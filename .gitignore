@@ -1,0 +1,18 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Rust
+backend/target/
+backend/.env
+backend/logs/*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.runlogs/
+Futures_Breakout_Strategy_Spec_v3.pdf
+Prompts.txt
+Expense.txt
