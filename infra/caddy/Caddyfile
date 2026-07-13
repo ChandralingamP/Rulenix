@@ -1,4 +1,4 @@
-app.rulenix.example.com {
+rulenix.in, www.rulenix.in {
     encode gzip zstd
     reverse_proxy 127.0.0.1:8080
     header {

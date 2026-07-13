@@ -46,7 +46,7 @@ services:
       backend:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     read_only: true
     tmpfs:
       - /var/cache/nginx:uid=10001,gid=10001,mode=1777
