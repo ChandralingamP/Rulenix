@@ -201,6 +201,18 @@ export default function Layout({ children }) {
     }
   }, [sessionReady, permissions.administer_users, location.pathname, navigate]);
 
+  if (!sessionReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 text-sm font-semibold text-slate-300">
+        Loading...
+      </div>
+    );
+  }
+
+  if (!username) {
+    return null;
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-950 to-slate-900">
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col">

@@ -30,11 +30,25 @@ describe("App", () => {
   });
 
   it("renders home page header", async () => {
-    axios.get.mockResolvedValueOnce({
-      data: {
-        client_id: "TRADER01",
-        api_key_configured: true,
-      },
+    axios.get.mockImplementation((url) => {
+      if (url === "/auth/access/") {
+        return Promise.resolve({
+          data: {
+            username: "TRADER01",
+            permissions: { administer_users: false, live_trading: false },
+            trading_mode: "demo",
+          },
+        });
+      }
+      if (url === "/account/balance") {
+        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
+      }
+      return Promise.resolve({
+        data: {
+          client_id: "TRADER01",
+          api_key_configured: true,
+        },
+      });
     });
 
     setAuthUsername("TRADER01");
