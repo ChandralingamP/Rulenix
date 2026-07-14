@@ -88,6 +88,7 @@ pub struct AdminMutation {
     pub username: String,
     pub can_administer: Option<bool>,
     pub can_live_trade: Option<bool>,
+    pub can_backtest: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,17 +97,19 @@ pub struct AuthUser {
     pub username: String,
     pub can_administer: bool,
     pub can_live_trade: bool,
+    pub can_backtest: bool,
     pub trading_mode: String,
     pub session_id: Uuid,
 }
 
 const SESSION_COOKIE: &str = "rulenix_session";
 const CSRF_COOKIE: &str = "rulenix_csrf";
-type SessionAuthRow = (Uuid, Uuid, String, bool, bool, String, Vec<u8>);
+type SessionAuthRow = (Uuid, Uuid, String, bool, bool, bool, String, Vec<u8>);
 type LoginUserRow = (
     Uuid,
     String,
     String,
+    bool,
     bool,
     bool,
     bool,
@@ -191,13 +194,21 @@ pub async fn authenticated(
         return unauthorized();
     };
     let row: Result<Option<SessionAuthRow>, sqlx::Error> = sqlx::query_as(
-        "SELECT s.id,u.id,u.username,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo'),s.csrf_hash FROM user_sessions s JOIN users u ON u.id=s.user_id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.idle_expires_at>NOW() AND s.absolute_expires_at>NOW() AND u.is_active=TRUE AND s.created_at>=u.password_changed_at"
+        "SELECT s.id,u.id,u.username,u.can_administer,u.can_live_trade,u.can_backtest,COALESCE(p.trading_mode,'demo'),s.csrf_hash FROM user_sessions s JOIN users u ON u.id=s.user_id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.idle_expires_at>NOW() AND s.absolute_expires_at>NOW() AND u.is_active=TRUE AND s.created_at>=u.password_changed_at"
     ).bind(token_hash(&raw_token)).fetch_optional(&state.db).await;
-    let Some((session_id, id, username, can_administer, can_live_trade, trading_mode, csrf_hash)) =
-        (match row {
-            Ok(value) => value,
-            Err(error) => return AppError::Sqlx(error).into_response(),
-        })
+    let Some((
+        session_id,
+        id,
+        username,
+        can_administer,
+        can_live_trade,
+        can_backtest,
+        trading_mode,
+        csrf_hash,
+    )) = (match row {
+        Ok(value) => value,
+        Err(error) => return AppError::Sqlx(error).into_response(),
+    })
     else {
         return unauthorized();
     };
@@ -224,6 +235,7 @@ pub async fn authenticated(
         username,
         can_administer,
         can_live_trade,
+        can_backtest,
         trading_mode,
         session_id,
     });
@@ -604,7 +616,7 @@ pub async fn signup(
     Ok((
         StatusCode::CREATED,
         Json(
-            json!({"username":username,"permissions":{"administer_users":false,"live_trading":false},"trading_mode":"demo"}),
+            json!({"username":username,"permissions":{"administer_users":false,"live_trading":false,"backtesting":false},"trading_mode":"demo"}),
         ),
     ))
 }
@@ -630,16 +642,16 @@ pub async fn login(
         state.config.login_rate_limit,
     )
     .await?;
-    let user: Option<LoginUserRow> = sqlx::query_as("SELECT u.id,u.username,u.password_hash,u.is_active,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo'),u.failed_login_attempts,u.locked_until FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE LOWER(u.username)=LOWER($1)")
+    let user: Option<LoginUserRow> = sqlx::query_as("SELECT u.id,u.username,u.password_hash,u.is_active,u.can_administer,u.can_live_trade,u.can_backtest,COALESCE(p.trading_mode,'demo'),u.failed_login_attempts,u.locked_until FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE LOWER(u.username)=LOWER($1)")
         .bind(input.username.trim()).fetch_optional(&state.db).await?;
-    if let Some((_, _, _, _, _, _, _, _, Some(until))) = &user
+    if let Some((_, _, _, _, _, _, _, _, _, Some(until))) = &user
         && *until > Utc::now()
     {
         return Err(AppError::RateLimited {
             retry_after: (*until - Utc::now()).num_seconds().max(1) as u64,
         });
     }
-    let verified = if let Some((_, _, hash, active, _, _, _, _, _)) = &user {
+    let verified = if let Some((_, _, hash, active, _, _, _, _, _, _)) = &user {
         *active
             && PasswordHash::new(hash).ok().is_some_and(|parsed| {
                 Argon2::default()
@@ -653,7 +665,7 @@ pub async fn login(
         false
     };
     if !verified {
-        if let Some((id, _, _, _, _, _, _, attempts, _)) = &user {
+        if let Some((id, _, _, _, _, _, _, _, attempts, _)) = &user {
             let next = attempts.saturating_add(1);
             let locked_until = if next >= state.config.login_lockout_threshold {
                 let exponent = (next - state.config.login_lockout_threshold).clamp(0, 20) as u32;
@@ -678,7 +690,7 @@ pub async fn login(
             "Invalid username or password.".into(),
         ));
     }
-    let (id, username, _, _, can_administer, can_live_trade, trading_mode, _, _) =
+    let (id, username, _, _, can_administer, can_live_trade, can_backtest, trading_mode, _, _) =
         user.expect("verified user exists");
     sqlx::query("UPDATE users SET failed_login_attempts=0,locked_until=NULL,last_failed_login_at=NULL WHERE id=$1").bind(id).execute(&state.db).await?;
     let session_token = random_token();
@@ -714,7 +726,7 @@ pub async fn login(
     Ok((
         cookie_headers(&state, &session_token, &csrf_token)?,
         Json(
-            json!({"username":username,"permissions":{"administer_users":can_administer,"live_trading":can_live_trade},"trading_mode":trading_mode,"idle_expires_in_seconds":state.config.session_idle_minutes*60,"absolute_expires_at":absolute}),
+            json!({"username":username,"permissions":{"administer_users":can_administer,"live_trading":can_live_trade,"backtesting":can_backtest},"trading_mode":trading_mode,"idle_expires_in_seconds":state.config.session_idle_minutes*60,"absolute_expires_at":absolute}),
         ),
     ))
 }
@@ -722,7 +734,7 @@ pub async fn login(
 pub async fn access_status(Extension(user): Extension<AuthUser>) -> AppResult<Json<Value>> {
     Ok(Json(json!({
         "username":user.username,
-        "permissions":{"administer_users":user.can_administer,"live_trading":user.can_live_trade},
+        "permissions":{"administer_users":user.can_administer,"live_trading":user.can_live_trade,"backtesting":user.can_backtest},
         "trading_mode":user.trading_mode,
     })))
 }
@@ -873,7 +885,7 @@ pub async fn list_users(
     Extension(admin): Extension<AuthUser>,
 ) -> AppResult<Json<Vec<AdminUser>>> {
     require_admin_permission(&admin)?;
-    let users = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id ORDER BY u.username").fetch_all(&state.db).await?;
+    let users = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id ORDER BY u.username").fetch_all(&state.db).await?;
     Ok(Json(users))
 }
 
@@ -890,14 +902,17 @@ pub async fn update_user(
             "You cannot change your own administration permission.".into(),
         ));
     }
-    if input.can_administer.is_none() && input.can_live_trade.is_none() {
+    if input.can_administer.is_none()
+        && input.can_live_trade.is_none()
+        && input.can_backtest.is_none()
+    {
         return Err(AppError::BadRequest(
             "At least one permission is required.".into(),
         ));
     }
     let mut tx = state.db.begin().await?;
-    let changed_id: Option<Uuid> = sqlx::query_scalar("UPDATE users SET can_administer=COALESCE($1,can_administer),can_live_trade=COALESCE($2,can_live_trade),updated_at=NOW() WHERE LOWER(username)=LOWER($3) RETURNING id")
-        .bind(input.can_administer).bind(input.can_live_trade).bind(&input.username).fetch_optional(&mut *tx).await?;
+    let changed_id: Option<Uuid> = sqlx::query_scalar("UPDATE users SET can_administer=COALESCE($1,can_administer),can_live_trade=COALESCE($2,can_live_trade),can_backtest=COALESCE($3,can_backtest),updated_at=NOW() WHERE LOWER(username)=LOWER($4) RETURNING id")
+        .bind(input.can_administer).bind(input.can_live_trade).bind(input.can_backtest).bind(&input.username).fetch_optional(&mut *tx).await?;
     let changed_id = changed_id.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
     if input.can_live_trade == Some(false) {
         sqlx::query(
@@ -907,14 +922,16 @@ pub async fn update_user(
         .execute(&mut *tx)
         .await?;
     }
-    let user: AdminUser = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
+    let user: AdminUser = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
         .bind(changed_id).fetch_one(&mut *tx).await?;
-    sqlx::query(
-        "UPDATE user_sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL",
-    )
-    .bind(user.id)
-    .execute(&mut *tx)
-    .await?;
+    if input.can_administer.is_some() || input.can_live_trade.is_some() {
+        sqlx::query(
+            "UPDATE user_sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL",
+        )
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     let request_context = crate::audit::optional_context(context);
     if let Err(error) = crate::audit::record(
@@ -926,7 +943,7 @@ pub async fn update_user(
             actor_user_id: Some(admin.id),
             target_user_id: Some(user.id),
             summary: "Administrator changed user permissions",
-            metadata: json!({"username":&user.username,"can_administer":user.can_administer,"can_live_trade":user.can_live_trade,"trading_mode":&user.trading_mode}),
+            metadata: json!({"username":&user.username,"can_administer":user.can_administer,"can_live_trade":user.can_live_trade,"can_backtest":user.can_backtest,"trading_mode":&user.trading_mode}),
         },
     )
     .await
@@ -986,6 +1003,7 @@ mod security_tests {
             username: "USER".into(),
             can_administer,
             can_live_trade,
+            can_backtest: false,
             trading_mode: "demo".into(),
             session_id: Uuid::new_v4(),
         }
@@ -1032,6 +1050,7 @@ mod security_tests {
         .unwrap();
         assert_eq!(live_update.can_live_trade, Some(true));
         assert_eq!(live_update.can_administer, None);
+        assert_eq!(live_update.can_backtest, None);
     }
 
     #[test]

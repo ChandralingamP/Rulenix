@@ -39,6 +39,7 @@ pub struct OrderRisk<'a> {
     pub quantity: i32,
     pub price: f64,
     pub trigger_price: Option<f64>,
+    pub margin_required: Option<f64>,
     pub idempotency_key: &'a str,
     pub snapshot_ready: bool,
     pub snapshot_current: bool,
@@ -266,8 +267,26 @@ pub async fn assess_and_reserve(
         {
             (code, message) = reason;
         }
-        let required_margin =
-            order.quantity as f64 * order.price * limits.margin_requirement_percent / 100.0;
+        let required_margin = order
+            .margin_required
+            .filter(|value| *value > 0.0)
+            .unwrap_or(
+                order.quantity as f64 * order.price * limits.margin_requirement_percent / 100.0,
+            );
+        if code == "allowed" && order.mode == "demo" {
+            let demo_balance: Option<f64> = sqlx::query_scalar(
+                "SELECT demo_balance::float8 FROM user_profiles WHERE user_id=$1",
+            )
+            .bind(order.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if demo_balance.is_none_or(|value| value < required_margin) {
+                (code, message) = reject(
+                    "insufficient_margin",
+                    "Order rejected: demo balance is insufficient for the required margin.",
+                );
+            }
+        }
         if code == "allowed"
             && order.mode == "live"
             && order
@@ -284,13 +303,14 @@ pub async fn assess_and_reserve(
         message = "Protective exit passed safety validation.";
     }
 
-    let values = json!({"limits":limits,"order":{"lots":order.lots,"quantity":order.quantity,"price":order.price,"role":order.role},"projected":{"lots":metrics.lots,"quantity":metrics.quantity,"notional":metrics.notional,"open_positions":metrics.positions,"trades_today":metrics.trades_today,"realized_pnl":metrics.realized_pnl,"unrealized_pnl":metrics.unrealized_pnl},"health":{"global_kill":global_kill,"user_kill":user_kill,"account_safe":account_safe,"snapshot_ready":order.snapshot_ready,"snapshot_current":order.snapshot_current,"market_price_age_seconds":tick_age,"broker_reconciled":order.live_reconciled,"margin_available":order.live_margin_available}});
+    let margin_required = order.margin_required.unwrap_or(0.0);
+    let values = json!({"limits":limits,"order":{"lots":order.lots,"quantity":order.quantity,"price":order.price,"role":order.role,"margin_required":margin_required},"projected":{"lots":metrics.lots,"quantity":metrics.quantity,"notional":metrics.notional,"open_positions":metrics.positions,"trades_today":metrics.trades_today,"realized_pnl":metrics.realized_pnl,"unrealized_pnl":metrics.unrealized_pnl},"health":{"global_kill":global_kill,"user_kill":user_kill,"account_safe":account_safe,"snapshot_ready":order.snapshot_ready,"snapshot_current":order.snapshot_current,"market_price_age_seconds":tick_age,"broker_reconciled":order.live_reconciled,"margin_available":order.live_margin_available}});
     let allowed = matches!(code, "allowed" | "protective_exit_allowed");
     let decision_id =
         persist_decision(&mut tx, order, order_id, allowed, code, message, &values).await?;
     if allowed {
-        sqlx::query("INSERT INTO strategy_orders (id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,trigger_price,status,idempotency_key,risk_decision_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',$13,$14)")
-            .bind(order_id).bind(order.user_id).bind(order.snapshot_id).bind(order.trade_id).bind(order.session).bind(order.role).bind(order.side).bind(order.mode).bind(order.lots).bind(order.quantity).bind(order.price).bind(order.trigger_price).bind(order.idempotency_key).bind(decision_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO strategy_orders (id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,trigger_price,margin_required,status,idempotency_key,risk_decision_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$15)")
+            .bind(order_id).bind(order.user_id).bind(order.snapshot_id).bind(order.trade_id).bind(order.session).bind(order.role).bind(order.side).bind(order.mode).bind(order.lots).bind(order.quantity).bind(order.price).bind(order.trigger_price).bind(margin_required).bind(order.idempotency_key).bind(decision_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     if allowed {

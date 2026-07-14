@@ -296,6 +296,41 @@ pub async fn get_margin(state: &AppState, api_key: &str, jwt_token: &str) -> App
     Ok(serde_json::json!({"available_balance":available,"provider_data":data}))
 }
 
+pub async fn calculate_margin(
+    state: &AppState,
+    api_key: &str,
+    jwt_token: &str,
+    token: &str,
+    quantity: i32,
+    order_type: &str,
+    trade_type: &str,
+) -> AppResult<Value> {
+    let body = margin_payload(token, quantity, order_type, trade_type);
+    secure_json(
+        state,
+        reqwest::Method::POST,
+        "/rest/secure/angelbroking/margin/v1/batch",
+        api_key,
+        jwt_token,
+        Some(body),
+    )
+    .await
+}
+
+fn margin_payload(token: &str, quantity: i32, order_type: &str, trade_type: &str) -> Value {
+    json!({
+        "positions":[{
+            "exchange":"MCX",
+            "orderType":order_type,
+            "qty":quantity.to_string(),
+            "price":"0",
+            "productType":"CARRYFORWARD",
+            "token":token,
+            "tradeType":trade_type,
+        }]
+    })
+}
+
 async fn secure_json(
     state: &AppState,
     method: reqwest::Method,
@@ -346,10 +381,25 @@ pub async fn get_candles(
     from_date: &str,
     to_date: &str,
 ) -> AppResult<Value> {
+    get_candles_with_interval(
+        state, api_key, jwt_token, token, "ONE_DAY", from_date, to_date,
+    )
+    .await
+}
+
+pub async fn get_candles_with_interval(
+    state: &AppState,
+    api_key: &str,
+    jwt_token: &str,
+    token: &str,
+    interval: &str,
+    from_date: &str,
+    to_date: &str,
+) -> AppResult<Value> {
     let body = json!({
         "exchange":"MCX",
         "symboltoken":token,
-        "interval":"ONE_DAY",
+        "interval":interval,
         "fromdate":from_date,
         "todate":to_date,
     });
@@ -844,6 +894,17 @@ mod tests {
         assert_eq!(payload["ordertype"], "STOPLOSS_LIMIT");
         assert_eq!(payload["price"], "100.25");
         assert_eq!(payload["triggerprice"], "100.00");
+    }
+
+    #[test]
+    fn margin_payload_includes_required_order_type() {
+        let payload = margin_payload("123", 10, "STOPLOSS_LIMIT", "BUY");
+        let position = &payload["positions"][0];
+        assert_eq!(position["orderType"], "STOPLOSS_LIMIT");
+        assert_eq!(position["productType"], "CARRYFORWARD");
+        assert_eq!(position["tradeType"], "BUY");
+        assert_eq!(position["token"], "123");
+        assert_eq!(position["qty"], "10");
     }
 
     #[tokio::test]

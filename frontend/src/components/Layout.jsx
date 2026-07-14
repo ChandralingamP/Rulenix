@@ -27,7 +27,11 @@ export default function Layout({ children }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [username, setUsername] = useState(() => getAuthUsername());
-  const [permissions, setPermissions] = useState({ administer_users: false, live_trading: false });
+  const [permissions, setPermissions] = useState({
+    administer_users: false,
+    live_trading: false,
+    backtesting: false,
+  });
   const [tradingMode, setTradingMode] = useState("demo");
   const [sessionReady, setSessionReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -36,11 +40,14 @@ export default function Layout({ children }) {
 
   const navItems = useMemo(() => {
     const items = [...baseNavItems];
+    if (permissions.backtesting) {
+      items.push({ label: "Backtesting", to: "/backtesting" });
+    }
     if (permissions.administer_users) {
       items.push({ label: "Admin", to: "/admin" });
     }
     return items;
-  }, [permissions.administer_users]);
+  }, [permissions.administer_users, permissions.backtesting]);
 
   const loadAccountBalance = useCallback(async () => {
     if (!username) return;
@@ -64,6 +71,7 @@ export default function Layout({ children }) {
       setPermissions({
         administer_users: Boolean(nextPermissions.administer_users),
         live_trading: Boolean(nextPermissions.live_trading),
+        backtesting: Boolean(nextPermissions.backtesting),
       });
       setTradingMode(response.data?.trading_mode === "live" ? "live" : "demo");
       if (serverUsername) {
@@ -76,7 +84,7 @@ export default function Layout({ children }) {
       if ([401, 404].includes(requestError.response?.status)) {
         clearAuthUsername();
         setUsername(null);
-        setPermissions({ administer_users: false, live_trading: false });
+        setPermissions({ administer_users: false, live_trading: false, backtesting: false });
         setTradingMode("demo");
         setSessionReady(true);
         navigate("/login", {
@@ -131,7 +139,7 @@ export default function Layout({ children }) {
       }
       clearAuthUsername();
       setUsername(null);
-      setPermissions({ administer_users: false, live_trading: false });
+      setPermissions({ administer_users: false, live_trading: false, backtesting: false });
       setTradingMode("demo");
       const navigationOptions = sourcePath
         ? { replace: true, state: { from: sourcePath } }
@@ -200,6 +208,12 @@ export default function Layout({ children }) {
       navigate("/", { replace: true });
     }
   }, [sessionReady, permissions.administer_users, location.pathname, navigate]);
+
+  useEffect(() => {
+    if (sessionReady && !permissions.backtesting && location.pathname.startsWith("/backtesting")) {
+      navigate("/", { replace: true });
+    }
+  }, [sessionReady, permissions.backtesting, location.pathname, navigate]);
 
   if (!sessionReady) {
     return (

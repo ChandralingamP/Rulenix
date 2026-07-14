@@ -3,12 +3,14 @@ mod alerts;
 mod angel;
 mod audit;
 mod auth;
+mod backtesting;
 mod config;
 mod credentials;
 mod error;
 mod home;
 mod jobs;
 mod logs;
+mod margin;
 mod market_ws;
 mod models;
 mod ops;
@@ -206,6 +208,8 @@ async fn main() -> Result<()> {
         )
         .route("/pnl", get(pnl::list))
         .route("/pnl/export", get(pnl::export))
+        .route("/backtesting/runs", get(backtesting::history))
+        .route("/backtesting/run", post(backtesting::run))
         .route("/logs/files/", get(logs::files))
         .route("/logs/content/", get(logs::content))
         .route("/scheduler/jobs/", get(jobs::list))

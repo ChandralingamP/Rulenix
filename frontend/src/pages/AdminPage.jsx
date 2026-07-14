@@ -280,7 +280,7 @@ function RiskControlsPanel() {
 }
 
 export default function AdminPage() {
-  const { session } = useOutletContext();
+  const { session, refreshSession } = useOutletContext();
   const [users, setUsers] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
@@ -353,6 +353,9 @@ export default function AdminPage() {
                 : user
             )
           );
+          if (updated.username.toLowerCase() === adminUsername.toLowerCase()) {
+            refreshSession?.();
+          }
         })
         .catch(() => {
           setError("Unable to update user status. Please try again.");
@@ -362,7 +365,7 @@ export default function AdminPage() {
           setSavingUser("");
         });
     },
-    [adminUsername, loadUsers, navigate]
+    [adminUsername, loadUsers, navigate, refreshSession]
   );
 
   const requestDeleteUser = useCallback((username) => {
@@ -416,7 +419,7 @@ export default function AdminPage() {
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold text-white">Admin Console</h1>
           <p className="text-sm text-slate-400">
-            Manage administration and live-trading permissions independently.
+            Manage administration, live-trading, and backtesting permissions independently.
           </p>
         </div>
       </header>
@@ -455,6 +458,9 @@ export default function AdminPage() {
                   Live trading
                 </th>
                 <th scope="col" className="px-4 py-3 text-center">
+                  Backtesting
+                </th>
+                <th scope="col" className="px-4 py-3 text-center">
                   Current mode
                 </th>
                 <th scope="col" className="px-4 py-3 text-right">
@@ -467,7 +473,7 @@ export default function AdminPage() {
                 <tr>
                   <td
                     className="px-4 py-6 text-center text-slate-400"
-                    colSpan={6}
+                    colSpan={7}
                   >
                     No users found.
                   </td>
@@ -501,6 +507,17 @@ export default function AdminPage() {
                           {user.can_live_trade ? "Allowed" : "Denied"}
                         </span>
                       </td>
+                      <td className="px-4 py-3 text-center">
+                        <span
+                          className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                            user.can_backtest
+                              ? "bg-sky-500/10 text-sky-300"
+                              : "bg-slate-800 text-slate-300"
+                          }`}
+                        >
+                          {user.can_backtest ? "Allowed" : "Denied"}
+                        </span>
+                      </td>
                       <td className="px-4 py-3 text-center uppercase text-slate-300">{user.trading_mode}</td>
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-2">
@@ -523,6 +540,14 @@ export default function AdminPage() {
                             className="rounded-lg border border-amber-500/50 px-3 py-2 text-xs font-semibold text-amber-200 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
                           >
                             {user.can_live_trade ? "Revoke live" : "Grant live"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isUpdating || isDeleting}
+                            onClick={() => updatePermission(user.username, "can_backtest", !user.can_backtest)}
+                            className="rounded-lg border border-sky-500/50 px-3 py-2 text-xs font-semibold text-sky-200 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
+                          >
+                            {user.can_backtest ? "Revoke backtest" : "Grant backtest"}
                           </button>
                           <button
                             type="button"

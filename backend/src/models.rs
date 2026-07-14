@@ -10,6 +10,7 @@ pub struct AdminUser {
     pub email: String,
     pub can_administer: bool,
     pub can_live_trade: bool,
+    pub can_backtest: bool,
     pub trading_mode: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,

@@ -11,6 +11,7 @@ import ResetPasswordPage from "./pages/ResetPasswordPage.jsx";
 import AdminPage from "./pages/AdminPage.jsx";
 import LogsViewerPage from "./pages/LogsViewerPage.jsx";
 import StrategiesPage from "./pages/StrategiesPage.jsx";
+import BacktestingPage from "./pages/BacktestingPage.jsx";
 
 export default function App() {
   return (
@@ -32,6 +33,7 @@ export default function App() {
           <Route index element={<HomePage />} />
           <Route path="pnl" element={<ProfitLossPage />} />
           <Route path="strategies" element={<StrategiesPage />} />
+          <Route path="backtesting" element={<BacktestingPage />} />
           <Route path="admin" element={<AdminPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

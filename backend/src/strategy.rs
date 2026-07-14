@@ -413,8 +413,36 @@ async fn place_strategy_order(
     let protective = matches!(order.role, "TARGET" | "SL1" | "SL2");
     let mut live_margin = None;
     let mut live_reconciled = runner.trading_mode != "live" || protective;
+    let entry_credentials = if !protective {
+        Some(state.credentials.load(runner.user_id).await?)
+    } else {
+        None
+    };
+    let margin_required = if protective {
+        0.0
+    } else {
+        let credentials = entry_credentials
+            .as_ref()
+            .expect("entry credentials are loaded");
+        crate::margin::estimate(
+            state,
+            runner.user_id,
+            &credentials.api_key,
+            &credentials.jwt_token,
+            token,
+            symbol,
+            "STOPLOSS_LIMIT",
+            order.side,
+            lot_size,
+            order.lots,
+        )
+        .await?
+        .margin_required
+    };
     if runner.trading_mode == "live" && !protective {
-        let credentials = state.credentials.load(runner.user_id).await?;
+        let credentials = entry_credentials
+            .as_ref()
+            .expect("entry credentials are loaded");
         match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await {
             Ok(_) => {
                 live_reconciled = true;
@@ -451,6 +479,7 @@ async fn place_strategy_order(
             quantity,
             price: order.price,
             trigger_price: order.trigger,
+            margin_required: Some(margin_required),
             idempotency_key: &key,
             snapshot_ready: snapshot.status == "ready",
             snapshot_current: snapshot.trade_date == ist_now().date_naive()
@@ -1145,6 +1174,7 @@ struct StoredOrder {
     lots: i32,
     quantity: i32,
     price: f64,
+    margin_required: f64,
     broker_order_id: String,
     client_order_id: String,
     status: String,
@@ -1290,7 +1320,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             by_tag.insert(tag.to_string(), item);
         }
     }
-    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,broker_order_id,client_order_id,status,filled_quantity FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
+    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
             .bind(user_id).fetch_all(&state.db).await?;
     for order in orders {
         let item = if !order.broker_order_id.is_empty() {
@@ -1507,19 +1537,21 @@ async fn cancel_active_exits(state: &AppState, user_id: Uuid, trade_id: Uuid) ->
     Ok(())
 }
 
-fn trade_pnl(direction: &str, entry: f64, exit: f64, quantity: i32) -> f64 {
+fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
     let movement = if direction == "BUY" {
         exit - entry
     } else {
         entry - exit
     };
-    movement * quantity as f64
+    movement * units
 }
 
+#[cfg(test)]
 fn demo_margin_amount(quantity: i32, price: f64, margin_requirement_percent: f64) -> f64 {
     quantity as f64 * price * margin_requirement_percent / 100.0
 }
 
+#[cfg(test)]
 fn demo_margin_release(
     total_quantity: i32,
     price: f64,
@@ -1531,16 +1563,6 @@ fn demo_margin_release(
     }
     let full_margin = demo_margin_amount(total_quantity, price, margin_requirement_percent);
     full_margin * (closed_quantity.min(total_quantity) as f64 / total_quantity as f64)
-}
-
-async fn effective_demo_margin_requirement(state: &AppState, user_id: Uuid) -> AppResult<f64> {
-    let percent: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(u.margin_requirement_percent,g.margin_requirement_percent,10.0)::float8 FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1 WHERE g.user_id IS NULL",
-    )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await?;
-    Ok(percent)
 }
 
 async fn append_user_log(state: &AppState, user_id: Uuid, message: &str) {
@@ -1573,13 +1595,17 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
             } else {
                 "SELL"
             };
-            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64)>("SELECT id,direction,quantity,entry_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
+            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64)>("SELECT id,direction,remaining_lots,entry_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
                 if existing.1!=direction {
                     cancel_active_exits(state,order.user_id,existing.0).await?;
-                    let pnl=trade_pnl(&existing.1,existing.3,fill,existing.2);
-                    let margin_requirement_percent = effective_demo_margin_requirement(state, order.user_id).await?;
-                    let release_margin = demo_margin_release(existing.2, existing.3, margin_requirement_percent, existing.2);
+                    let pnl=trade_pnl(&existing.1,existing.3,fill,existing.2 as f64);
+                    let release_margin: f64 =
+                        sqlx::query_scalar("SELECT margin_required FROM trades WHERE id=$1")
+                            .bind(existing.0)
+                            .fetch_one(&state.db)
+                            .await
+                            .unwrap_or(0.0);
                     sqlx::query("WITH closed AS (UPDATE trades SET status='closed',exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),remaining_lots=0,notes=CONCAT(notes,'; SAR reversal'),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'")
                         .bind(existing.0).bind(fill).bind(pnl).bind(release_margin).execute(&state.db).await?;
                     append_user_log(state, order.user_id, &format!("STRATEGY POSITION CLOSED {} SAR @ {:.2} P&L {:+.2}", instrument, fill, pnl)).await;
@@ -1594,18 +1620,15 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
             } else {
                 (snapshot.sell_target, snapshot.sell_sl1, snapshot.sell_sl2)
             };
-            let margin_requirement_percent =
-                effective_demo_margin_requirement(state, order.user_id).await?;
-            let reserved_margin =
-                demo_margin_amount(order.quantity, fill, margin_requirement_percent);
+            let reserved_margin = order.margin_required;
             let mut fill_tx = state.db.begin().await?;
             if order.execution_mode == "demo" {
                 sqlx::query("UPDATE user_profiles SET demo_balance=(GREATEST((demo_balance::float8 - $2),0::numeric))::numeric,updated_at=NOW() WHERE user_id=$1")
                     .bind(order.user_id).bind(reserved_margin).execute(&mut *fill_tx).await?;
             }
-            sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,sl2_price) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,'Futures Breakout v3',$8,$9,$10,$10,$11,$12,$13 FROM strategy_orders WHERE id=$14")
+            sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,sl2_price,margin_required) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,'Futures Breakout v3',$8,$9,$10,$10,$11,$12,$13,$15 FROM strategy_orders WHERE id=$14")
                 .bind(trade_id).bind(order.user_id).bind(direction).bind(order.quantity).bind(fill).bind(&instrument).bind(snapshot.contract_symbol.as_deref().unwrap_or(""))
-                .bind(STRATEGY_KEY).bind(snapshot.id).bind(order.lots).bind(target).bind(sl1).bind(sl2).bind(order.id).execute(&mut *fill_tx).await?;
+                .bind(STRATEGY_KEY).bind(snapshot.id).bind(order.lots).bind(target).bind(sl1).bind(sl2).bind(order.id).bind(order.margin_required).execute(&mut *fill_tx).await?;
             sqlx::query("UPDATE strategy_orders SET status='filled',trade_id=$2,processed_quantity=GREATEST(processed_quantity,$3),updated_at=NOW() WHERE id=$1").bind(order.id).bind(trade_id).bind(order.quantity).execute(&mut *fill_tx).await?;
             fill_tx.commit().await?;
             let runner = runner_for(state, order.user_id, &instrument).await?;
@@ -1651,11 +1674,12 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
                 state,
                 order.user_id,
                 &format!(
-                    "STRATEGY POSITION OPENED {} {} {} lots @ {:.2} [{}]",
+                    "STRATEGY POSITION OPENED {} {} {} lots @ {:.2} MARGIN {:.2} [{}]",
                     instrument,
                     direction,
                     order.lots,
                     fill,
+                    order.margin_required,
                     runner.trading_mode.to_uppercase()
                 ),
             )
@@ -1663,29 +1687,22 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
         }
         "TARGET" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,f64,f64)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,entry_price::float8,pnl::float8 FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,f64,f64,f64)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,entry_price::float8,pnl::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed = order.lots.min(trade.2);
                 let remaining = trade.2 - closed;
-                let realized = trade_pnl(
-                    &trade.0,
-                    trade.3,
-                    fill,
-                    closed * snapshot.lot_size.unwrap_or(1),
-                );
-                let margin_requirement_percent =
-                    effective_demo_margin_requirement(state, order.user_id).await?;
-                let release_margin = demo_margin_release(
-                    trade.1 * snapshot.lot_size.unwrap_or(1),
-                    trade.3,
-                    margin_requirement_percent,
-                    closed * snapshot.lot_size.unwrap_or(1),
-                );
+                let realized = trade_pnl(&trade.0, trade.3, fill, closed as f64);
+                let release_margin = if trade.1 > 0 {
+                    trade.5 * closed as f64 / trade.1 as f64
+                } else {
+                    0.0
+                };
+                let remaining_margin = (trade.5 - release_margin).max(0.0);
                 let mut fill_tx = state.db.begin().await?;
                 if remaining == 0 {
                     sqlx::query("WITH closed AS (UPDATE trades SET status='closed',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=(pnl::float8+$3)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'").bind(trade_id).bind(fill).bind(realized).bind(release_margin).execute(&mut *fill_tx).await?;
                 } else {
-                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining*snapshot.lot_size.unwrap_or(1)).bind(fill).bind(realized).bind(release_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,margin_required=$7,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining*snapshot.lot_size.unwrap_or(1)).bind(fill).bind(realized).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status='filled',processed_quantity=GREATEST(processed_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(order.quantity).execute(&mut *fill_tx).await?;
                 fill_tx.commit().await?;
@@ -1721,27 +1738,25 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,f64,f64)=sqlx::query_as("SELECT direction,quantity,remaining_lots,entry_price::float8,pnl::float8 FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,f64,f64,f64)=sqlx::query_as("SELECT direction,quantity,remaining_lots,entry_price::float8,pnl::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
                 let closed_lots = order.lots.min(trade.2);
                 let remaining_lots = (trade.2 - closed_lots).max(0);
-                let closing_pnl = trade_pnl(&trade.0, trade.3, fill, closed_quantity);
+                let closing_pnl = trade_pnl(&trade.0, trade.3, fill, closed_lots as f64);
                 let pnl = trade.4 + closing_pnl;
-                let margin_requirement_percent =
-                    effective_demo_margin_requirement(state, order.user_id).await?;
-                let release_margin = demo_margin_release(
-                    trade.1,
-                    trade.3,
-                    margin_requirement_percent,
-                    closed_quantity,
-                );
+                let release_margin = if trade.1 > 0 {
+                    trade.5 * closed_quantity as f64 / trade.1 as f64
+                } else {
+                    0.0
+                };
+                let remaining_margin = (trade.5 - release_margin).max(0.0);
                 let mut fill_tx = state.db.begin().await?;
                 if remaining_quantity == 0 {
                     sqlx::query("WITH changed AS (UPDATE trades SET status='closed',quantity=0,remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$4+$5)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).execute(&mut *fill_tx).await?;
                 } else {
-                    sqlx::query("WITH changed AS (UPDATE trades SET quantity=$2,remaining_lots=$3,last_price=($4::float8)::numeric,pnl=($5::float8)::numeric,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$6+$7)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(remaining_quantity).bind(remaining_lots).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH changed AS (UPDATE trades SET quantity=$2,remaining_lots=$3,last_price=($4::float8)::numeric,pnl=($5::float8)::numeric,margin_required=$8,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$6+$7)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(remaining_quantity).bind(remaining_lots).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status='filled',processed_quantity=GREATEST(processed_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(order.quantity).execute(&mut *fill_tx).await?;
                 fill_tx.commit().await?;
@@ -1804,7 +1819,7 @@ pub async fn process_tick(state: &AppState, user_id: Uuid, token: &str, ltp: f64
     risk::record_tick(state, token, ltp).await?;
     sqlx::query("UPDATE trades t SET last_price=($3::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.user_id=$1 AND t.execution_mode='demo' AND t.status='open' AND s.contract_token=$2")
         .bind(user_id).bind(token).bind(ltp).execute(&state.db).await?;
-    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.execution_mode,o.lots,o.quantity,o.price,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.contract_token=$2 ORDER BY o.created_at")
+    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.contract_token=$2 ORDER BY o.created_at")
         .bind(user_id).bind(token).fetch_all(&state.db).await?;
     for order in orders {
         let triggered = match (order.role.as_str(), order.side.as_str()) {
@@ -2123,8 +2138,8 @@ pub async fn status(
     let config:Option<(bool,i32,bool,bool)>=sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument=$3").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await?;
     let strategy_active = activation_state(&state, user).await?;
     let snapshot = load_snapshot(&state, &instrument, ist_now().date_naive()).await?;
-    let orders:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'role',role,'side',side,'status',status,'lots',lots,'quantity',quantity,'price',price,'trigger_price',trigger_price,'client_order_id',client_order_id,'broker_order_id',broker_order_id,'filled_quantity',filled_quantity,'average_fill_price',average_fill_price,'broker_error_class',broker_error_class,'broker_error_code',broker_error_code,'broker_http_status',broker_http_status,'last_reconciled_at',last_reconciled_at,'created_at',created_at) FROM strategy_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100").bind(user).fetch_all(&state.db).await?;
-    let trades:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'status',status,'direction',direction,'lots',total_lots,'remaining_lots',remaining_lots,'quantity',quantity,'entry_price',entry_price,'exit_price',exit_price,'pnl',pnl,'trigger_time',entry_datetime,'exit_time',exit_datetime,'contract_symbol',contract_symbol,'target',target_price,'sl1',sl1_price,'sl2',sl2_price) FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 ORDER BY created_at DESC LIMIT 100").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
+    let orders:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'role',role,'side',side,'status',status,'lots',lots,'quantity',quantity,'price',price,'trigger_price',trigger_price,'margin_required',margin_required,'client_order_id',client_order_id,'broker_order_id',broker_order_id,'filled_quantity',filled_quantity,'average_fill_price',average_fill_price,'broker_error_class',broker_error_class,'broker_error_code',broker_error_code,'broker_http_status',broker_http_status,'last_reconciled_at',last_reconciled_at,'created_at',created_at) FROM strategy_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100").bind(user).fetch_all(&state.db).await?;
+    let trades:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'status',status,'direction',direction,'lots',total_lots,'remaining_lots',remaining_lots,'quantity',quantity,'entry_price',entry_price,'exit_price',exit_price,'pnl',pnl,'margin_required',margin_required,'trigger_time',entry_datetime,'exit_time',exit_datetime,'contract_symbol',contract_symbol,'target',target_price,'sl1',sl1_price,'sl2',sl2_price) FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 ORDER BY created_at DESC LIMIT 100").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
     let alerts:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 20").bind(STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
     Ok(Json(
         json!({"strategy_key":STRATEGY_KEY,"strategy_active":strategy_active,"instrument":instrument,"configuration":config.map(|v|json!({"enabled":v.0,"lots":v.1,"run_day_session":v.2,"run_evening_session":v.3})),"snapshot":snapshot,"orders":orders,"trades":trades,"operational_alerts":alerts}),
@@ -2204,9 +2219,13 @@ mod tests {
 
     #[test]
     fn pnl_supports_long_and_short_positions() {
-        assert_eq!(trade_pnl("BUY", 100.0, 112.5, 4), 50.0);
-        assert_eq!(trade_pnl("SELL", 100.0, 87.5, 4), 50.0);
-        assert_eq!(trade_pnl("BUY", 100.0, 87.5, 4), -50.0);
+        assert_eq!(trade_pnl("BUY", 100.0, 112.5, 4.0), 50.0);
+        assert_eq!(trade_pnl("SELL", 100.0, 87.5, 4.0), 50.0);
+        assert_eq!(trade_pnl("BUY", 100.0, 87.5, 4.0), -50.0);
+        assert_eq!(
+            trade_pnl("BUY", 143_398.71, 145_549.70, 1.0).round(),
+            2151.0
+        );
     }
     #[test]
     fn catchup_window_is_bounded() {
