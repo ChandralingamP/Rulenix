@@ -151,4 +151,67 @@ describe("StrategiesPage", () => {
     expect(screen.queryByText(/3\/7\/2026/)).not.toBeInTheDocument();
     expect(screen.queryByText("Older broker issue")).not.toBeInTheDocument();
   });
+
+  it("saves Ichimoku live execution parameters through its dedicated route", async () => {
+    setAuthUsername("TRADER01");
+    const ichimoku = {
+      key: "ichimoku_keltner_tsi",
+      name: "Ichimoku + Keltner + TSI",
+      description: "Continuous index options and GOLDTEN strategy.",
+      active: true,
+      instruments: [
+        {
+          instrument: "NIFTY",
+          label: "NIFTY 50 Options",
+          enabled: true,
+          lots: 1,
+          run_day_session: true,
+          run_evening_session: false,
+          interval_key: "FIVE_MINUTE",
+          stop_loss_percent: 5,
+          target_percent: 20,
+          keltner_multiplier: 2,
+          require_volume: false,
+          premium_min: 200,
+          premium_max: 300,
+          snapshot: null,
+        },
+      ],
+    };
+    apiClient.get.mockResolvedValue({ data: { strategies: [ichimoku] } });
+    apiClient.put.mockResolvedValue({ data: {} });
+    const store = configureStore({ reducer: { strategies: strategiesReducer } });
+    const user = userEvent.setup();
+
+    render(
+      <Provider store={store}>
+        <StrategiesPage />
+      </Provider>
+    );
+
+    expect(await screen.findByText("NIFTY 50 Options")).toBeInTheDocument();
+    expect(screen.getByText(/Entry: MARKET/)).toBeInTheDocument();
+    const target = screen.getByLabelText("NIFTY Target %");
+    await user.clear(target);
+    await user.type(target, "25");
+    const premiumMax = screen.getByLabelText("NIFTY premium maximum");
+    await user.clear(premiumMax);
+    await user.type(premiumMax, "350");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(apiClient.put).toHaveBeenCalledWith(
+        "/strategy/ichimoku",
+        expect.objectContaining({
+          instrument: "NIFTY",
+          interval_key: "FIVE_MINUTE",
+          stop_loss_percent: 5,
+          target_percent: 25,
+          keltner_multiplier: 2,
+          premium_min: 200,
+          premium_max: 350,
+        })
+      )
+    );
+  });
 });

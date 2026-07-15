@@ -304,6 +304,51 @@ within ten minutes of expiry. Rejected refresh tokens are cleared and reported
 as invalid; temporary verification failures are reported without discarding
 otherwise reusable credentials.
 
+## Ichimoku backtest and continuous trading
+
+The backtesting page and live strategy scheduler include the PDF-defined
+Ichimoku Cloud, Keltner Channel, and TSI strategy for NIFTY, BANKNIFTY, SENSEX,
+MIDCAPNIFTY, and GOLDTEN. Cash indices use their Angel One NSE/BSE index candles;
+GOLDTEN uses the currently eligible MCX futures contract. Index backtest results
+are directional underlying-index simulations, not historical CE/PE strike or
+premium results.
+
+Signals use Ichimoku 9/26/52 with a 26-period displaced cloud, Keltner EMA 20
+and ATR 10, and TSI 25/13/13. Entries and indicator exits execute at the next
+candle open to prevent look-ahead. The default 5% stop, 20% target, Keltner 2x
+multiplier, slippage, costs, and optional 20-period volume filter are editable.
+The volume filter defaults off because cash-index candles normally contain zero
+volume.
+
+For demo and live execution, the scheduler evaluates each newly completed 1,
+5, or 15 minute candle once. A bullish index signal buys a CE and a bearish
+signal buys a PE from the nearest valid expiry, choosing the premium closest to
+the middle of the configured range (INR 200-300 by default). GOLDTEN signals use
+the selected futures contract directly. Entries use MARKET orders, targets use
+LIMIT orders, and stop losses use STOPLOSS_LIMIT orders. Demo exits are checked
+with bulk market quotes; live orders are reconciled with the broker. Each signal
+configuration and each user's risk reservation/order workflow runs in an
+independent Tokio task so one account cannot block other accounts.
+
+```http
+POST /api/backtesting/run
+Content-Type: application/json
+
+{
+  "strategy_key": "ichimoku_keltner_tsi",
+  "instrument": "NIFTY",
+  "interval": "FIVE_MINUTE",
+  "lookback_months": 3,
+  "lots": 1,
+  "stop_loss_percent": 5,
+  "target_percent": 20,
+  "keltner_multiplier": 2,
+  "require_volume": false,
+  "slippage_bps": 5,
+  "cost_bps": 2
+}
+```
+
 ## Primary API routes
 
 - `POST /api/auth/request-otp/`, `/signup/`, `/login/`
@@ -322,6 +367,7 @@ otherwise reusable credentials.
 - `GET /api/ws/market` (WebSocket upgrade)
 - `GET /api/strategies`, `PUT /api/strategies/{strategy_key}/activation`
 - `GET|PUT /api/strategy/futures-breakout`
+- `PUT /api/strategy/ichimoku`
 - `GET /api/ws/strategy` (WebSocket upgrade)
 
 The header gear opens account settings. Username, email, mobile number, and

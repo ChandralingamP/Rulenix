@@ -70,6 +70,8 @@ pub async fn estimate(
     user_id: Uuid,
     api_key: &str,
     jwt_token: &str,
+    exchange: &str,
+    product_type: &str,
     token: &str,
     symbol: &str,
     order_type: &str,
@@ -82,11 +84,13 @@ pub async fn estimate(
     }
     let order_type = order_type.to_uppercase();
     let trade_type = trade_type.to_uppercase();
+    let exchange = exchange.to_uppercase();
+    let product_type = product_type.to_uppercase();
     if !matches!(trade_type.as_str(), "BUY" | "SELL") {
         return Err(AppError::BadRequest("Invalid margin side.".into()));
     }
-    let cached: Option<f64> = sqlx::query_scalar("SELECT margin_per_lot FROM broker_margin_estimates WHERE exchange='MCX' AND symbol_token=$1 AND product_type='CARRYFORWARD' AND trade_type=$2 AND lot_size=$3 AND order_type=$4 AND fetched_at>NOW()-INTERVAL '1 day' ORDER BY fetched_at DESC LIMIT 1")
-        .bind(token).bind(&trade_type).bind(lot_size).bind(&order_type).fetch_optional(&state.db).await?;
+    let cached: Option<f64> = sqlx::query_scalar("SELECT margin_per_lot FROM broker_margin_estimates WHERE exchange=$1 AND symbol_token=$2 AND product_type=$3 AND trade_type=$4 AND lot_size=$5 AND order_type=$6 AND fetched_at>NOW()-INTERVAL '1 day' ORDER BY fetched_at DESC LIMIT 1")
+        .bind(&exchange).bind(token).bind(&product_type).bind(&trade_type).bind(lot_size).bind(&order_type).fetch_optional(&state.db).await?;
     if let Some(margin_per_lot) = cached.filter(|value| value.is_finite() && *value > 0.0) {
         return Ok(MarginEstimate {
             margin_per_lot,
@@ -100,6 +104,8 @@ pub async fn estimate(
             state,
             api_key,
             jwt_token,
+            &exchange,
+            &product_type,
             token,
             lot_size,
             &order_type,
@@ -120,8 +126,8 @@ pub async fn estimate(
                 "order_type":order_type,
                 "broker_response":response
             });
-            sqlx::query("INSERT INTO broker_margin_estimates (id,exchange,symbol_token,trading_symbol,product_type,order_type,trade_type,lot_size,margin_per_lot,raw_response,fetched_by) VALUES ($1,'MCX',$2,$3,'CARRYFORWARD',$4,$5,$6,$7,$8,$9) ON CONFLICT (exchange,symbol_token,product_type,order_type,trade_type,lot_size) DO UPDATE SET trading_symbol=EXCLUDED.trading_symbol,margin_per_lot=EXCLUDED.margin_per_lot,raw_response=EXCLUDED.raw_response,fetched_by=EXCLUDED.fetched_by,fetched_at=NOW()")
-                .bind(Uuid::new_v4()).bind(token).bind(symbol).bind(&order_type).bind(&trade_type).bind(lot_size).bind(margin_per_lot).bind(&raw_response).bind(user_id)
+            sqlx::query("INSERT INTO broker_margin_estimates (id,exchange,symbol_token,trading_symbol,product_type,order_type,trade_type,lot_size,margin_per_lot,raw_response,fetched_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (exchange,symbol_token,product_type,order_type,trade_type,lot_size) DO UPDATE SET trading_symbol=EXCLUDED.trading_symbol,margin_per_lot=EXCLUDED.margin_per_lot,raw_response=EXCLUDED.raw_response,fetched_by=EXCLUDED.fetched_by,fetched_at=NOW()")
+                .bind(Uuid::new_v4()).bind(&exchange).bind(token).bind(symbol).bind(&product_type).bind(&order_type).bind(&trade_type).bind(lot_size).bind(margin_per_lot).bind(&raw_response).bind(user_id)
                 .execute(&state.db).await?;
             return Ok(MarginEstimate {
                 margin_per_lot,

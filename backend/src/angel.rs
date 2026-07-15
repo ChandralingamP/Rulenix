@@ -296,16 +296,26 @@ pub async fn get_margin(state: &AppState, api_key: &str, jwt_token: &str) -> App
     Ok(serde_json::json!({"available_balance":available,"provider_data":data}))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn calculate_margin(
     state: &AppState,
     api_key: &str,
     jwt_token: &str,
+    exchange: &str,
+    product_type: &str,
     token: &str,
     quantity: i32,
     order_type: &str,
     trade_type: &str,
 ) -> AppResult<Value> {
-    let body = margin_payload(token, quantity, order_type, trade_type);
+    let body = margin_payload(
+        exchange,
+        product_type,
+        token,
+        quantity,
+        order_type,
+        trade_type,
+    );
     secure_json(
         state,
         reqwest::Method::POST,
@@ -317,18 +327,43 @@ pub async fn calculate_margin(
     .await
 }
 
-fn margin_payload(token: &str, quantity: i32, order_type: &str, trade_type: &str) -> Value {
+fn margin_payload(
+    exchange: &str,
+    product_type: &str,
+    token: &str,
+    quantity: i32,
+    order_type: &str,
+    trade_type: &str,
+) -> Value {
     json!({
         "positions":[{
-            "exchange":"MCX",
+            "exchange":exchange,
             "orderType":order_type,
             "qty":quantity.to_string(),
             "price":"0",
-            "productType":"CARRYFORWARD",
+            "productType":product_type,
             "token":token,
             "tradeType":trade_type,
         }]
     })
+}
+
+pub async fn market_quote(
+    state: &AppState,
+    api_key: &str,
+    jwt_token: &str,
+    mode: &str,
+    exchange_tokens: Value,
+) -> AppResult<Value> {
+    secure_json(
+        state,
+        reqwest::Method::POST,
+        "/rest/secure/angelbroking/market/v1/quote",
+        api_key,
+        jwt_token,
+        Some(json!({"mode":mode,"exchangeTokens":exchange_tokens})),
+    )
+    .await
 }
 
 async fn secure_json(
@@ -396,8 +431,25 @@ pub async fn get_candles_with_interval(
     from_date: &str,
     to_date: &str,
 ) -> AppResult<Value> {
+    get_candles_with_exchange_interval(
+        state, api_key, jwt_token, "MCX", token, interval, from_date, to_date,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn get_candles_with_exchange_interval(
+    state: &AppState,
+    api_key: &str,
+    jwt_token: &str,
+    exchange: &str,
+    token: &str,
+    interval: &str,
+    from_date: &str,
+    to_date: &str,
+) -> AppResult<Value> {
     let body = json!({
-        "exchange":"MCX",
+        "exchange":exchange,
         "symboltoken":token,
         "interval":interval,
         "fromdate":from_date,
@@ -428,6 +480,8 @@ pub async fn get_candles_with_interval(
 pub struct OrderRequest<'a> {
     pub symbol: &'a str,
     pub token: &'a str,
+    pub exchange: &'a str,
+    pub product_type: &'a str,
     pub side: &'a str,
     pub order_type: &'a str,
     pub quantity: i32,
@@ -449,10 +503,15 @@ fn classify_transport(error: &reqwest::Error) -> BrokerErrorClass {
 }
 
 fn order_payload(order: &OrderRequest<'_>) -> Value {
+    let price = if order.order_type == "MARKET" {
+        0.0
+    } else {
+        order.price
+    };
     json!({
         "variety":if order.order_type.starts_with("STOPLOSS") { "STOPLOSS" } else { "NORMAL" },
-        "tradingsymbol":order.symbol,"symboltoken":order.token,"transactiontype":order.side,"exchange":"MCX",
-        "ordertype":order.order_type,"producttype":"CARRYFORWARD","duration":"DAY","price":format!("{:.2}",order.price),
+        "tradingsymbol":order.symbol,"symboltoken":order.token,"transactiontype":order.side,"exchange":order.exchange,
+        "ordertype":order.order_type,"producttype":order.product_type,"duration":"DAY","price":format!("{price:.2}"),
         "squareoff":"0","stoploss":"0","quantity":order.quantity.to_string(),
         "triggerprice":order.trigger_price.map(|value|format!("{value:.2}")).unwrap_or_else(||"0".into()),
         "ordertag":order.client_order_id,
@@ -846,6 +905,8 @@ mod tests {
         let order = OrderRequest {
             symbol: "GOLDTEN",
             token: "1",
+            exchange: "MCX",
+            product_type: "CARRYFORWARD",
             side: "BUY",
             order_type: "LIMIT",
             quantity: 1,
@@ -880,6 +941,8 @@ mod tests {
         let order = OrderRequest {
             symbol: "GOLDTEN",
             token: "1",
+            exchange: "MCX",
+            product_type: "CARRYFORWARD",
             side: "BUY",
             order_type: "STOPLOSS_LIMIT",
             quantity: 1,
@@ -898,7 +961,7 @@ mod tests {
 
     #[test]
     fn margin_payload_includes_required_order_type() {
-        let payload = margin_payload("123", 10, "STOPLOSS_LIMIT", "BUY");
+        let payload = margin_payload("MCX", "CARRYFORWARD", "123", 10, "STOPLOSS_LIMIT", "BUY");
         let position = &payload["positions"][0];
         assert_eq!(position["orderType"], "STOPLOSS_LIMIT");
         assert_eq!(position["productType"], "CARRYFORWARD");

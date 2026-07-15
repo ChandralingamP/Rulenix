@@ -53,6 +53,10 @@ pub struct Snapshot {
     pub contract_symbol: Option<String>,
     pub contract_expiry: Option<NaiveDate>,
     pub lot_size: Option<i32>,
+    pub exchange_segment: String,
+    pub product_type: String,
+    pub execution_key: String,
+    pub underlying_token: String,
     pub candle_dates: Vec<NaiveDate>,
     pub highs: Vec<f64>,
     pub lows: Vec<f64>,
@@ -149,7 +153,7 @@ fn select_contract(
 }
 
 fn snapshot_select() -> &'static str {
-    "SELECT id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,fetched_at FROM strategy_market_snapshots"
+    "SELECT id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,fetched_at FROM strategy_market_snapshots"
 }
 
 async fn load_snapshot(
@@ -345,25 +349,26 @@ async fn record_snapshot_failure(state: &AppState, instrument: &str, date: Naive
 }
 
 #[derive(Debug, FromRow)]
-struct Runner {
-    user_id: Uuid,
-    username: String,
-    instrument: String,
-    lots: i32,
-    run_day_session: bool,
-    run_evening_session: bool,
-    trading_mode: String,
+pub(crate) struct Runner {
+    pub user_id: Uuid,
+    pub username: String,
+    pub instrument: String,
+    pub lots: i32,
+    pub run_day_session: bool,
+    pub run_evening_session: bool,
+    pub trading_mode: String,
 }
 
 #[derive(Debug, Clone)]
-struct NewOrder {
-    role: &'static str,
-    side: &'static str,
-    lots: i32,
-    price: f64,
-    trigger: Option<f64>,
-    trade_id: Option<Uuid>,
-    quantity: Option<i32>,
+pub(crate) struct NewOrder {
+    pub role: &'static str,
+    pub side: &'static str,
+    pub order_type: &'static str,
+    pub lots: i32,
+    pub price: f64,
+    pub trigger: Option<f64>,
+    pub trade_id: Option<Uuid>,
+    pub quantity: Option<i32>,
 }
 
 type ProtectiveRetryRow = (
@@ -379,7 +384,7 @@ type ProtectiveRetryRow = (
     Option<f64>,
 );
 
-async fn place_strategy_order(
+pub(crate) async fn place_strategy_order(
     state: &AppState,
     runner: &Runner,
     snapshot: &Snapshot,
@@ -429,9 +434,11 @@ async fn place_strategy_order(
             runner.user_id,
             &credentials.api_key,
             &credentials.jwt_token,
+            &snapshot.exchange_segment,
+            &snapshot.product_type,
             token,
             symbol,
-            "STOPLOSS_LIMIT",
+            order.order_type,
             order.side,
             lot_size,
             order.lots,
@@ -515,9 +522,12 @@ async fn place_strategy_order(
         return Ok(());
     };
     let client_order_id = format!("RX{}", &id.simple().to_string()[..18]).to_uppercase();
-    sqlx::query("UPDATE strategy_orders SET client_order_id=$2,updated_at=NOW() WHERE id=$1")
+    sqlx::query("UPDATE strategy_orders SET client_order_id=$2,order_type=$3,exchange_segment=$4,product_type=$5,updated_at=NOW() WHERE id=$1")
         .bind(id)
         .bind(&client_order_id)
+        .bind(order.order_type)
+        .bind(&snapshot.exchange_segment)
+        .bind(&snapshot.product_type)
         .execute(&state.db)
         .await?;
     let result = if runner.trading_mode == "live" {
@@ -538,11 +548,6 @@ async fn place_strategy_order(
                 diagnostic: "Required broker credentials are absent.".into(),
             })
         } else {
-            let order_type = if order.trigger.is_some() {
-                "STOPLOSS_LIMIT"
-            } else {
-                "LIMIT"
-            };
             angel::place_order(
                 state,
                 &credentials.api_key,
@@ -550,8 +555,10 @@ async fn place_strategy_order(
                 &angel::OrderRequest {
                     symbol,
                     token,
+                    exchange: &snapshot.exchange_segment,
+                    product_type: &snapshot.product_type,
                     side: order.side,
-                    order_type,
+                    order_type: order.order_type,
                     quantity,
                     price: order.price,
                     trigger_price: order.trigger,
@@ -569,7 +576,7 @@ async fn place_strategy_order(
                 .bind(id).bind(&broker_id).execute(&state.db).await?;
             sqlx::query("INSERT INTO broker_order_events(order_id,user_id,from_state,to_state,event_type,broker_order_id) VALUES($1,$2,$3,'submitted','submission_acknowledged',$4)")
                 .bind(id).bind(runner.user_id).bind(if runner.trading_mode=="live"{"submitting"}else{"pending"}).bind(&broker_id).execute(&state.db).await?;
-            emit(state, Some(runner.user_id), &runner.instrument, "order_submitted", json!({"order_id":id,"broker_order_id":broker_id,"role":order.role,"side":order.side,"price":order.price,"trigger_price":order.trigger,"lots":order.lots,"mode":runner.trading_mode})).await;
+            emit_for(state, &snapshot.strategy_key, Some(runner.user_id), &runner.instrument, "order_submitted", json!({"order_id":id,"broker_order_id":broker_id,"role":order.role,"side":order.side,"order_type":order.order_type,"price":order.price,"trigger_price":order.trigger,"lots":order.lots,"mode":runner.trading_mode})).await;
             crate::logs::append(
                 &runner.username,
                 &format!(
@@ -578,6 +585,11 @@ async fn place_strategy_order(
                 ),
             )
             .await;
+            if runner.trading_mode == "demo" && order.order_type == "MARKET" {
+                let stored: StoredOrder = sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity FROM strategy_orders WHERE id=$1")
+                    .bind(id).fetch_one(&state.db).await?;
+                Box::pin(complete_order(state, stored, order.price)).await?;
+            }
             Ok(())
         }
         Err(error) => {
@@ -595,8 +607,9 @@ async fn place_strategy_order(
                 .bind(id).bind(status).bind(&diagnostic).bind(error.class.as_str()).bind(&error.code).bind(error.status.map(i32::from)).execute(&state.db).await?;
             sqlx::query("INSERT INTO broker_order_events(order_id,user_id,from_state,to_state,event_type,error_class,error_code,http_status,diagnostic) VALUES($1,$2,'submitting',$3,'submission_failed',$4,$5,$6,$7)")
                 .bind(id).bind(runner.user_id).bind(status).bind(error.class.as_str()).bind(&error.code).bind(error.status.map(i32::from)).bind(&diagnostic).execute(&state.db).await?;
-            emit(
+            emit_for(
                 state,
+                &snapshot.strategy_key,
                 Some(runner.user_id),
                 &runner.instrument,
                 "order_failed",
@@ -659,6 +672,7 @@ async fn place_entries(
         NewOrder {
             role: "BUY_ENTRY",
             side: "BUY",
+            order_type: "STOPLOSS_LIMIT",
             lots: runner.lots,
             price: buy,
             trigger: Some(buy),
@@ -675,6 +689,7 @@ async fn place_entries(
         NewOrder {
             role: "SELL_ENTRY",
             side: "SELL",
+            order_type: "STOPLOSS_LIMIT",
             lots: runner.lots,
             price: sell,
             trigger: Some(sell),
@@ -735,8 +750,17 @@ async fn run_entries(
 }
 
 async fn runner_for(state: &AppState, user_id: Uuid, instrument: &str) -> AppResult<Runner> {
+    runner_for_strategy(state, user_id, STRATEGY_KEY, instrument).await
+}
+
+pub(crate) async fn runner_for_strategy(
+    state: &AppState,
+    user_id: Uuid,
+    strategy_key: &str,
+    instrument: &str,
+) -> AppResult<Runner> {
     Ok(sqlx::query_as("SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode FROM user_strategy_configs c JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id WHERE c.user_id=$1 AND c.strategy_key=$2 AND c.instrument=$3 AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))")
-        .bind(user_id).bind(STRATEGY_KEY).bind(instrument).fetch_one(&state.db).await?)
+        .bind(user_id).bind(strategy_key).bind(instrument).fetch_one(&state.db).await?)
 }
 
 #[derive(Debug, FromRow)]
@@ -795,6 +819,11 @@ async fn place_carry_orders(
                 NewOrder {
                     role: if role == "TARGET" { "TARGET" } else { "SL2" },
                     side,
+                    order_type: if role == "TARGET" {
+                        "LIMIT"
+                    } else {
+                        "STOPLOSS_LIMIT"
+                    },
                     lots,
                     price,
                     trigger,
@@ -1162,23 +1191,24 @@ pub fn refresh_after_broker_connect(state: AppState) {
 }
 
 #[derive(Debug, Clone, FromRow)]
-struct StoredOrder {
-    id: Uuid,
-    user_id: Uuid,
-    snapshot_id: Uuid,
-    trade_id: Option<Uuid>,
-    session_key: String,
-    role: String,
-    side: String,
-    execution_mode: String,
-    lots: i32,
-    quantity: i32,
-    price: f64,
-    margin_required: f64,
-    broker_order_id: String,
-    client_order_id: String,
-    status: String,
-    filled_quantity: i32,
+pub(crate) struct StoredOrder {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub snapshot_id: Uuid,
+    pub trade_id: Option<Uuid>,
+    pub session_key: String,
+    pub role: String,
+    pub side: String,
+    pub order_type: String,
+    pub execution_mode: String,
+    pub lots: i32,
+    pub quantity: i32,
+    pub price: f64,
+    pub margin_required: f64,
+    pub broker_order_id: String,
+    pub client_order_id: String,
+    pub status: String,
+    pub filled_quantity: i32,
 }
 
 async fn reconcile_live(state: &AppState) -> AppResult<()> {
@@ -1320,7 +1350,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             by_tag.insert(tag.to_string(), item);
         }
     }
-    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
+    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
             .bind(user_id).fetch_all(&state.db).await?;
     for order in orders {
         let item = if !order.broker_order_id.is_empty() {
@@ -1392,10 +1422,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             if order.status == "cancelling" {
                 continue;
             }
-            let variety = if matches!(
-                order.role.as_str(),
-                "BUY_ENTRY" | "SELL_ENTRY" | "SL1" | "SL2"
-            ) {
+            let variety = if order.order_type.starts_with("STOPLOSS") {
                 "STOPLOSS"
             } else {
                 "NORMAL"
@@ -1487,6 +1514,11 @@ async fn retry_failed_protective_orders(state: &AppState) -> AppResult<()> {
             NewOrder {
                 role,
                 side,
+                order_type: if trigger.is_some() {
+                    "STOPLOSS_LIMIT"
+                } else {
+                    "LIMIT"
+                },
                 lots,
                 price,
                 trigger,
@@ -1510,14 +1542,26 @@ async fn retry_failed_protective_orders(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
-async fn cancel_active_exits(state: &AppState, user_id: Uuid, trade_id: Uuid) -> AppResult<()> {
-    let credentials = state.credentials.load(user_id).await?;
+pub(crate) async fn cancel_active_exits(
+    state: &AppState,
+    user_id: Uuid,
+    trade_id: Uuid,
+) -> AppResult<()> {
     let orders:Vec<(Uuid,String,String)>=sqlx::query_as("SELECT id,broker_order_id,role FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2') AND status='submitted'").bind(trade_id).fetch_all(&state.db).await?;
+    let credentials = if orders
+        .iter()
+        .any(|(_, broker_order_id, _)| !broker_order_id.starts_with("DEMO-"))
+    {
+        Some(state.credentials.load(user_id).await?)
+    } else {
+        None
+    };
     for (id, broker_id, role) in orders {
-        if !broker_id.starts_with("DEMO-")
-            && !credentials.api_key.is_empty()
-            && !credentials.jwt_token.is_empty()
-        {
+        if let Some(credentials) = credentials.as_ref().filter(|credentials| {
+            !broker_id.starts_with("DEMO-")
+                && !credentials.api_key.is_empty()
+                && !credentials.jwt_token.is_empty()
+        }) {
             let variety = if role == "TARGET" {
                 "NORMAL"
             } else {
@@ -1576,7 +1620,11 @@ async fn append_user_log(state: &AppState, user_id: Uuid, message: &str) {
     }
 }
 
-async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppResult<()> {
+pub(crate) async fn complete_order(
+    state: &AppState,
+    order: StoredOrder,
+    fill: f64,
+) -> AppResult<()> {
     let claimed=sqlx::query("UPDATE strategy_orders SET status='processing',filled_price=$2,average_fill_price=$2,filled_quantity=GREATEST(filled_quantity,$3),filled_at=NOW(),state_version=state_version+1,updated_at=NOW() WHERE id=$1 AND status IN ('submitted','partially_filled') AND processed_quantity<$3")
         .bind(order.id).bind(fill).bind(order.quantity).execute(&state.db).await?;
     if claimed.rows_affected() == 0 {
@@ -1587,6 +1635,9 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
         .bind(order.snapshot_id)
         .fetch_one(&state.db)
         .await?;
+    if snapshot.strategy_key == crate::ichimoku_strategy::STRATEGY_KEY {
+        return crate::ichimoku_strategy::complete_order(state, order, snapshot, fill).await;
+    }
     let instrument = snapshot.instrument.clone();
     match order.role.as_str() {
         "BUY_ENTRY" | "SELL_ENTRY" => {
@@ -1642,6 +1693,7 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
                 NewOrder {
                     role: "TARGET",
                     side: exit_side,
+                    order_type: "LIMIT",
                     lots: close_lots.min(order.lots),
                     price: target.unwrap(),
                     trigger: None,
@@ -1661,6 +1713,7 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
                 NewOrder {
                     role: "SL1",
                     side: exit_side,
+                    order_type: "STOPLOSS_LIMIT",
                     lots: order.lots,
                     price: sl1.unwrap(),
                     trigger: sl1,
@@ -1723,6 +1776,7 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
                         NewOrder {
                             role: "SL2",
                             side,
+                            order_type: "STOPLOSS_LIMIT",
                             lots: remaining,
                             price: sl2,
                             trigger: Some(sl2),
@@ -1793,6 +1847,7 @@ async fn complete_order(state: &AppState, order: StoredOrder, fill: f64) -> AppR
                         NewOrder {
                             role: "SL2",
                             side: if trade.0 == "BUY" { "SELL" } else { "BUY" },
+                            order_type: "STOPLOSS_LIMIT",
                             lots: remaining_lots.max(1),
                             price: sl2,
                             trigger: Some(sl2),
@@ -1819,7 +1874,7 @@ pub async fn process_tick(state: &AppState, user_id: Uuid, token: &str, ltp: f64
     risk::record_tick(state, token, ltp).await?;
     sqlx::query("UPDATE trades t SET last_price=($3::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.user_id=$1 AND t.execution_mode='demo' AND t.status='open' AND s.contract_token=$2")
         .bind(user_id).bind(token).bind(ltp).execute(&state.db).await?;
-    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.contract_token=$2 ORDER BY o.created_at")
+    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.order_type,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.contract_token=$2 ORDER BY o.created_at")
         .bind(user_id).bind(token).fetch_all(&state.db).await?;
     for order in orders {
         let triggered = match (order.role.as_str(), order.side.as_str()) {
@@ -1876,6 +1931,19 @@ pub async fn finish_kill_cancellations(
     Ok(())
 }
 
+pub(crate) async fn emit_for(
+    state: &AppState,
+    strategy_key: &str,
+    user_id: Option<Uuid>,
+    instrument: &str,
+    event_type: &str,
+    payload: Value,
+) {
+    let envelope = json!({"type":event_type,"user_id":user_id,"strategy_key":strategy_key,"instrument":instrument,"payload":payload,"created_at":Utc::now()});
+    if let Err(error)=sqlx::query("INSERT INTO strategy_events (user_id,strategy_key,instrument,event_type,payload) VALUES ($1,$2,$3,$4,$5)").bind(user_id).bind(strategy_key).bind(instrument).bind(event_type).bind(&payload).execute(&state.db).await { tracing::warn!(%error,"could not persist strategy event"); }
+    let _ = state.strategy_events.send(envelope);
+}
+
 async fn emit(
     state: &AppState,
     user_id: Option<Uuid>,
@@ -1883,9 +1951,15 @@ async fn emit(
     event_type: &str,
     payload: Value,
 ) {
-    let envelope = json!({"type":event_type,"user_id":user_id,"strategy_key":STRATEGY_KEY,"instrument":instrument,"payload":payload,"created_at":Utc::now()});
-    if let Err(error)=sqlx::query("INSERT INTO strategy_events (user_id,strategy_key,instrument,event_type,payload) VALUES ($1,$2,$3,$4,$5)").bind(user_id).bind(STRATEGY_KEY).bind(instrument).bind(event_type).bind(&payload).execute(&state.db).await { tracing::warn!(%error,"could not persist strategy event"); }
-    let _ = state.strategy_events.send(envelope);
+    emit_for(
+        state,
+        STRATEGY_KEY,
+        user_id,
+        instrument,
+        event_type,
+        payload,
+    )
+    .await;
 }
 
 pub async fn operational_alert(
@@ -1942,11 +2016,19 @@ pub struct ActivationUpdate {
 }
 
 async fn activation_state(state: &AppState, user: Uuid) -> AppResult<bool> {
+    activation_state_for(state, user, STRATEGY_KEY).await
+}
+
+pub(crate) async fn activation_state_for(
+    state: &AppState,
+    user: Uuid,
+    strategy_key: &str,
+) -> AppResult<bool> {
     Ok(sqlx::query_scalar(
         "SELECT is_active FROM user_strategy_activations WHERE user_id=$1 AND strategy_key=$2",
     )
     .bind(user)
-    .bind(STRATEGY_KEY)
+    .bind(strategy_key)
     .fetch_optional(&state.db)
     .await?
     .unwrap_or(false))
@@ -1969,7 +2051,7 @@ pub async fn catalog(
     let runs: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('instrument',instrument,'session',session_key,'action',action,'status',status,'attempts',attempts,'scheduled_for',scheduled_for,'last_error',last_error,'updated_at',updated_at) FROM strategy_scheduler_runs WHERE strategy_key=$1 AND trade_date=$2 ORDER BY scheduled_for,action")
         .bind(STRATEGY_KEY).bind(ist_now().date_naive()).fetch_all(&state.db).await?;
     let instrument = config.unwrap_or((false, 1, true, true));
-    Ok(Json(json!({"strategies":[{
+    let breakout = json!({
         "key":STRATEGY_KEY,
         "name":"Futures Breakout v3",
         "description":"Four-day MCX futures breakout with stop-and-reverse trade management.",
@@ -1985,7 +2067,9 @@ pub async fn catalog(
             "run_evening_session":instrument.3,
             "snapshot":snapshot
         }]
-    }]})))
+    });
+    let ichimoku = crate::ichimoku_strategy::catalog_item(&state, user).await?;
+    Ok(Json(json!({"strategies":[breakout,ichimoku]})))
 }
 
 async fn cancel_pending_entries(state: &AppState, user: Uuid) -> AppResult<()> {
@@ -2021,6 +2105,16 @@ pub async fn update_activation(
     context: Option<Extension<crate::security::RequestContext>>,
     Json(input): Json<ActivationUpdate>,
 ) -> AppResult<Json<Value>> {
+    if strategy_key == crate::ichimoku_strategy::STRATEGY_KEY {
+        return crate::ichimoku_strategy::update_activation(
+            state,
+            auth,
+            headers,
+            context,
+            input.active,
+        )
+        .await;
+    }
     if strategy_key != STRATEGY_KEY {
         return Err(AppError::NotFound("Strategy not found.".into()));
     }

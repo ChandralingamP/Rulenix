@@ -8,6 +8,7 @@ mod config;
 mod credentials;
 mod error;
 mod home;
+mod ichimoku_strategy;
 mod jobs;
 mod logs;
 mod margin;
@@ -165,6 +166,7 @@ async fn main() -> Result<()> {
         abuse_prevention: Default::default(),
     };
     strategy::start(state.clone());
+    ichimoku_strategy::start(state.clone());
     home::start_session_maintenance(state.clone());
     auth::start_session_cleanup(state.clone());
 
@@ -235,6 +237,10 @@ async fn main() -> Result<()> {
         .route(
             "/strategy/futures-breakout",
             get(strategy::status).put(strategy::update),
+        )
+        .route(
+            "/strategy/ichimoku",
+            axum::routing::put(ichimoku_strategy::update),
         )
         .route("/strategies", get(strategy::catalog))
         .route(

@@ -9,6 +9,8 @@ import ForgotPasswordPage from "./pages/ForgotPasswordPage.jsx";
 import VerifyResetOtpPage from "./pages/VerifyResetOtpPage.jsx";
 import ResetPasswordPage from "./pages/ResetPasswordPage.jsx";
 import AdminPage from "./pages/AdminPage.jsx";
+import AdminRiskLimitsPage from "./pages/AdminRiskLimitsPage.jsx";
+import AdminJobsPage from "./pages/AdminJobsPage.jsx";
 import LogsViewerPage from "./pages/LogsViewerPage.jsx";
 import StrategiesPage from "./pages/StrategiesPage.jsx";
 import BacktestingPage from "./pages/BacktestingPage.jsx";
@@ -34,7 +36,10 @@ export default function App() {
           <Route path="pnl" element={<ProfitLossPage />} />
           <Route path="strategies" element={<StrategiesPage />} />
           <Route path="backtesting" element={<BacktestingPage />} />
-          <Route path="admin" element={<AdminPage />} />
+          <Route path="admin" element={<Navigate to="/admin/users" replace />} />
+          <Route path="admin/users" element={<AdminPage />} />
+          <Route path="admin/limits" element={<AdminRiskLimitsPage />} />
+          <Route path="admin/jobs" element={<AdminJobsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
 

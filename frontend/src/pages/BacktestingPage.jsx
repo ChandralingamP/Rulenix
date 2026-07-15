@@ -50,14 +50,64 @@ function Metric({ label, value, tone = "slate" }) {
   );
 }
 
+function EquityCurve({ points }) {
+  if (!Array.isArray(points) || points.length < 2) return null;
+  const values = points.map((point) => Number(point.equity || 0));
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const range = Math.max(maximum - minimum, 1);
+  const path = values
+    .map((value, index) => {
+      const x = (index / (values.length - 1)) * 100;
+      const y = 38 - ((value - minimum) / range) * 34;
+      return `${x},${y}`;
+    })
+    .join(" ");
+  return (
+    <div className="mt-5 rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          Equity curve
+        </p>
+        <p className="text-xs text-slate-500">
+          {currency.format(minimum)} to {currency.format(maximum)}
+        </p>
+      </div>
+      <svg
+        viewBox="0 0 100 42"
+        role="img"
+        aria-label="Cumulative backtest equity curve"
+        className="mt-3 h-36 w-full overflow-visible"
+        preserveAspectRatio="none"
+      >
+        <line x1="0" y1="38" x2="100" y2="38" stroke="rgb(51 65 85)" strokeWidth="0.4" />
+        <polyline
+          points={path}
+          fill="none"
+          stroke="rgb(56 189 248)"
+          strokeWidth="1.2"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </div>
+  );
+}
+
 export default function BacktestingPage() {
   const { session } = useOutletContext();
   const navigate = useNavigate();
   const [form, setForm] = useState({
-    instrument: "GOLDTEN",
-    interval: "FIFTEEN_MINUTE",
+    strategy_key: "ichimoku_keltner_tsi",
+    instrument: "NIFTY",
+    interval: "FIVE_MINUTE",
     lookback_months: 3,
     lots: 1,
+    stop_loss_percent: 5,
+    target_percent: 20,
+    keltner_multiplier: 2,
+    require_volume: false,
+    slippage_bps: 5,
+    cost_bps: 2,
   });
   const [history, setHistory] = useState([]);
   const [result, setResult] = useState(null);
@@ -88,6 +138,8 @@ export default function BacktestingPage() {
   }, [canBacktest, loadHistory, navigate, session?.ready]);
 
   const latestSummary = result?.run?.summary || history[0]?.summary || null;
+  const isIchimoku = form.strategy_key === "ichimoku_keltner_tsi";
+  const summaryIsIchimoku = latestSummary?.strategy_key === "ichimoku_keltner_tsi";
   const recentTrades = useMemo(
     () => (Array.isArray(result?.trades) ? result.trades.slice(-10).reverse() : []),
     [result]
@@ -97,6 +149,14 @@ export default function BacktestingPage() {
     setForm((current) => ({ ...current, [key]: value }));
   };
 
+  const updateStrategy = (strategyKey) => {
+    setForm((current) => ({
+      ...current,
+      strategy_key: strategyKey,
+      instrument: strategyKey === "ichimoku_keltner_tsi" ? "NIFTY" : "GOLDTEN",
+    }));
+  };
+
   const runBacktest = async (event) => {
     event.preventDefault();
     setStatus("running");
@@ -104,10 +164,17 @@ export default function BacktestingPage() {
     setResult(null);
     try {
       const response = await apiClient.post("/backtesting/run", {
+        strategy_key: form.strategy_key,
         instrument: form.instrument,
         interval: form.interval,
         lookback_months: Number(form.lookback_months),
         lots: Number(form.lots),
+        stop_loss_percent: Number(form.stop_loss_percent),
+        target_percent: Number(form.target_percent),
+        keltner_multiplier: Number(form.keltner_multiplier),
+        require_volume: Boolean(form.require_volume),
+        slippage_bps: Number(form.slippage_bps),
+        cost_bps: Number(form.cost_bps),
       });
       setResult(response.data);
       await loadHistory();
@@ -127,7 +194,7 @@ export default function BacktestingPage() {
           </p>
           <h1 className="mt-2 text-3xl font-semibold text-white">Backtesting</h1>
           <p className="mt-2 text-sm text-slate-400">
-            Run Futures Breakout v3 on GOLDTEN historical candles with reusable market data.
+            Research Ichimoku Cloud + Keltner Channel + TSI signals across Indian indices and GOLDTEN.
           </p>
         </div>
         <button
@@ -162,11 +229,17 @@ export default function BacktestingPage() {
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
               Strategy
             </p>
-            <p className="mt-1 text-sm font-semibold text-white">
-              Futures Breakout v3
-            </p>
-            <p className="mt-1 text-xs text-slate-500">
-              futures_breakout_v3
+            <select
+              aria-label="Strategy"
+              value={form.strategy_key}
+              onChange={(event) => updateStrategy(event.target.value)}
+              className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+            >
+              <option value="ichimoku_keltner_tsi">Ichimoku + Keltner + TSI</option>
+              <option value="futures_breakout_v3">Futures Breakout v3</option>
+            </select>
+            <p className="mt-2 text-xs text-slate-500">
+              {form.strategy_key} · backtesting only
             </p>
           </div>
 
@@ -177,7 +250,17 @@ export default function BacktestingPage() {
               onChange={(event) => update("instrument", event.target.value)}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
-              <option value="GOLDTEN">GOLDTEN</option>
+              {isIchimoku ? (
+                <>
+                  <option value="NIFTY">NIFTY 50</option>
+                  <option value="BANKNIFTY">BANK NIFTY</option>
+                  <option value="SENSEX">SENSEX</option>
+                  <option value="MIDCAPNIFTY">NIFTY MID SELECT</option>
+                  <option value="GOLDTEN">GOLDTEN</option>
+                </>
+              ) : (
+                <option value="GOLDTEN">GOLDTEN</option>
+              )}
             </select>
           </label>
 
@@ -210,7 +293,7 @@ export default function BacktestingPage() {
               </select>
             </label>
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Lots
+              {isIchimoku ? "Position size" : "Lots"}
               <input
                 type="number"
                 min="1"
@@ -221,6 +304,82 @@ export default function BacktestingPage() {
               />
             </label>
           </div>
+
+          {isIchimoku ? <div className="grid grid-cols-2 gap-3">
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Stop loss %
+              <input
+                type="number"
+                min="0.01"
+                max="100"
+                step="0.1"
+                value={form.stop_loss_percent}
+                onChange={(event) => update("stop_loss_percent", event.target.value)}
+                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+              />
+            </label>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Target %
+              <input
+                type="number"
+                min="0.01"
+                max="500"
+                step="0.1"
+                value={form.target_percent}
+                onChange={(event) => update("target_percent", event.target.value)}
+                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+              />
+            </label>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Keltner ATR ×
+              <input
+                type="number"
+                min="0.1"
+                max="10"
+                step="0.1"
+                value={form.keltner_multiplier}
+                onChange={(event) => update("keltner_multiplier", event.target.value)}
+                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+              />
+            </label>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Slippage bps
+              <input
+                type="number"
+                min="0"
+                max="1000"
+                step="1"
+                value={form.slippage_bps}
+                onChange={(event) => update("slippage_bps", event.target.value)}
+                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+              />
+            </label>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Cost / side bps
+              <input
+                type="number"
+                min="0"
+                max="1000"
+                step="1"
+                value={form.cost_bps}
+                onChange={(event) => update("cost_bps", event.target.value)}
+                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
+              />
+            </label>
+            <label className="flex items-end gap-2 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <input
+                type="checkbox"
+                checked={form.require_volume}
+                onChange={(event) => update("require_volume", event.target.checked)}
+                className="h-4 w-4 rounded border-slate-600 bg-slate-950 text-brand-500"
+              />
+              Require volume
+            </label>
+          </div> : null}
+
+          {isIchimoku ? <p className="text-xs leading-5 text-slate-500">
+            Signals execute at the next candle open. Index results model directional index points, not historical CE/PE premiums or strikes; GOLDTEN uses its contract lot size. The volume filter is off because cash-index candles commonly report zero volume.
+          </p> : null}
 
           <button
             type="submit"
@@ -253,7 +412,8 @@ export default function BacktestingPage() {
             </div>
 
             {latestSummary ? (
-              <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <>
+                <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <Metric
                   label="Realized P&L"
                   value={currency.format(Number(latestSummary.net_pnl || 0))}
@@ -285,31 +445,67 @@ export default function BacktestingPage() {
                   value={currency.format(Number(latestSummary.max_drawdown || 0))}
                   tone="bad"
                 />
-                <Metric
-                  label="Initial margin"
-                  value={currency.format(Number(latestSummary.initial_margin || 0))}
-                  tone="info"
-                />
-                <Metric
-                  label="Margin / lot"
-                  value={currency.format(
-                    Number(
-                      latestSummary.calculator_margin_per_lot ||
-                        latestSummary.initial_margin_per_lot ||
-                        0
-                    )
-                  )}
-                  tone="info"
-                />
-                <Metric
-                  label="Margin %"
-                  value={`${number.format(Number(latestSummary.margin_requirement_percent || 0))}%`}
-                />
-                <Metric
-                  label="Max margin used"
-                  value={currency.format(Number(latestSummary.max_margin_used || 0))}
-                />
-              </div>
+                {summaryIsIchimoku ? (
+                  <>
+                    <Metric
+                      label="Max drawdown %"
+                      value={`${number.format(Number(latestSummary.max_drawdown_percent || 0))}%`}
+                      tone="bad"
+                    />
+                    <Metric
+                      label="Profit factor"
+                      value={
+                        latestSummary.profit_factor == null
+                          ? "-"
+                          : number.format(Number(latestSummary.profit_factor))
+                      }
+                      tone="info"
+                    />
+                    <Metric
+                      label="Sharpe / trade"
+                      value={
+                        latestSummary.sharpe_ratio == null
+                          ? "-"
+                          : number.format(Number(latestSummary.sharpe_ratio))
+                      }
+                      tone="info"
+                    />
+                    <Metric
+                      label="Costs"
+                      value={currency.format(Number(latestSummary.total_costs || 0))}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Metric
+                      label="Initial margin"
+                      value={currency.format(Number(latestSummary.initial_margin || 0))}
+                      tone="info"
+                    />
+                    <Metric
+                      label="Margin / lot"
+                      value={currency.format(
+                        Number(
+                          latestSummary.calculator_margin_per_lot ||
+                            latestSummary.initial_margin_per_lot ||
+                            0
+                        )
+                      )}
+                      tone="info"
+                    />
+                    <Metric
+                      label="Margin %"
+                      value={`${number.format(Number(latestSummary.margin_requirement_percent || 0))}%`}
+                    />
+                    <Metric
+                      label="Max margin used"
+                      value={currency.format(Number(latestSummary.max_margin_used || 0))}
+                    />
+                  </>
+                )}
+                </div>
+                <EquityCurve points={latestSummary.equity_curve} />
+              </>
             ) : (
               <div className="mt-5 rounded-lg border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">
                 Results will appear here after the first run.
@@ -385,11 +581,11 @@ export default function BacktestingPage() {
                     {run.instrument} {run.interval}
                   </p>
                   <p className="text-xs text-slate-500">
-                    {formatDateTime(run.created_at)}
+                    {run.summary?.strategy_name || run.strategy_key} · {formatDateTime(run.created_at)}
                   </p>
                 </div>
                 <p className="text-slate-300">
-                  {run.lookback_months} months, {run.lots} lots
+                  {run.lookback_months} months, size {run.lots}
                 </p>
                 <p
                   className={`font-semibold ${
@@ -401,14 +597,7 @@ export default function BacktestingPage() {
                   {currency.format(Number(run.summary?.net_pnl || 0))}
                 </p>
                 <p className="text-slate-400">
-                  {currency.format(
-                    Number(
-                      run.summary?.calculator_margin_per_lot ||
-                        run.summary?.initial_margin_per_lot ||
-                        0
-                    )
-                  )}{" "}
-                  / lot
+                  {number.format(Number(run.summary?.win_rate || 0))}% win rate
                 </p>
               </div>
             ))}

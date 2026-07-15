@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { Navigate, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import AccountSettingsModal from "./AccountSettingsModal.jsx";
 import apiClient from "../utils/axiosConfig.js";
 import {
@@ -15,6 +15,12 @@ const baseNavItems = [
   { label: "Home", to: "/" },
   { label: "Strategies", to: "/strategies" },
   { label: "Profit & Loss", to: "/pnl" },
+];
+
+const adminNavItems = [
+  { label: "User control", to: "/admin/users" },
+  { label: "Risk limits", to: "/admin/limits" },
+  { label: "System jobs", to: "/admin/jobs" },
 ];
 
 const balanceFormatter = new Intl.NumberFormat("en-IN", {
@@ -37,20 +43,23 @@ export default function Layout({ children }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [accountBalance, setAccountBalance] = useState(null);
   const [balanceError, setBalanceError] = useState("");
+  const isAdmin = permissions.administer_users;
 
   const navItems = useMemo(() => {
+    if (permissions.administer_users) return adminNavItems;
     const items = [...baseNavItems];
     if (permissions.backtesting) {
       items.push({ label: "Backtesting", to: "/backtesting" });
-    }
-    if (permissions.administer_users) {
-      items.push({ label: "Admin", to: "/admin" });
     }
     return items;
   }, [permissions.administer_users, permissions.backtesting]);
 
   const loadAccountBalance = useCallback(async () => {
-    if (!username) return;
+    if (!username || permissions.administer_users) {
+      setAccountBalance(null);
+      setBalanceError("");
+      return;
+    }
     try {
       setBalanceError("");
       const response = await apiClient.get("/account/balance");
@@ -61,7 +70,7 @@ export default function Layout({ children }) {
         requestError.response?.data?.detail || "Balance unavailable"
       );
     }
-  }, [username]);
+  }, [permissions.administer_users, username]);
 
   const syncAccessStatus = useCallback(async () => {
     try {
@@ -79,7 +88,6 @@ export default function Layout({ children }) {
         setUsername(serverUsername);
       }
       setSessionReady(true);
-      await loadAccountBalance();
     } catch (requestError) {
       if ([401, 404].includes(requestError.response?.status)) {
         clearAuthUsername();
@@ -93,11 +101,11 @@ export default function Layout({ children }) {
         });
       }
     }
-  }, [loadAccountBalance, location.pathname, navigate]);
+  }, [location.pathname, navigate]);
 
   useEffect(() => {
-    loadAccountBalance();
-  }, [loadAccountBalance]);
+    if (sessionReady && !permissions.administer_users) loadAccountBalance();
+  }, [loadAccountBalance, permissions.administer_users, sessionReady]);
 
   useEffect(() => {
     syncAccessStatus();
@@ -204,12 +212,6 @@ export default function Layout({ children }) {
   }, [handleLogout, location.pathname, username]);
 
   useEffect(() => {
-    if (sessionReady && !permissions.administer_users && location.pathname.startsWith("/admin")) {
-      navigate("/", { replace: true });
-    }
-  }, [sessionReady, permissions.administer_users, location.pathname, navigate]);
-
-  useEffect(() => {
     if (sessionReady && !permissions.backtesting && location.pathname.startsWith("/backtesting")) {
       navigate("/", { replace: true });
     }
@@ -227,6 +229,14 @@ export default function Layout({ children }) {
     return null;
   }
 
+  const onAdminRoute = location.pathname.startsWith("/admin");
+  if (isAdmin && !onAdminRoute) {
+    return <Navigate to="/admin/users" replace />;
+  }
+  if (!isAdmin && onAdminRoute) {
+    return <Navigate to="/" replace />;
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-950 to-slate-900">
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col">
@@ -240,7 +250,11 @@ export default function Layout({ children }) {
                 <p className="text-sm uppercase tracking-[0.4em] text-brand-300">
                   Rulenix
                 </p>
-                {tradingMode === "live" ? (
+                {isAdmin ? (
+                  <span className="rounded-full border border-violet-400/50 bg-violet-500/10 px-2 py-[2px] text-[10px] font-semibold uppercase tracking-wide text-violet-200">
+                    Admin
+                  </span>
+                ) : tradingMode === "live" ? (
                   <span className="rounded-full border border-emerald-400/50 bg-emerald-500/10 px-2 py-[2px] text-[10px] font-semibold uppercase tracking-wide text-emerald-200">
                     Live
                   </span>
@@ -251,7 +265,7 @@ export default function Layout({ children }) {
                 )}
               </div>
               <p className="text-xs text-slate-400">
-                Algorithmic Trading Control Center
+                {isAdmin ? "Administration Control Center" : "Algorithmic Trading Control Center"}
               </p>
             </div>
           </div>
@@ -274,32 +288,36 @@ export default function Layout({ children }) {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <div
-              className="rounded-full border border-slate-800 bg-slate-900/60 px-4 py-2 text-xs text-slate-300"
-              title={balanceError || "Available account balance"}
-            >
-              {tradingMode === "live" ? "Live" : "Demo"} balance{" "}
-              <span className="font-semibold text-white">
-                {accountBalance
-                  ? balanceFormatter.format(Number(accountBalance.balance || 0))
-                  : "—"}
-              </span>
-            </div>
+            {!isAdmin ? (
+              <div
+                className="rounded-full border border-slate-800 bg-slate-900/60 px-4 py-2 text-xs text-slate-300"
+                title={balanceError || "Available account balance"}
+              >
+                {tradingMode === "live" ? "Live" : "Demo"} balance{" "}
+                <span className="font-semibold text-white">
+                  {accountBalance
+                    ? balanceFormatter.format(Number(accountBalance.balance || 0))
+                    : "—"}
+                </span>
+              </div>
+            ) : null}
             <div className="rounded-full border border-slate-800 bg-slate-900/60 px-4 py-2 text-xs text-slate-300">
               Logged in as{" "}
               <span className="font-semibold text-white">
                 {username || "Guest"}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-700 bg-slate-900 text-lg text-slate-300 transition hover:border-brand-400 hover:text-brand-200"
-              title="Account settings"
-              aria-label="Account settings"
-            >
-              ⚙
-            </button>
+            {!isAdmin ? (
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true)}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-700 bg-slate-900 text-lg text-slate-300 transition hover:border-brand-400 hover:text-brand-200"
+                title="Account settings"
+                aria-label="Account settings"
+              >
+                ⚙
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => handleLogout("manual", location.pathname)}
@@ -313,20 +331,28 @@ export default function Layout({ children }) {
           {typeof children !== "undefined" ? children : <Outlet context={{ session: { username, permissions, tradingMode, ready: sessionReady }, refreshSession: syncAccessStatus }} />}
         </main>
         <footer className="border-t border-slate-800 px-6 py-6 text-xs text-slate-500">
-          Built for rapid quant experimentation. © {new Date().getFullYear()}{" "}
-          Rulenix.
+          {isAdmin
+            ? "Rulenix administration workspace."
+            : "Built for rapid quant experimentation."}{" "}
+          © {new Date().getFullYear()} Rulenix.
         </footer>
       </div>
-      <AccountSettingsModal
-        open={settingsOpen}
-        username={username}
-        onClose={() => setSettingsOpen(false)}
-        onProfileChanged={handleProfileChanged}
-        onBalanceChanged={setAccountBalance}
-        permissions={permissions}
-        tradingMode={tradingMode}
-        onTradingModeChanged={(mode) => { setTradingMode(mode); syncAccessStatus(); loadAccountBalance(); }}
-      />
+      {!isAdmin ? (
+        <AccountSettingsModal
+          open={settingsOpen}
+          username={username}
+          onClose={() => setSettingsOpen(false)}
+          onProfileChanged={handleProfileChanged}
+          onBalanceChanged={setAccountBalance}
+          permissions={permissions}
+          tradingMode={tradingMode}
+          onTradingModeChanged={(mode) => {
+            setTradingMode(mode);
+            syncAccessStatus();
+            loadAccountBalance();
+          }}
+        />
+      ) : null}
     </div>
   );
 }
