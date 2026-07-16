@@ -1,3 +1,9 @@
 # SQLx migration checksums are byte-sensitive. Keep migration files identical
 # across Windows development and Linux production deployments.
 backend/migrations/*.sql text eol=lf
+
+# These migrations were first applied to production with CRLF bytes. SQLx
+# validates the original bytes, so their exported line endings must stay CRLF.
+backend/migrations/20260713000000_backtesting.sql text eol=crlf
+backend/migrations/20260714000000_margin_estimates.sql text eol=crlf
+backend/migrations/20260714010000_margin_estimate_order_type.sql text eol=crlf
