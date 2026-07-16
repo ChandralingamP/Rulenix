@@ -644,7 +644,10 @@ fn is_expiry_error(message: &str, code: Option<&str>) -> bool {
 
 pub fn is_invalid_api_key_error(message: &str) -> bool {
     let value = message.to_lowercase();
-    value.contains("invalid api key") || value.contains("ag8004")
+    value.contains("invalid api key")
+        || value.contains("ag8004")
+        || value.contains("http 401 unauthorized")
+        || value.contains("http 403 forbidden")
 }
 
 pub async fn refresh_session(
@@ -881,6 +884,9 @@ mod tests {
         assert!(!is_expiry_error("Service temporarily unavailable", None));
         assert!(is_invalid_api_key_error("Invalid API Key"));
         assert!(is_invalid_api_key_error("Broker error AG8004"));
+        assert!(is_invalid_api_key_error(
+            "Angel One API request returned HTTP 403 Forbidden"
+        ));
         assert!(!is_invalid_api_key_error("Service temporarily unavailable"));
     }
 
