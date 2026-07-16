@@ -283,7 +283,21 @@ async fn create_snapshot(
         &format!("{} 00:00", from.format("%Y-%m-%d")),
         &format!("{} 23:59", to.format("%Y-%m-%d")),
     )
-    .await?;
+    .await;
+    let raw = match raw {
+        Ok(value) => value,
+        Err(error) => {
+            if angel::is_invalid_api_key_error(&error.to_string()) {
+                crate::home::mark_invalid(
+                    state,
+                    profile_id,
+                    "Angel One API token is invalid. Please establish the broker connection again.",
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
     let mut candles: Vec<(NaiveDate, f64, f64)> = raw
         .as_array()
         .into_iter()

@@ -642,6 +642,11 @@ fn is_expiry_error(message: &str, code: Option<&str>) -> bool {
         .any(|word| value.contains(word))
 }
 
+pub fn is_invalid_api_key_error(message: &str) -> bool {
+    let value = message.to_lowercase();
+    value.contains("invalid api key") || value.contains("ag8004")
+}
+
 pub async fn refresh_session(
     state: &AppState,
     api_key: &str,
@@ -874,6 +879,9 @@ mod tests {
         assert!(is_expiry_error("Request rejected", Some("AG8001")));
         assert!(is_expiry_error("Invalid API Key", Some("AG8004")));
         assert!(!is_expiry_error("Service temporarily unavailable", None));
+        assert!(is_invalid_api_key_error("Invalid API Key"));
+        assert!(is_invalid_api_key_error("Broker error AG8004"));
+        assert!(!is_invalid_api_key_error("Service temporarily unavailable"));
     }
 
     #[test]

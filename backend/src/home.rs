@@ -65,7 +65,7 @@ fn details(p: &BrokerageProfile, credentials: &BrokerCredentials) -> Value {
     })
 }
 
-async fn mark_invalid(state: &AppState, user_id: Uuid, message: &str) -> AppResult<()> {
+pub(crate) async fn mark_invalid(state: &AppState, user_id: Uuid, message: &str) -> AppResult<()> {
     state.credentials.clear_tokens(user_id).await?;
     sqlx::query("UPDATE user_profiles SET token_state='invalid',last_token_check_at=NOW(),last_token_status='invalid',last_token_message=$2 WHERE user_id=$1")
         .bind(user_id).bind(message).execute(&state.db).await?;

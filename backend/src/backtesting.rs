@@ -491,7 +491,21 @@ pub(crate) async fn fetch_and_cache(
                 .format("%Y-%m-%d %H:%M")
                 .to_string(),
         )
-        .await?;
+        .await;
+        let raw = match raw {
+            Ok(value) => value,
+            Err(error) => {
+                if angel::is_invalid_api_key_error(&error.to_string()) {
+                    crate::home::mark_invalid(
+                        state,
+                        user_id,
+                        "Angel One API token is invalid. Please establish the broker connection again.",
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+        };
         let candles = parse_candles(raw);
         total += candles.len() as i64;
         for candle in &candles {
