@@ -65,6 +65,45 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a persistent reconnect warning for an invalid broker token", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/auth/access/") {
+        return Promise.resolve({
+          data: {
+            username: "TRADER01",
+            permissions: { administer_users: false, live_trading: true },
+            trading_mode: "demo",
+          },
+        });
+      }
+      if (url === "/account/balance") {
+        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
+      }
+      return Promise.resolve({
+        data: {
+          client_id: "TRADER01",
+          api_key_configured: true,
+          connection_state: "invalid",
+          connection_message:
+            "Angel One API token is invalid or expired. Please establish the broker connection again.",
+        },
+      });
+    });
+
+    setAuthUsername("TRADER01");
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    );
+
+    const warning = await screen.findByRole("alert");
+    expect(warning).toHaveTextContent("Angel One API token is invalid");
+    expect(
+      screen.getByRole("link", { name: "Establish broker connection" })
+    ).toHaveAttribute("href", "/#broker-connection");
+  });
+
   it("redirects administrators into an admin-only user workspace", async () => {
     axios.get.mockImplementation((url) => {
       if (url === "/auth/access/") {

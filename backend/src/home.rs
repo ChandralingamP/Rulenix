@@ -210,7 +210,7 @@ async fn maintain_user_session_inner(state: &AppState, user_id: Uuid) -> AppResu
             mark_invalid(
                 state,
                 user_id,
-                "Angel One token is invalid or revoked. Please reconnect.",
+                "Angel One API token is invalid or expired. Please establish the broker connection again.",
             )
             .await?;
         }

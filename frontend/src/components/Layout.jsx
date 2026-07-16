@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useDispatch, useSelector } from "react-redux";
 import { Navigate, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import AccountSettingsModal from "./AccountSettingsModal.jsx";
+import { fetchAccountStatus } from "../features/home/homeSlice.js";
 import apiClient from "../utils/axiosConfig.js";
 import {
   clearAuthUsername,
@@ -30,6 +32,7 @@ const balanceFormatter = new Intl.NumberFormat("en-IN", {
 });
 
 export default function Layout({ children }) {
+  const dispatch = useDispatch();
   const navigate = useNavigate();
   const location = useLocation();
   const [username, setUsername] = useState(() => getAuthUsername());
@@ -43,7 +46,14 @@ export default function Layout({ children }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [accountBalance, setAccountBalance] = useState(null);
   const [balanceError, setBalanceError] = useState("");
+  const brokerDetails = useSelector((state) => state.home.details);
   const isAdmin = permissions.administer_users;
+  const brokerConnectionState = String(
+    brokerDetails?.connection_state || ""
+  ).toLowerCase();
+  const brokerNeedsReconnect = ["invalid", "expired", "failed"].includes(
+    brokerConnectionState
+  );
 
   const navItems = useMemo(() => {
     if (permissions.administer_users) return adminNavItems;
@@ -106,6 +116,12 @@ export default function Layout({ children }) {
   useEffect(() => {
     if (sessionReady && !permissions.administer_users) loadAccountBalance();
   }, [loadAccountBalance, permissions.administer_users, sessionReady]);
+
+  useEffect(() => {
+    if (sessionReady && username && !permissions.administer_users) {
+      dispatch(fetchAccountStatus(username));
+    }
+  }, [dispatch, permissions.administer_users, sessionReady, username]);
 
   useEffect(() => {
     syncAccessStatus();
@@ -327,6 +343,26 @@ export default function Layout({ children }) {
             </button>
           </div>
         </nav>
+        {!isAdmin && brokerNeedsReconnect ? (
+          <div
+            role="alert"
+            className="mx-6 mb-6 flex flex-col gap-3 rounded-2xl border border-rose-500/40 bg-rose-500/10 px-5 py-4 text-rose-100 shadow-lg shadow-rose-950/20 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <div>
+              <p className="font-semibold">Angel One API token is invalid</p>
+              <p className="mt-1 text-sm text-rose-200/90">
+                Update the API key if required, then establish the broker
+                connection again before using live or demo market data.
+              </p>
+            </div>
+            <NavLink
+              to="/#broker-connection"
+              className="shrink-0 rounded-lg bg-rose-500 px-4 py-2 text-center text-sm font-semibold text-white transition hover:bg-rose-400"
+            >
+              Establish broker connection
+            </NavLink>
+          </div>
+        ) : null}
         <main className="flex-1 px-6 pb-12">
           {typeof children !== "undefined" ? children : <Outlet context={{ session: { username, permissions, tradingMode, ready: sessionReady }, refreshSession: syncAccessStatus }} />}
         </main>

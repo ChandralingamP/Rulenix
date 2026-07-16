@@ -12,10 +12,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Debug, Deserialize)]
 pub struct AngelEnvelope<T> {
+    #[serde(alias = "success")]
     pub status: bool,
     #[serde(default, deserialize_with = "null_string")]
     pub message: String,
-    #[serde(default)]
+    #[serde(default, alias = "errorCode")]
     pub errorcode: Option<String>,
     pub data: Option<T>,
 }
@@ -244,17 +245,18 @@ pub async fn create_session(
         )
     })?;
 
-    let (status, payload): (_, AngelEnvelope<AngelSession>) =
-        decode_response(response, "login").await?;
+    let (status, payload): (_, AngelEnvelope<Value>) = decode_response(response, "login").await?;
     if !status.is_success() || !payload.status {
         return Err(AppError::BadRequest(redact_sensitive(
             &payload.message,
             &[api_key, mpin, totp],
         )));
     }
-    payload
+    let data = payload
         .data
-        .ok_or_else(|| AppError::BadRequest("Angel One returned no session tokens".into()))
+        .ok_or_else(|| AppError::BadRequest("Angel One returned no session tokens".into()))?;
+    serde_json::from_value(data)
+        .map_err(|_| AppError::BadRequest("Angel One returned malformed session tokens".into()))
 }
 
 fn numeric_value(value: Option<&Value>) -> Option<f64> {
@@ -632,10 +634,12 @@ pub fn jwt_expires_within(token: &str, seconds: i64) -> bool {
 
 fn is_expiry_error(message: &str, code: Option<&str>) -> bool {
     let value = message.to_lowercase();
-    matches!(code, Some("AG8001" | "AG8002" | "AG8003" | "AB1010"))
-        || ["token", "session", "jwt", "expired", "unauthorized"]
-            .iter()
-            .any(|word| value.contains(word))
+    matches!(
+        code,
+        Some("AG8001" | "AG8002" | "AG8003" | "AG8004" | "AB1010")
+    ) || ["token", "session", "jwt", "expired", "unauthorized"]
+        .iter()
+        .any(|word| value.contains(word))
 }
 
 pub async fn refresh_session(
@@ -716,8 +720,15 @@ fn parse_refresh_response(
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let code = payload.get("errorcode").and_then(Value::as_str);
-    if status.is_success() && payload.get("status").and_then(Value::as_bool) == Some(true) {
+    let code = payload
+        .get("errorcode")
+        .or_else(|| payload.get("errorCode"))
+        .and_then(Value::as_str);
+    let accepted = payload
+        .get("status")
+        .or_else(|| payload.get("success"))
+        .and_then(Value::as_bool);
+    if status.is_success() && accepted == Some(true) {
         let data = payload.get("data").unwrap_or(&Value::Null);
         let jwt = data
             .get("jwtToken")
@@ -861,7 +872,27 @@ mod tests {
     fn recognizes_angel_token_errors() {
         assert!(is_expiry_error("Invalid Token", None));
         assert!(is_expiry_error("Request rejected", Some("AG8001")));
+        assert!(is_expiry_error("Invalid API Key", Some("AG8004")));
         assert!(!is_expiry_error("Service temporarily unavailable", None));
+    }
+
+    #[test]
+    fn accepts_alternate_angel_error_envelope() {
+        let payload: AngelEnvelope<Value> = serde_json::from_slice(
+            br#"{"success":false,"message":"Invalid API Key","errorCode":"AG8004","data":""}"#,
+        )
+        .unwrap();
+        assert!(!payload.status);
+        assert_eq!(payload.errorcode.as_deref(), Some("AG8004"));
+
+        let refresh = parse_refresh_response(
+            reqwest::StatusCode::OK,
+            br#"{"success":false,"message":"Invalid API Key","errorCode":"AG8004","data":""}"#,
+            "api-key",
+            "jwt",
+            "refresh",
+        );
+        assert!(matches!(refresh, RefreshCheck::Invalid(_)));
     }
 
     #[test]

@@ -306,7 +306,7 @@ export default function HomePage() {
             ) : null}
           </article>
 
-          <article className="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
+          <article id="broker-connection" className="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
             <h2 className="text-lg font-semibold text-white">
               Establish Session
             </h2>
