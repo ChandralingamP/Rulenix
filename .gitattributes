@@ -1,0 +1,3 @@
+# SQLx migration checksums are byte-sensitive. Keep migration files identical
+# across Windows development and Linux production deployments.
+backend/migrations/*.sql text eol=lf
