@@ -21,6 +21,7 @@ const SUPPORTED_INSTRUMENT: &str = "GOLDTEN";
 const ICHIMOKU_STRATEGY_KEY: &str = "ichimoku_keltner_tsi";
 const SUPPORTED_ICHIMOKU_INSTRUMENTS: [&str; 5] =
     ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCAPNIFTY", "GOLDTEN"];
+const TRADING_DAY_BLOCK_MESSAGE: &str = "Backtesting is disabled for the entire Indian trading day to reserve Angel One API capacity for live market data and order execution. Try again on a weekend or full market holiday.";
 
 #[derive(Debug, Clone, Deserialize)]
 struct MasterContract {
@@ -186,6 +187,51 @@ pub fn require_backtest_permission(user: &AuthUser) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::Forbidden("Backtesting access required.".into()))
+    }
+}
+
+fn backtesting_allowed_on_date(date: NaiveDate, calendar_sessions: Option<(bool, bool)>) -> bool {
+    let market_open = calendar_sessions
+        .map(|(morning_open, evening_open)| morning_open || evening_open)
+        .unwrap_or_else(|| !matches!(date.weekday(), Weekday::Sat | Weekday::Sun));
+    !market_open
+}
+
+async fn backtesting_availability(state: &AppState) -> AppResult<Value> {
+    let trade_date = Utc::now().with_timezone(&ist_offset()).date_naive();
+    let calendar: Option<(bool, bool, String)> = sqlx::query_as(
+        "SELECT morning_open,evening_open,reason FROM market_calendar WHERE trade_date=$1",
+    )
+    .bind(trade_date)
+    .fetch_optional(&state.db)
+    .await?;
+    let allowed = backtesting_allowed_on_date(
+        trade_date,
+        calendar
+            .as_ref()
+            .map(|(morning, evening, _)| (*morning, *evening)),
+    );
+    let calendar_reason = calendar
+        .as_ref()
+        .map(|(_, _, reason)| reason.as_str())
+        .filter(|reason| !reason.is_empty());
+    Ok(json!({
+        "allowed": allowed,
+        "trade_date": trade_date,
+        "reason": if allowed {
+            calendar_reason.unwrap_or("Non-trading day")
+        } else {
+            TRADING_DAY_BLOCK_MESSAGE
+        }
+    }))
+}
+
+async fn require_non_trading_day(state: &AppState) -> AppResult<()> {
+    let availability = backtesting_availability(state).await?;
+    if availability["allowed"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(TRADING_DAY_BLOCK_MESSAGE.into()))
     }
 }
 
@@ -1589,6 +1635,7 @@ pub async fn run(
     Json(input): Json<BacktestRequest>,
 ) -> AppResult<Json<Value>> {
     require_backtest_permission(&user)?;
+    require_non_trading_day(&state).await?;
     let strategy_key = input
         .strategy_key
         .as_deref()
@@ -1795,14 +1842,26 @@ pub async fn history(
     axum::extract::Extension(user): axum::extract::Extension<AuthUser>,
 ) -> AppResult<Json<Value>> {
     require_backtest_permission(&user)?;
+    let availability = backtesting_availability(&state).await?;
     let runs: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'strategy_key',strategy_key,'instrument',instrument,'trading_symbol',trading_symbol,'interval',interval_key,'lookback_months',lookback_months,'from_time',from_time,'to_time',to_time,'lots',lots,'lot_size',lot_size,'status',status,'summary',summary,'error',error,'data_points',data_points,'reused_points',reused_points,'fetched_points',fetched_points,'created_at',created_at) FROM backtest_runs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20")
         .bind(user.id).fetch_all(&state.db).await?;
-    Ok(Json(json!({"runs":runs})))
+    Ok(Json(json!({"runs":runs,"availability":availability})))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backtesting_is_reserved_for_non_trading_dates() {
+        let weekday = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let weekend = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        assert!(!backtesting_allowed_on_date(weekday, None));
+        assert!(backtesting_allowed_on_date(weekend, None));
+        assert!(backtesting_allowed_on_date(weekday, Some((false, false))));
+        assert!(!backtesting_allowed_on_date(weekday, Some((false, true))));
+        assert!(!backtesting_allowed_on_date(weekend, Some((true, false))));
+    }
 
     fn candle(day: u32, open: f64, high: f64, low: f64, close: f64) -> Candle {
         Candle {

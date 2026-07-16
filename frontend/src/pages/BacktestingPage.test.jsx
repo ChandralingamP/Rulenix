@@ -73,4 +73,27 @@ describe("BacktestingPage", () => {
     expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDTEN");
     expect(screen.queryByLabelText("Stop loss %")).not.toBeInTheDocument();
   });
+
+  it("disables new backtests on an Indian trading day", async () => {
+    apiClient.get.mockResolvedValue({
+      data: {
+        runs: [],
+        availability: {
+          allowed: false,
+          trade_date: "2026-07-16",
+          reason:
+            "Backtesting is disabled for the entire Indian trading day to reserve Angel One API capacity for live market data and order execution.",
+        },
+      },
+    });
+    render(<BacktestingPage />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Backtesting is unavailable today"
+    );
+    expect(
+      screen.getByRole("button", { name: "Backtesting unavailable today" })
+    ).toBeDisabled();
+    expect(apiClient.post).not.toHaveBeenCalled();
+  });
 });

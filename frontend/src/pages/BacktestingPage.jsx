@@ -113,6 +113,7 @@ export default function BacktestingPage() {
   const [result, setResult] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
+  const [availability, setAvailability] = useState(null);
 
   const canBacktest = Boolean(session?.permissions?.backtesting);
 
@@ -121,6 +122,7 @@ export default function BacktestingPage() {
     try {
       const response = await apiClient.get("/backtesting/runs");
       setHistory(Array.isArray(response.data?.runs) ? response.data.runs : []);
+      setAvailability(response.data?.availability || null);
     } catch (requestError) {
       setError(
         requestError.response?.data?.detail || "Unable to load backtest history."
@@ -139,6 +141,7 @@ export default function BacktestingPage() {
 
   const latestSummary = result?.run?.summary || history[0]?.summary || null;
   const isIchimoku = form.strategy_key === "ichimoku_keltner_tsi";
+  const backtestingAllowed = availability?.allowed !== false;
   const summaryIsIchimoku = latestSummary?.strategy_key === "ichimoku_keltner_tsi";
   const recentTrades = useMemo(
     () => (Array.isArray(result?.trades) ? result.trades.slice(-10).reverse() : []),
@@ -224,6 +227,15 @@ export default function BacktestingPage() {
               Historical candles are cached by symbol and interval for future runs.
             </p>
           </div>
+
+          {!backtestingAllowed ? (
+            <div role="alert" className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+              <p className="font-semibold">Backtesting is unavailable today</p>
+              <p className="mt-1 text-xs leading-5 text-amber-200/90">
+                {availability?.reason}
+              </p>
+            </div>
+          ) : null}
 
           <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -383,10 +395,14 @@ export default function BacktestingPage() {
 
           <button
             type="submit"
-            disabled={status === "running" || Number(form.lots) <= 0}
+            disabled={!backtestingAllowed || status === "running" || Number(form.lots) <= 0}
             className="w-full rounded-lg bg-brand-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-brand-500/20 transition hover:bg-brand-400 disabled:cursor-wait disabled:bg-slate-700"
           >
-            {status === "running" ? "Running backtest..." : "Run backtest"}
+            {!backtestingAllowed
+              ? "Backtesting unavailable today"
+              : status === "running"
+                ? "Running backtest..."
+                : "Run backtest"}
           </button>
         </form>
 
