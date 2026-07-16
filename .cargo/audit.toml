@@ -1,0 +1,6 @@
+# SQLx keeps its optional MySQL dependency graph in Cargo.lock even when the
+# application compiles only the PostgreSQL feature set. RUSTSEC-2023-0071 is in
+# rsa through sqlx-mysql; SQLx default features are disabled in backend/Cargo.toml,
+# so neither sqlx-mysql nor rsa is present in the compiled Rulenix dependency tree.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
