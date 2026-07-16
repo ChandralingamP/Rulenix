@@ -2,7 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import axios from "axios";
 import { getAuthUsername } from "../utils/authCookies.js";
-import { PASSWORD_RESET_STORAGE_KEY } from "./ForgotPasswordPage.jsx";
+import {
+  clearPendingPasswordReset,
+  getPendingPasswordReset,
+  setPendingPasswordReset,
+} from "../utils/pendingAuth.js";
 
 import { API_BASE_URL } from "../utils/constants.js";
 
@@ -24,25 +28,13 @@ export default function VerifyResetOtpPage() {
       navigate("/", { replace: true });
       return;
     }
-    if (typeof window === "undefined") {
-      return;
-    }
-    const raw = sessionStorage.getItem(PASSWORD_RESET_STORAGE_KEY);
-    if (!raw) {
+    const pending = getPendingPasswordReset();
+    if (!pending?.email) {
       navigate("/forgot-password", { replace: true });
       return;
     }
-    try {
-      const parsed = JSON.parse(raw);
-      if (!parsed.email) {
-        throw new Error("Invalid payload");
-      }
-      setPendingData(parsed);
-      setInfoMessage(`We emailed a 6-digit OTP to ${parsed.email}.`);
-    } catch (error_) {
-      sessionStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
-      navigate("/forgot-password", { replace: true });
-    }
+    setPendingData(pending);
+    setInfoMessage(`We emailed a 6-digit OTP to ${pending.email}.`);
   }, [navigate]);
 
   const maskedEmail = useMemo(() => {
@@ -82,10 +74,7 @@ export default function VerifyResetOtpPage() {
           email: pendingData.email,
           otp: trimmedOtp,
         };
-        sessionStorage.setItem(
-          PASSWORD_RESET_STORAGE_KEY,
-          JSON.stringify(payload)
-        );
+        setPendingPasswordReset(payload);
         navigate("/forgot-password/reset", { replace: false });
       })
       .catch((verifyError) => {
@@ -113,10 +102,7 @@ export default function VerifyResetOtpPage() {
       )
       .then(() => {
         const payload = { email: pendingData.email };
-        sessionStorage.setItem(
-          PASSWORD_RESET_STORAGE_KEY,
-          JSON.stringify(payload)
-        );
+        setPendingPasswordReset(payload);
         setResendStatus({
           status: "succeeded",
           message: "OTP resent successfully.",
@@ -207,9 +193,7 @@ export default function VerifyResetOtpPage() {
             Entered the wrong email?{" "}
             <Link
               to="/forgot-password"
-              onClick={() =>
-                sessionStorage.removeItem(PASSWORD_RESET_STORAGE_KEY)
-              }
+              onClick={clearPendingPasswordReset}
               className="font-semibold text-brand-300 hover:text-brand-200"
             >
               Start over

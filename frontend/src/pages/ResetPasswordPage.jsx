@@ -3,7 +3,10 @@ import { Link, useNavigate } from "react-router-dom";
 import axios from "axios";
 import { getAuthUsername } from "../utils/authCookies.js";
 import { isStrongPassword } from "../utils/password.js";
-import { PASSWORD_RESET_STORAGE_KEY } from "./ForgotPasswordPage.jsx";
+import {
+  clearPendingPasswordReset,
+  getPendingPasswordReset,
+} from "../utils/pendingAuth.js";
 import { API_BASE_URL } from "../utils/constants.js";
 const LOGIN_NOTICE_KEY = "rulenix_login_notice";
 
@@ -21,24 +24,12 @@ export default function ResetPasswordPage() {
       navigate("/", { replace: true });
       return;
     }
-    if (typeof window === "undefined") {
-      return;
-    }
-    const raw = sessionStorage.getItem(PASSWORD_RESET_STORAGE_KEY);
-    if (!raw) {
+    const pending = getPendingPasswordReset();
+    if (!pending?.email || !pending?.otp) {
       navigate("/forgot-password", { replace: true });
       return;
     }
-    try {
-      const parsed = JSON.parse(raw);
-      if (!parsed.email || !parsed.otp) {
-        throw new Error("Missing reset data");
-      }
-      setResetData(parsed);
-    } catch (error_) {
-      sessionStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
-      navigate("/forgot-password", { replace: true });
-    }
+    setResetData(pending);
   }, [navigate]);
 
   if (!resetData) {
@@ -75,7 +66,7 @@ export default function ResetPasswordPage() {
         { withCredentials: false }
       )
       .then(() => {
-        sessionStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
+        clearPendingPasswordReset();
         if (typeof window !== "undefined") {
           try {
             window.sessionStorage.setItem(

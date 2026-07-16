@@ -405,6 +405,18 @@ pub(crate) async fn place_strategy_order(
     session: &str,
     order: NewOrder,
 ) -> AppResult<()> {
+    if snapshot.strategy_key == STRATEGY_KEY
+        && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY")
+    {
+        let (target, sl1, sl2) = if order.role == "BUY_ENTRY" {
+            (snapshot.buy_target, snapshot.buy_sl1, snapshot.buy_sl2)
+        } else {
+            (snapshot.sell_target, snapshot.sell_sl1, snapshot.sell_sl2)
+        };
+        required_exit_level(target, "target")?;
+        required_exit_level(sl1, "initial stop loss")?;
+        required_exit_level(sl2, "continuation stop loss")?;
+    }
     let lot_size = snapshot
         .lot_size
         .ok_or_else(|| AppError::BadRequest("Snapshot has no contract lot size.".into()))?;
@@ -442,7 +454,7 @@ pub(crate) async fn place_strategy_order(
     } else {
         let credentials = entry_credentials
             .as_ref()
-            .expect("entry credentials are loaded");
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
         crate::margin::estimate(
             state,
             runner.user_id,
@@ -463,7 +475,7 @@ pub(crate) async fn place_strategy_order(
     if runner.trading_mode == "live" && !protective {
         let credentials = entry_credentials
             .as_ref()
-            .expect("entry credentials are loaded");
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
         match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await {
             Ok(_) => {
                 live_reconciled = true;
@@ -1571,24 +1583,49 @@ pub(crate) async fn cancel_active_exits(
         None
     };
     for (id, broker_id, role) in orders {
-        if let Some(credentials) = credentials.as_ref().filter(|credentials| {
-            !broker_id.starts_with("DEMO-")
-                && !credentials.api_key.is_empty()
-                && !credentials.jwt_token.is_empty()
-        }) {
+        if !broker_id.starts_with("DEMO-") {
+            let credentials = credentials
+                .as_ref()
+                .filter(|credentials| {
+                    !credentials.api_key.is_empty() && !credentials.jwt_token.is_empty()
+                })
+                .ok_or_else(|| {
+                    AppError::Unauthorized(
+                        "Cannot cancel the live protective order until Angel One is reconnected."
+                            .into(),
+                    )
+                })?;
             let variety = if role == "TARGET" {
                 "NORMAL"
             } else {
                 "STOPLOSS"
             };
-            let _ = angel::cancel_order(
+            if let Err(error) = angel::cancel_order(
                 state,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
                 variety,
             )
-            .await;
+            .await
+            {
+                let message = format!("Protective order cancellation was not confirmed: {error}");
+                sqlx::query("UPDATE strategy_orders SET broker_status=$2,updated_at=NOW() WHERE id=$1 AND status='submitted'")
+                    .bind(id)
+                    .bind(&message)
+                    .execute(&state.db)
+                    .await?;
+                operational_alert(
+                    state,
+                    Some(user_id),
+                    "",
+                    "protective_cancel_failed",
+                    "error",
+                    &message,
+                )
+                .await;
+                return Err(AppError::BadRequest(message));
+            }
         }
         sqlx::query("UPDATE strategy_orders SET status='cancelled',updated_at=NOW() WHERE id=$1 AND status='submitted'").bind(id).execute(&state.db).await?;
     }
@@ -1602,6 +1639,16 @@ fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
         entry - exit
     };
     movement * units
+}
+
+fn required_exit_level(value: Option<f64>, label: &str) -> AppResult<f64> {
+    value
+        .filter(|level| level.is_finite() && *level > 0.0)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Futures Breakout snapshot has no valid {label}; the position was not opened."
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -1660,7 +1707,7 @@ pub(crate) async fn complete_order(
             } else {
                 "SELL"
             };
-            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64)>("SELECT id,direction,remaining_lots,entry_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
+            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64)>("SELECT id,direction,quantity,entry_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
                 if existing.1!=direction {
                     cancel_active_exits(state,order.user_id,existing.0).await?;
@@ -1685,6 +1732,9 @@ pub(crate) async fn complete_order(
             } else {
                 (snapshot.sell_target, snapshot.sell_sl1, snapshot.sell_sl2)
             };
+            let target = required_exit_level(target, "target")?;
+            let sl1 = required_exit_level(sl1, "initial stop loss")?;
+            let sl2 = required_exit_level(sl2, "continuation stop loss")?;
             let reserved_margin = order.margin_required;
             let mut fill_tx = state.db.begin().await?;
             if order.execution_mode == "demo" {
@@ -1705,17 +1755,14 @@ pub(crate) async fn complete_order(
                 &snapshot,
                 &order.session_key,
                 NewOrder {
-                    role: "TARGET",
+                    role: "SL1",
                     side: exit_side,
-                    order_type: "LIMIT",
-                    lots: close_lots.min(order.lots),
-                    price: target.unwrap(),
-                    trigger: None,
+                    order_type: "STOPLOSS_LIMIT",
+                    lots: order.lots,
+                    price: sl1,
+                    trigger: Some(sl1),
                     trade_id: Some(trade_id),
-                    quantity: Some(
-                        (close_lots.min(order.lots) * snapshot.lot_size.unwrap_or(1))
-                            .min(order.quantity),
-                    ),
+                    quantity: Some(order.quantity),
                 },
             )
             .await?;
@@ -1725,14 +1772,17 @@ pub(crate) async fn complete_order(
                 &snapshot,
                 &order.session_key,
                 NewOrder {
-                    role: "SL1",
+                    role: "TARGET",
                     side: exit_side,
-                    order_type: "STOPLOSS_LIMIT",
-                    lots: order.lots,
-                    price: sl1.unwrap(),
-                    trigger: sl1,
+                    order_type: "LIMIT",
+                    lots: close_lots.min(order.lots),
+                    price: target,
+                    trigger: None,
                     trade_id: Some(trade_id),
-                    quantity: Some(order.quantity),
+                    quantity: Some(
+                        (close_lots.min(order.lots) * snapshot.lot_size.unwrap_or(1))
+                            .min(order.quantity),
+                    ),
                 },
             )
             .await?;
@@ -1754,33 +1804,35 @@ pub(crate) async fn complete_order(
         }
         "TARGET" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,f64,f64,f64)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,entry_price::float8,pnl::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed = order.lots.min(trade.2);
-                let remaining = trade.2 - closed;
-                let realized = trade_pnl(&trade.0, trade.3, fill, closed as f64);
-                let release_margin = if trade.1 > 0 {
-                    trade.5 * closed as f64 / trade.1 as f64
+                let remaining = (trade.2 - closed).max(0);
+                let closed_quantity = order.quantity.min(trade.3).max(0);
+                let remaining_quantity = (trade.3 - closed_quantity).max(0);
+                let realized = trade_pnl(&trade.0, trade.4, fill, closed_quantity as f64);
+                let release_margin = if trade.3 > 0 {
+                    trade.5 * closed_quantity as f64 / trade.3 as f64
                 } else {
                     0.0
                 };
                 let remaining_margin = (trade.5 - release_margin).max(0.0);
                 let mut fill_tx = state.db.begin().await?;
-                if remaining == 0 {
+                if remaining_quantity == 0 {
                     sqlx::query("WITH closed AS (UPDATE trades SET status='closed',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=(pnl::float8+$3)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'").bind(trade_id).bind(fill).bind(realized).bind(release_margin).execute(&mut *fill_tx).await?;
                 } else {
-                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,margin_required=$7,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining*snapshot.lot_size.unwrap_or(1)).bind(fill).bind(realized).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,margin_required=$7,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining_quantity).bind(fill).bind(realized).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status='filled',processed_quantity=GREATEST(processed_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(order.quantity).execute(&mut *fill_tx).await?;
                 fill_tx.commit().await?;
-                if remaining > 0 {
+                if remaining_quantity > 0 {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
                     let sl2 = if trade.0 == "BUY" {
                         snapshot.buy_sl2
                     } else {
                         snapshot.sell_sl2
-                    }
-                    .unwrap();
+                    };
+                    let sl2 = required_exit_level(sl2, "continuation stop loss")?;
                     let side = if trade.0 == "BUY" { "SELL" } else { "BUY" };
                     place_strategy_order(
                         state,
@@ -1795,7 +1847,7 @@ pub(crate) async fn complete_order(
                             price: sl2,
                             trigger: Some(sl2),
                             trade_id: Some(trade_id),
-                            quantity: Some(remaining * snapshot.lot_size.unwrap_or(1)),
+                            quantity: Some(remaining_quantity),
                         },
                     )
                     .await?;
@@ -1812,7 +1864,7 @@ pub(crate) async fn complete_order(
                 let remaining_quantity = trade.1 - closed_quantity;
                 let closed_lots = order.lots.min(trade.2);
                 let remaining_lots = (trade.2 - closed_lots).max(0);
-                let closing_pnl = trade_pnl(&trade.0, trade.3, fill, closed_lots as f64);
+                let closing_pnl = trade_pnl(&trade.0, trade.3, fill, closed_quantity as f64);
                 let pnl = trade.4 + closing_pnl;
                 let release_margin = if trade.1 > 0 {
                     trade.5 * closed_quantity as f64 / trade.1 as f64
@@ -1851,8 +1903,8 @@ pub(crate) async fn complete_order(
                         snapshot.buy_sl2
                     } else {
                         snapshot.sell_sl2
-                    }
-                    .unwrap();
+                    };
+                    let sl2 = required_exit_level(sl2, "continuation stop loss")?;
                     place_strategy_order(
                         state,
                         &runner,
@@ -2330,10 +2382,19 @@ mod tests {
         assert_eq!(trade_pnl("BUY", 100.0, 112.5, 4.0), 50.0);
         assert_eq!(trade_pnl("SELL", 100.0, 87.5, 4.0), 50.0);
         assert_eq!(trade_pnl("BUY", 100.0, 87.5, 4.0), -50.0);
+        assert_eq!(trade_pnl("BUY", 100.0, 101.0, 50.0), 50.0);
         assert_eq!(
             trade_pnl("BUY", 143_398.71, 145_549.70, 1.0).round(),
             2151.0
         );
+    }
+
+    #[test]
+    fn protective_levels_must_be_positive_and_finite() {
+        assert_eq!(required_exit_level(Some(123.45), "target").unwrap(), 123.45);
+        assert!(required_exit_level(None, "target").is_err());
+        assert!(required_exit_level(Some(0.0), "stop loss").is_err());
+        assert!(required_exit_level(Some(f64::NAN), "stop loss").is_err());
     }
     #[test]
     fn catchup_window_is_bounded() {

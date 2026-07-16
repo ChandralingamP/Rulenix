@@ -2,7 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import axios from "axios";
 import { API_BASE_URL } from "../utils/constants.js";
-const PENDING_SIGNUP_KEY = "rulenix_pending_signup";
+import {
+  clearPendingSignup,
+  getPendingSignup,
+} from "../utils/pendingAuth.js";
 
 export default function VerifyOtpPage() {
   const navigate = useNavigate();
@@ -17,19 +20,13 @@ export default function VerifyOtpPage() {
   });
 
   useEffect(() => {
-    const raw = sessionStorage.getItem(PENDING_SIGNUP_KEY);
-    if (!raw) {
+    const pending = getPendingSignup();
+    if (!pending) {
       navigate("/signup", { replace: true });
       return;
     }
-    try {
-      const parsed = JSON.parse(raw);
-      setPendingData(parsed);
-      setInfoMessage(`We emailed a 6-digit OTP to ${parsed.email}.`);
-    } catch (error_) {
-      sessionStorage.removeItem(PENDING_SIGNUP_KEY);
-      navigate("/signup", { replace: true });
-    }
+    setPendingData(pending);
+    setInfoMessage(`We emailed a 6-digit OTP to ${pending.email}.`);
   }, [navigate]);
 
   const maskedEmail = useMemo(() => {
@@ -68,7 +65,7 @@ export default function VerifyOtpPage() {
         { withCredentials: false }
       )
       .then(() => {
-        sessionStorage.removeItem(PENDING_SIGNUP_KEY);
+        clearPendingSignup();
         sessionStorage.setItem("rulenix_login_notice", "Account created. Sign in to continue.");
         navigate("/login", { replace: true });
       })
@@ -180,7 +177,7 @@ export default function VerifyOtpPage() {
             Entered the wrong details?{" "}
             <Link
               to="/signup"
-              onClick={() => sessionStorage.removeItem(PENDING_SIGNUP_KEY)}
+              onClick={clearPendingSignup}
               className="font-semibold text-brand-300 hover:text-brand-200"
             >
               Go back to signup

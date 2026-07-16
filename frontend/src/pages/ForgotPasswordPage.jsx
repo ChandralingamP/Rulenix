@@ -3,8 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import axios from "axios";
 import { getAuthUsername } from "../utils/authCookies.js";
 import { API_BASE_URL } from "../utils/constants.js";
-
-export const PASSWORD_RESET_STORAGE_KEY = "rulenix_password_reset";
+import { setPendingPasswordReset } from "../utils/pendingAuth.js";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
@@ -42,11 +41,7 @@ export default function ForgotPasswordPage() {
         { withCredentials: false }
       )
       .then(() => {
-        const payload = { email: trimmedEmail };
-        sessionStorage.setItem(
-          PASSWORD_RESET_STORAGE_KEY,
-          JSON.stringify(payload)
-        );
+        setPendingPasswordReset({ email: trimmedEmail });
         setInfo("We sent an OTP to your email address.");
         navigate("/forgot-password/verify", {
           replace: false,

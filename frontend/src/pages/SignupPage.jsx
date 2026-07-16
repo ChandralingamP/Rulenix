@@ -3,8 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import apiClient from "../utils/axiosConfig.js";
 import { getAuthUsername } from "../utils/authCookies.js";
 import { isStrongPassword } from "../utils/password.js";
-
-const PENDING_SIGNUP_KEY = "rulenix_pending_signup";
+import { setPendingSignup } from "../utils/pendingAuth.js";
 
 const defaultFormState = {
   username: "",
@@ -105,10 +104,7 @@ export default function SignupPage() {
           password: formState.password,
           confirm_password: formState.confirmPassword,
         };
-        sessionStorage.setItem(
-          PENDING_SIGNUP_KEY,
-          JSON.stringify(pendingPayload)
-        );
+        setPendingSignup(pendingPayload);
         navigate("/verify-otp", {
           replace: false,
           state: { email: trimmedEmail },
