@@ -96,4 +96,37 @@ describe("BacktestingPage", () => {
     ).toBeDisabled();
     expect(apiClient.post).not.toHaveBeenCalled();
   });
+
+  it("offers an Excel trade download for each saved run", async () => {
+    const runId = "a806c209-36bf-4284-b3bb-ec394e174225";
+    apiClient.get.mockResolvedValue({
+      data: {
+        runs: [
+          {
+            id: runId,
+            instrument: "GOLDTEN",
+            interval: "FIFTEEN_MINUTE",
+            trading_symbol: "GOLDTEN30JUL26FUT",
+            from_time: "2026-04-01T00:00:00Z",
+            created_at: "2026-07-18T00:00:00Z",
+            lookback_months: 3,
+            lots: 2,
+            summary: { strategy_name: "Futures Breakout v3", net_pnl: 1200 },
+          },
+        ],
+      },
+    });
+
+    render(<BacktestingPage />);
+
+    const links = await screen.findAllByRole("link", { name: /download/i });
+    expect(links).toHaveLength(2);
+    for (const link of links) {
+      expect(link).toHaveAttribute(
+        "href",
+        `${window.location.origin}/api/backtesting/runs/${runId}/export`
+      );
+      expect(link).toHaveAttribute("download");
+    }
+  });
 });

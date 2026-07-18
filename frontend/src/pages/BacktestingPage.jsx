@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useOutletContext } from "react-router-dom";
 import apiClient from "../utils/axiosConfig.js";
+import { API_BASE_URL } from "../utils/constants.js";
 
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -139,7 +140,8 @@ export default function BacktestingPage() {
     loadHistory();
   }, [canBacktest, loadHistory, navigate, session?.ready]);
 
-  const latestSummary = result?.run?.summary || history[0]?.summary || null;
+  const latestRun = result?.run || history[0] || null;
+  const latestSummary = latestRun?.summary || null;
   const isIchimoku = form.strategy_key === "ichimoku_keltner_tsi";
   const backtestingAllowed = availability?.allowed !== false;
   const summaryIsIchimoku = latestSummary?.strategy_key === "ichimoku_keltner_tsi";
@@ -416,12 +418,23 @@ export default function BacktestingPage() {
                       : "No backtest has been run yet."}
                 </p>
               </div>
-              {result?.run ? (
-                <span className="rounded-full bg-sky-500/10 px-3 py-1 text-xs font-semibold text-sky-300">
-                  {number.format(result.run.reused_points || 0)} reused /{" "}
-                  {number.format(result.run.fetched_points || 0)} fetched
-                </span>
-              ) : null}
+              <div className="flex flex-wrap items-center gap-2">
+                {result?.run ? (
+                  <span className="rounded-full bg-sky-500/10 px-3 py-1 text-xs font-semibold text-sky-300">
+                    {number.format(result.run.reused_points || 0)} reused /{" "}
+                    {number.format(result.run.fetched_points || 0)} fetched
+                  </span>
+                ) : null}
+                {latestRun?.id ? (
+                  <a
+                    href={`${API_BASE_URL}/backtesting/runs/${latestRun.id}/export`}
+                    download
+                    className="rounded-full border border-brand-400/50 bg-brand-500/10 px-3 py-1 text-xs font-semibold text-brand-200 transition hover:border-brand-300 hover:text-white"
+                  >
+                    Download trades
+                  </a>
+                ) : null}
+              </div>
             </div>
 
             {latestSummary ? (
@@ -538,6 +551,7 @@ export default function BacktestingPage() {
                       <th className="px-4 py-3">Side</th>
                       <th className="px-4 py-3">Entry</th>
                       <th className="px-4 py-3">Exit</th>
+                      <th className="px-4 py-3 text-right">Lots / quantity</th>
                       <th className="px-4 py-3">Reason</th>
                       <th className="px-4 py-3 text-right">P&L</th>
                     </tr>
@@ -555,6 +569,10 @@ export default function BacktestingPage() {
                         <td className="px-4 py-3 text-slate-300">
                           {formatDateTime(trade.exit_time)} @{" "}
                           {number.format(Number(trade.exit_price))}
+                        </td>
+                        <td className="px-4 py-3 text-right text-slate-300">
+                          {number.format(Number(trade.lots || 0))} /{" "}
+                          {number.format(Number(trade.quantity || 0))}
                         </td>
                         <td className="px-4 py-3 text-slate-300">
                           {trade.exit_reason}
@@ -587,7 +605,7 @@ export default function BacktestingPage() {
             {history.map((run) => (
               <div
                 key={run.id}
-                className="grid gap-3 px-5 py-4 text-sm md:grid-cols-[1.2fr_1fr_1fr_1fr]"
+                className="grid items-center gap-3 px-5 py-4 text-sm md:grid-cols-[1.2fr_1fr_1fr_1fr_auto]"
               >
                 <div>
                   <p className="font-semibold text-white">
@@ -612,6 +630,13 @@ export default function BacktestingPage() {
                 <p className="text-slate-400">
                   {number.format(Number(run.summary?.win_rate || 0))}% win rate
                 </p>
+                <a
+                  href={`${API_BASE_URL}/backtesting/runs/${run.id}/export`}
+                  download
+                  className="justify-self-start rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 transition hover:border-brand-400 hover:text-brand-200"
+                >
+                  Download
+                </a>
               </div>
             ))}
           </div>

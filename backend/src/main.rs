@@ -211,6 +211,10 @@ async fn main() -> Result<()> {
         .route("/pnl", get(pnl::list))
         .route("/pnl/export", get(pnl::export))
         .route("/backtesting/runs", get(backtesting::history))
+        .route(
+            "/backtesting/runs/{run_id}/export",
+            get(backtesting::export),
+        )
         .route("/backtesting/run", post(backtesting::run))
         .route("/logs/files/", get(logs::files))
         .route("/logs/content/", get(logs::content))

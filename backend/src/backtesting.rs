@@ -5,10 +5,16 @@ use crate::{
     state::AppState,
     strategy::STRATEGY_KEY,
 };
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    body::Body,
+    extract::{Path, State},
+    http::{Response, header},
+};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday,
 };
+use rust_xlsxwriter::Workbook;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sqlx::FromRow;
@@ -134,6 +140,7 @@ struct Position {
     entry_time: DateTime<Utc>,
     entry_price: f64,
     lots: i32,
+    lot_size: i32,
     remaining_lots: i32,
     pnl_multiplier_per_lot: f64,
     margin_per_lot: f64,
@@ -141,6 +148,36 @@ struct Position {
     realized_pnl: f64,
     target_done: bool,
     levels: Levels,
+}
+
+#[derive(Debug, FromRow)]
+struct ExportRun {
+    id: Uuid,
+    strategy_key: String,
+    instrument: String,
+    trading_symbol: String,
+    interval_key: String,
+    from_time: DateTime<Utc>,
+    to_time: DateTime<Utc>,
+    lots: i32,
+    lot_size: i32,
+    summary: Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct ExportTrade {
+    trade_date: NaiveDate,
+    direction: String,
+    entry_time: DateTime<Utc>,
+    entry_price: f64,
+    exit_time: DateTime<Utc>,
+    exit_price: f64,
+    lots: i32,
+    quantity: i32,
+    realized_pnl: f64,
+    exit_reason: String,
+    levels: Value,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -759,13 +796,41 @@ fn close_position(
     reason: &str,
 ) -> TradeResult {
     let pnl_units = position.remaining_lots as f64 * position.pnl_multiplier_per_lot;
-    let pnl = position.realized_pnl
-        + trade_pnl(
-            &position.direction,
-            position.entry_price,
-            exit_price,
-            pnl_units,
+    let final_leg_pnl = trade_pnl(
+        &position.direction,
+        position.entry_price,
+        exit_price,
+        pnl_units,
+    );
+    let pnl = position.realized_pnl + final_leg_pnl;
+    let quantity = position.lots.saturating_mul(position.lot_size);
+    let mut audit_levels = levels_json(position.levels);
+    if let Some(levels) = audit_levels.as_object_mut() {
+        levels.insert("contract_lot_size".into(), json!(position.lot_size));
+        levels.insert("configured_lots".into(), json!(position.lots));
+        levels.insert("quantity".into(), json!(quantity));
+        levels.insert(
+            "partial_exit_lots".into(),
+            json!(position.lots.saturating_sub(position.remaining_lots)),
         );
+        levels.insert(
+            "partial_exit_quantity".into(),
+            json!(
+                position
+                    .lots
+                    .saturating_sub(position.remaining_lots)
+                    .saturating_mul(position.lot_size)
+            ),
+        );
+        levels.insert("partial_realized_pnl".into(), json!(position.realized_pnl));
+        levels.insert("final_leg_lots".into(), json!(position.remaining_lots));
+        levels.insert(
+            "final_leg_quantity".into(),
+            json!(position.remaining_lots.saturating_mul(position.lot_size)),
+        );
+        levels.insert("final_leg_pnl".into(), json!(final_leg_pnl));
+        levels.insert("calculated_pnl".into(), json!(pnl));
+    }
     TradeResult {
         id: Uuid::new_v4(),
         trade_date: position.trade_date,
@@ -775,12 +840,12 @@ fn close_position(
         exit_time: candle.candle_time,
         exit_price,
         lots: position.lots,
-        quantity: position.lots,
+        quantity,
         margin_per_lot: position.margin_per_lot,
         margin_used: position.margin_used,
         realized_pnl: pnl,
         exit_reason: reason.into(),
-        levels: levels_json(position.levels),
+        levels: audit_levels,
     }
 }
 
@@ -918,8 +983,9 @@ fn simulate(
             entry_time: candle.candle_time,
             entry_price,
             lots,
+            lot_size,
             remaining_lots: lots,
-            pnl_multiplier_per_lot: 1.0,
+            pnl_multiplier_per_lot: lot_size as f64,
             margin_per_lot,
             margin_used: margin_per_lot * lots as f64,
             realized_pnl: 0.0,
@@ -1000,7 +1066,7 @@ fn simulate(
         "profit_factor": (gross_loss.abs() > 0.0).then_some(gross_profit / gross_loss.abs()),
         "max_drawdown": max_drawdown,
         "lot_size": lot_size,
-        "pnl_multiplier_per_lot": 1.0,
+        "pnl_multiplier_per_lot": lot_size,
         "entry_frequency": "one_per_session",
         "margin_requirement_percent": margin_requirement_percent,
         "initial_margin_per_lot": initial_margin_per_lot,
@@ -1847,6 +1913,249 @@ pub async fn history(
     Ok(Json(json!({"runs":runs,"availability":availability})))
 }
 
+pub async fn export(
+    State(state): State<AppState>,
+    axum::extract::Extension(user): axum::extract::Extension<AuthUser>,
+    Path(run_id): Path<Uuid>,
+) -> AppResult<Response<Body>> {
+    require_backtest_permission(&user)?;
+    let run: ExportRun = sqlx::query_as(
+        "SELECT id,strategy_key,instrument,trading_symbol,interval_key,from_time,to_time,lots,lot_size,summary,created_at FROM backtest_runs WHERE id=$1 AND user_id=$2",
+    )
+    .bind(run_id)
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Backtest run not found.".into()))?;
+    let trades: Vec<ExportTrade> = sqlx::query_as(
+        "SELECT trade_date,direction,entry_time,entry_price,exit_time,exit_price,lots,quantity,realized_pnl,exit_reason,levels FROM backtest_trades WHERE run_id=$1 ORDER BY entry_time,id",
+    )
+    .bind(run.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut workbook = Workbook::new();
+    let summary = workbook.add_worksheet();
+    summary
+        .set_name("Summary")
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let summary_rows = [
+        ("Run ID", run.id.to_string()),
+        ("Strategy", run.strategy_key.clone()),
+        ("Instrument", run.instrument.clone()),
+        ("Trading symbol", run.trading_symbol.clone()),
+        ("Interval", run.interval_key.clone()),
+        ("From", run.from_time.to_rfc3339()),
+        ("To", run.to_time.to_rfc3339()),
+        ("Configured lots", run.lots.to_string()),
+        ("Contract lot size", run.lot_size.to_string()),
+        (
+            "Contract quantity",
+            run.lots.saturating_mul(run.lot_size).to_string(),
+        ),
+        ("Trades", trades.len().to_string()),
+        (
+            "Net P&L",
+            run.summary
+                .get("net_pnl")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .to_string(),
+        ),
+        ("Created", run.created_at.to_rfc3339()),
+    ];
+    for (row, (label, value)) in summary_rows.iter().enumerate() {
+        summary
+            .write_string(row as u32, 0, *label)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        summary
+            .write_string(row as u32, 1, value)
+            .map_err(|error| AppError::Internal(error.into()))?;
+    }
+    summary
+        .set_column_width(0, 24)
+        .map_err(|error| AppError::Internal(error.into()))?;
+    summary
+        .set_column_width(1, 44)
+        .map_err(|error| AppError::Internal(error.into()))?;
+
+    let sheet = workbook.add_worksheet();
+    sheet
+        .set_name("Trades")
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let headings = [
+        "#",
+        "Trade date",
+        "Side",
+        "Entry time",
+        "Entry price",
+        "Exit time",
+        "Exit price",
+        "Price movement",
+        "Configured lots",
+        "Contract lot size",
+        "Contract quantity",
+        "Partial exit lots",
+        "Partial exit quantity",
+        "Partial P&L",
+        "Final leg lots",
+        "Final leg quantity",
+        "Final leg P&L",
+        "Gross P&L",
+        "Costs",
+        "Realized P&L",
+        "Exit reason",
+        "Calculation check",
+    ];
+    for (column, heading) in headings.iter().enumerate() {
+        sheet
+            .write_string(0, column as u16, *heading)
+            .map_err(|error| AppError::Internal(error.into()))?;
+    }
+    for (index, trade) in trades.iter().enumerate() {
+        let row = (index + 1) as u32;
+        let movement = if trade.direction == "BUY" {
+            trade.exit_price - trade.entry_price
+        } else {
+            trade.entry_price - trade.exit_price
+        };
+        let partial_pnl = trade
+            .levels
+            .get("partial_realized_pnl")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let partial_exit_lots = trade
+            .levels
+            .get("partial_exit_lots")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let partial_exit_quantity = trade
+            .levels
+            .get("partial_exit_quantity")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let final_leg_lots = trade
+            .levels
+            .get("final_leg_lots")
+            .and_then(Value::as_i64)
+            .unwrap_or(trade.lots as i64);
+        let final_leg_quantity = trade
+            .levels
+            .get("final_leg_quantity")
+            .and_then(Value::as_i64)
+            .unwrap_or(trade.quantity as i64);
+        let final_leg_pnl = trade
+            .levels
+            .get("final_leg_pnl")
+            .and_then(Value::as_f64)
+            .unwrap_or(movement * trade.quantity as f64);
+        let gross_pnl = trade
+            .levels
+            .get("gross_pnl")
+            .and_then(Value::as_f64)
+            .unwrap_or(trade.realized_pnl);
+        let costs = trade
+            .levels
+            .get("costs")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let calculation = if run.strategy_key == STRATEGY_KEY {
+            format!(
+                "{partial_pnl:.4} + {final_leg_pnl:.4} = {:.4}",
+                trade.realized_pnl
+            )
+        } else {
+            format!("{gross_pnl:.4} - {costs:.4} = {:.4}", trade.realized_pnl)
+        };
+        sheet
+            .write_number(row, 0, (index + 1) as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 1, trade.trade_date.to_string())
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 2, &trade.direction)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 3, trade.entry_time.to_rfc3339())
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 4, trade.entry_price)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 5, trade.exit_time.to_rfc3339())
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 6, trade.exit_price)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 7, movement)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 8, trade.lots as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 9, run.lot_size as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 10, trade.quantity as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 11, partial_exit_lots as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 12, partial_exit_quantity as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 13, partial_pnl)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 14, final_leg_lots as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 15, final_leg_quantity as f64)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 16, final_leg_pnl)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 17, gross_pnl)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 18, costs)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_number(row, 19, trade.realized_pnl)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 20, &trade.exit_reason)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 21, calculation)
+            .map_err(|error| AppError::Internal(error.into()))?;
+    }
+    for (column, width) in [(3, 24), (5, 24), (20, 18), (21, 34)] {
+        sheet
+            .set_column_width(column, width)
+            .map_err(|error| AppError::Internal(error.into()))?;
+    }
+
+    let bytes = workbook
+        .save_to_buffer()
+        .map_err(|error| AppError::Internal(error.into()))?;
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=Rulenix-Backtest-{}.xlsx", run.id),
+        )
+        .body(Body::from(bytes))
+        .map_err(|error| AppError::Internal(error.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_does_not_multiply_pnl_by_broker_lot_size() {
+    fn simulator_multiplies_gold_pnl_by_contract_lot_size() {
         let daily = vec![
             candle(1, 95.0, 100.0, 90.0, 96.0),
             candle(2, 96.0, 101.0, 91.0, 97.0),
@@ -1939,7 +2248,7 @@ mod tests {
                 levels.buy_target,
             ),
         ];
-        let (trades, _) = simulate(
+        let (trades, summary) = simulate(
             &intraday,
             &daily,
             10,
@@ -1948,11 +2257,15 @@ mod tests {
             Some(13_218.0),
             Some(13_218.0),
         );
-        let expected = levels.buy_target - levels.buy_entry;
+        let expected = (levels.buy_target - levels.buy_entry) * 10.0;
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].exit_reason, "TARGET");
-        assert_eq!(trades[0].quantity, 1);
+        assert_eq!(trades[0].quantity, 10);
         assert!((trades[0].realized_pnl - expected).abs() < 1e-9);
+        assert_eq!(summary["pnl_multiplier_per_lot"], 10);
+        assert_eq!(trades[0].levels["contract_lot_size"], 10);
+        assert_eq!(trades[0].levels["partial_exit_quantity"], 10);
+        assert_eq!(trades[0].levels["final_leg_quantity"], 0);
     }
 
     #[test]
