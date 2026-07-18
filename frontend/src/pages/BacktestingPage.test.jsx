@@ -45,7 +45,7 @@ describe("BacktestingPage", () => {
     render(<BacktestingPage />);
 
     expect(await screen.findByText("Ichimoku + Keltner + TSI", { selector: "option" })).toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("Instrument"), "BANKNIFTY");
+    await user.selectOptions(screen.getByLabelText("Instrument"), "SENSEX");
     fireEvent.submit(screen.getByRole("button", { name: "Run backtest" }).closest("form"));
 
     await waitFor(() =>
@@ -53,7 +53,7 @@ describe("BacktestingPage", () => {
         "/backtesting/run",
         expect.objectContaining({
           strategy_key: "ichimoku_keltner_tsi",
-          instrument: "BANKNIFTY",
+          instrument: "SENSEX",
           interval: "FIVE_MINUTE",
           stop_loss_percent: 5,
           target_percent: 20,

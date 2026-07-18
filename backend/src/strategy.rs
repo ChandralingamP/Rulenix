@@ -405,9 +405,7 @@ pub(crate) async fn place_strategy_order(
     session: &str,
     order: NewOrder,
 ) -> AppResult<()> {
-    if snapshot.strategy_key == STRATEGY_KEY
-        && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY")
-    {
+    if snapshot.strategy_key == STRATEGY_KEY && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY") {
         let (target, sl1, sl2) = if order.role == "BUY_ENTRY" {
             (snapshot.buy_target, snapshot.buy_sl1, snapshot.buy_sl2)
         } else {
@@ -2240,8 +2238,10 @@ pub async fn update(
         .unwrap_or_else(|| "GOLDTEN".into())
         .trim()
         .to_uppercase();
-    if instrument.is_empty() || instrument.len() > 32 {
-        return Err(AppError::BadRequest("Invalid instrument.".into()));
+    if instrument != "GOLDTEN" {
+        return Err(AppError::BadRequest(
+            "Futures Breakout supports only GOLDTEN.".into(),
+        ));
     }
     if input.enabled && !activation_state(&state, user).await? {
         return Err(AppError::BadRequest(

@@ -197,7 +197,7 @@ export default function BacktestingPage() {
           </p>
           <h1 className="mt-2 text-3xl font-semibold text-white">Backtesting</h1>
           <p className="mt-2 text-sm text-slate-400">
-            Research Ichimoku Cloud + Keltner Channel + TSI signals across Indian indices and GOLDTEN.
+            Research Ichimoku Cloud + Keltner Channel + TSI signals for NIFTY 50 and SENSEX.
           </p>
         </div>
         <button
@@ -265,10 +265,7 @@ export default function BacktestingPage() {
               {isIchimoku ? (
                 <>
                   <option value="NIFTY">NIFTY 50</option>
-                  <option value="BANKNIFTY">BANK NIFTY</option>
                   <option value="SENSEX">SENSEX</option>
-                  <option value="MIDCAPNIFTY">NIFTY MID SELECT</option>
-                  <option value="GOLDTEN">GOLDTEN</option>
                 </>
               ) : (
                 <option value="GOLDTEN">GOLDTEN</option>

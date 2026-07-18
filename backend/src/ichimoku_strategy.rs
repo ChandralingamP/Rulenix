@@ -28,7 +28,7 @@ use tokio::{sync::Mutex, task::JoinSet, time::MissedTickBehavior};
 use uuid::Uuid;
 
 pub const STRATEGY_KEY: &str = "ichimoku_keltner_tsi";
-const INSTRUMENTS: [&str; 5] = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCAPNIFTY", "GOLDTEN"];
+const INSTRUMENTS: [&str; 2] = ["NIFTY", "SENSEX"];
 const MASTER_URL: &str =
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json";
 
@@ -180,7 +180,7 @@ fn configured_session_open(config: &Config, now: DateTime<FixedOffset>) -> bool 
 }
 
 async fn active_configs(state: &AppState) -> AppResult<Vec<Config>> {
-    Ok(sqlx::query_as("SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode,c.interval_key,c.stop_loss_percent,c.target_percent,c.keltner_multiplier,c.require_volume,c.premium_min,c.premium_max FROM user_strategy_configs c JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id WHERE c.strategy_key=$1 AND c.enabled=TRUE AND a.is_active=TRUE AND u.is_active=TRUE AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE)) ORDER BY c.instrument,c.user_id")
+    Ok(sqlx::query_as("SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode,c.interval_key,c.stop_loss_percent,c.target_percent,c.keltner_multiplier,c.require_volume,c.premium_min,c.premium_max FROM user_strategy_configs c JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id WHERE c.strategy_key=$1 AND c.instrument IN ('NIFTY','SENSEX') AND c.enabled=TRUE AND a.is_active=TRUE AND u.is_active=TRUE AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE)) ORDER BY c.instrument,c.user_id")
         .bind(STRATEGY_KEY).fetch_all(&state.db).await?)
 }
 
@@ -860,7 +860,7 @@ pub async fn catalog_item(state: &AppState, user_id: Uuid) -> AppResult<Value> {
     Ok(json!({
         "key":STRATEGY_KEY,
         "name":"Ichimoku + Keltner + TSI",
-        "description":"Continuous multi-confirmation strategy: CE/PE premium selection for Indian indices and direct GOLDTEN futures execution.",
+        "description":"Continuous multi-confirmation options strategy for NIFTY 50 and SENSEX.",
         "active":active,
         "operational_alerts":alerts,
         "scheduler_runs":[],
@@ -1310,6 +1310,10 @@ mod tests {
     #[test]
     fn live_configuration_rejects_unsafe_values() {
         assert!(validate_update(&update("nifty")).is_ok());
+        assert!(validate_update(&update("SENSEX")).is_ok());
+        assert!(validate_update(&update("BANKNIFTY")).is_err());
+        assert!(validate_update(&update("MIDCAPNIFTY")).is_err());
+        assert!(validate_update(&update("GOLDTEN")).is_err());
         let mut invalid = update("NIFTY");
         invalid.premium_max = Some(100.0);
         assert!(validate_update(&invalid).is_err());

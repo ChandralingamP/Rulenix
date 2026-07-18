@@ -19,8 +19,7 @@ const MASTER_URL: &str =
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json";
 const SUPPORTED_INSTRUMENT: &str = "GOLDTEN";
 const ICHIMOKU_STRATEGY_KEY: &str = "ichimoku_keltner_tsi";
-const SUPPORTED_ICHIMOKU_INSTRUMENTS: [&str; 5] =
-    ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCAPNIFTY", "GOLDTEN"];
+const SUPPORTED_ICHIMOKU_INSTRUMENTS: [&str; 2] = ["NIFTY", "SENSEX"];
 const TRADING_DAY_BLOCK_MESSAGE: &str = "Backtesting is disabled for the entire Indian trading day to reserve Angel One API capacity for live market data and order execution. Try again on a weekend or full market holiday.";
 
 #[derive(Debug, Clone, Deserialize)]

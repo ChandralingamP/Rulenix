@@ -96,9 +96,9 @@ export default function StrategiesPage() {
     }));
   };
 
-  const saveInstrument = (strategy, instrument) => {
+  const saveInstrument = (strategy, instrument, changes = {}) => {
     const key = `${strategy.key}:${instrument.instrument}`;
-    const draft = drafts[key];
+    const draft = { ...drafts[key], ...changes };
     const lots = Number(draft?.lots);
     if (!Number.isInteger(lots) || lots <= 0) return;
     dispatch(
@@ -375,11 +375,19 @@ export default function StrategiesPage() {
                                 <Toggle
                                   active={Boolean(draft.enabled)}
                                   label={`Use ${instrument.instrument} in ${strategy.name}`}
-                                  onChange={() =>
+                                  disabled={instrumentKey === key}
+                                  onChange={() => {
+                                    const enabled = !draft.enabled;
                                     updateDraft(key, {
-                                      enabled: !draft.enabled,
-                                    })
-                                  }
+                                      enabled,
+                                    });
+                                    if (isIchimoku) {
+                                      saveInstrument(strategy, instrument, {
+                                        ...draft,
+                                        enabled,
+                                      });
+                                    }
+                                  }}
                                 />
                               </td>
                               <td className="px-4 py-4 text-right">

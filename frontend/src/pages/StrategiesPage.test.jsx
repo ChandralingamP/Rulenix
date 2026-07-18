@@ -152,12 +152,74 @@ describe("StrategiesPage", () => {
     expect(screen.queryByText("Older broker issue")).not.toBeInTheDocument();
   });
 
+  it("persists an Ichimoku instrument toggle immediately through its dedicated route", async () => {
+    setAuthUsername("TRADER01");
+    const nifty = {
+      instrument: "NIFTY",
+      label: "NIFTY 50 Options",
+      enabled: false,
+      lots: 1,
+      run_day_session: true,
+      run_evening_session: false,
+      interval_key: "FIVE_MINUTE",
+      stop_loss_percent: 5,
+      target_percent: 20,
+      keltner_multiplier: 2,
+      require_volume: false,
+      premium_min: 200,
+      premium_max: 300,
+      snapshot: null,
+    };
+    const ichimoku = {
+      key: "ichimoku_keltner_tsi",
+      name: "Ichimoku + Keltner + TSI",
+      description: "Continuous NIFTY 50 and SENSEX options strategy.",
+      active: true,
+      instruments: [nifty],
+    };
+    apiClient.get
+      .mockResolvedValueOnce({ data: { strategies: [ichimoku] } })
+      .mockResolvedValue({
+        data: {
+          strategies: [
+            { ...ichimoku, instruments: [{ ...nifty, enabled: true }] },
+          ],
+        },
+      });
+    apiClient.put.mockResolvedValue({ data: {} });
+    const store = configureStore({ reducer: { strategies: strategiesReducer } });
+    const user = userEvent.setup();
+
+    render(
+      <Provider store={store}>
+        <StrategiesPage />
+      </Provider>
+    );
+
+    await user.click(
+      await screen.findByRole("switch", {
+        name: /Use NIFTY in Ichimoku \+ Keltner \+ TSI/i,
+      })
+    );
+
+    await waitFor(() =>
+      expect(apiClient.put).toHaveBeenCalledWith(
+        "/strategy/ichimoku",
+        expect.objectContaining({
+          instrument: "NIFTY",
+          enabled: true,
+          lots: 1,
+        })
+      )
+    );
+  });
+
   it("saves Ichimoku live execution parameters through its dedicated route", async () => {
     setAuthUsername("TRADER01");
     const ichimoku = {
       key: "ichimoku_keltner_tsi",
       name: "Ichimoku + Keltner + TSI",
-      description: "Continuous index options and GOLDTEN strategy.",
+      description: "Continuous NIFTY 50 and SENSEX options strategy.",
       active: true,
       instruments: [
         {
