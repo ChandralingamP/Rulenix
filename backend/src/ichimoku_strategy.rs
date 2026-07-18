@@ -204,8 +204,15 @@ fn parse_expiry(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&value.to_uppercase(), "%d%b%Y").ok()
 }
 
-async fn contract_master(state: &AppState) -> AppResult<Vec<MasterContract>> {
-    state
+async fn contract_master(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>> {
+    let cache = CONTRACT_MASTER_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().await;
+    if let Some((fetched_at, contracts)) = cached.as_ref()
+        && fetched_at.elapsed() < CONTRACT_MASTER_CACHE_TTL
+    {
+        return Ok(Arc::clone(contracts));
+    }
+    let contracts = state
         .http
         .get(MASTER_URL)
         .send()
@@ -223,10 +230,16 @@ async fn contract_master(state: &AppState) -> AppResult<Vec<MasterContract>> {
         .await
         .map_err(|error| {
             AppError::BadRequest(format!("Invalid Angel One contract master: {error}"))
-        })
+        })?;
+    let contracts = Arc::new(contracts);
+    *cached = Some((std::time::Instant::now(), Arc::clone(&contracts)));
+    Ok(contracts)
 }
 
 static QUOTE_RATE_LIMIT: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+type ContractMasterCache = Mutex<Option<(std::time::Instant, Arc<Vec<MasterContract>>)>>;
+static CONTRACT_MASTER_CACHE: OnceLock<ContractMasterCache> = OnceLock::new();
+const CONTRACT_MASTER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 async fn quotes(
     state: &AppState,
@@ -261,6 +274,90 @@ fn quote_rows(value: &Value) -> Vec<&Value> {
         .collect()
 }
 
+fn option_market(instrument: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match instrument {
+        "NIFTY" => Some(("NFO", &["NIFTY"])),
+        "SENSEX" => Some(("BFO", &["SENSEX"])),
+        _ => None,
+    }
+}
+
+fn is_option_symbol(symbol: &str) -> bool {
+    let symbol = symbol.to_uppercase();
+    symbol.ends_with("CE") || symbol.ends_with("PE")
+}
+
+fn option_contract_preview(
+    master: &[MasterContract],
+    instrument: &str,
+    today: NaiveDate,
+) -> AppResult<(&'static str, NaiveDate, i32)> {
+    let (exchange, names) = option_market(instrument).ok_or_else(|| {
+        AppError::BadRequest("Options are available only for NIFTY 50 and SENSEX.".into())
+    })?;
+    let expiry = master
+        .iter()
+        .filter(|item| {
+            item.exch_seg.eq_ignore_ascii_case(exchange)
+                && names
+                    .iter()
+                    .any(|name| item.name.eq_ignore_ascii_case(name))
+                && item.instrumenttype.eq_ignore_ascii_case("OPTIDX")
+                && is_option_symbol(&item.symbol)
+        })
+        .filter_map(|item| parse_expiry(&item.expiry))
+        .filter(|expiry| *expiry >= today)
+        .min()
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "No current {instrument} option expiry was found in the Angel One contract master."
+            ))
+        })?;
+    let lot_size = master
+        .iter()
+        .filter(|item| {
+            item.exch_seg.eq_ignore_ascii_case(exchange)
+                && names
+                    .iter()
+                    .any(|name| item.name.eq_ignore_ascii_case(name))
+                && item.instrumenttype.eq_ignore_ascii_case("OPTIDX")
+                && parse_expiry(&item.expiry) == Some(expiry)
+        })
+        .find_map(|item| {
+            item.lotsize
+                .parse::<f64>()
+                .ok()
+                .map(|value| value as i32)
+                .filter(|value| *value > 0)
+        })
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "The Angel One contract master has no valid {instrument} lot size."
+            ))
+        })?;
+    Ok((exchange, expiry, lot_size))
+}
+
+async fn refresh_contract_preview(state: &AppState, instrument: &str) -> AppResult<()> {
+    let master = contract_master(state).await?;
+    let today = ist_now().date_naive();
+    let (exchange, expiry, lot_size) = option_contract_preview(&master, instrument, today)?;
+    let underlying = index_contract(instrument)
+        .ok_or_else(|| AppError::BadRequest("Unsupported Ichimoku instrument.".into()))?;
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,fetched_at) VALUES ($1,$2,$3,$4,'ready',NULL,$5,$6,$7,'CARRYFORWARD','catalog-preview',$8,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error=NULL,contract_token=NULL,contract_symbol=NULL,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment=EXCLUDED.exchange_segment,underlying_token=EXCLUDED.underlying_token,fetched_at=NOW()")
+        .bind(Uuid::new_v4())
+        .bind(STRATEGY_KEY)
+        .bind(instrument)
+        .bind(today)
+        .bind(expiry)
+        .bind(lot_size)
+        .bind(exchange)
+        .bind(&underlying.token)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
 async fn select_option(
     state: &AppState,
     credentials: &BrokerCredentials,
@@ -269,17 +366,9 @@ async fn select_option(
     spot: f64,
 ) -> AppResult<ExecutionContract> {
     let master = contract_master(state).await?;
-    let (exchange, names): (&str, &[&str]) = match config.instrument.as_str() {
-        "NIFTY" => ("NFO", &["NIFTY"]),
-        "BANKNIFTY" => ("NFO", &["BANKNIFTY"]),
-        "SENSEX" => ("BFO", &["SENSEX"]),
-        "MIDCAPNIFTY" => ("NFO", &["MIDCPNIFTY", "MIDCAPNIFTY"]),
-        _ => {
-            return Err(AppError::BadRequest(
-                "Options are available only for supported indices.".into(),
-            ));
-        }
-    };
+    let (exchange, names) = option_market(&config.instrument).ok_or_else(|| {
+        AppError::BadRequest("Options are available only for NIFTY 50 and SENSEX.".into())
+    })?;
     let option_type = if signal == "BUY" { "CE" } else { "PE" };
     let today = ist_now().date_naive();
     let expiry = master
@@ -302,7 +391,7 @@ async fn select_option(
             ))
         })?;
     let mut candidates: Vec<(MasterContract, f64)> = master
-        .into_iter()
+        .iter()
         .filter(|item| {
             item.exch_seg.eq_ignore_ascii_case(exchange)
                 && names
@@ -315,7 +404,8 @@ async fn select_option(
         .filter_map(|item| {
             let raw = item.strike.parse::<f64>().ok()?;
             let strike = if raw > spot * 10.0 { raw / 100.0 } else { raw };
-            (strike.is_finite() && (strike - spot).abs() <= spot * 0.12).then_some((item, strike))
+            (strike.is_finite() && (strike - spot).abs() <= spot * 0.12)
+                .then_some((item.clone(), strike))
         })
         .collect();
     candidates.sort_by(|left, right| (left.1 - spot).abs().total_cmp(&(right.1 - spot).abs()));
@@ -833,13 +923,36 @@ pub async fn catalog_item(state: &AppState, user_id: Uuid) -> AppResult<Value> {
             Some((key, value))
         })
         .collect();
+    let today = ist_now().date_naive();
+    let mut preview_errors = HashMap::new();
+    for instrument in INSTRUMENTS {
+        let enabled = by_instrument
+            .get(instrument)
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            continue;
+        }
+        let has_current_contract: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_market_snapshots WHERE strategy_key=$1 AND instrument=$2 AND contract_expiry >= $3)")
+            .bind(STRATEGY_KEY)
+            .bind(instrument)
+            .bind(today)
+            .fetch_one(&state.db)
+            .await?;
+        if !has_current_contract
+            && let Err(error) = refresh_contract_preview(state, instrument).await
+        {
+            preview_errors.insert(instrument.to_string(), error.to_string());
+        }
+    }
     let alerts: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 5")
         .bind(STRATEGY_KEY).bind(user_id).fetch_all(&state.db).await?;
     let mut instruments = Vec::new();
     for instrument in INSTRUMENTS {
         let config = by_instrument.get(instrument);
-        let snapshot: Option<Value> = sqlx::query_scalar("SELECT jsonb_build_object('contract_symbol',contract_symbol,'contract_token',contract_token,'contract_expiry',contract_expiry,'lot_size',lot_size,'exchange_segment',exchange_segment,'fetched_at',fetched_at) FROM strategy_market_snapshots WHERE strategy_key=$1 AND instrument=$2 ORDER BY fetched_at DESC LIMIT 1")
-            .bind(STRATEGY_KEY).bind(instrument).fetch_optional(&state.db).await?;
+        let snapshot: Option<Value> = sqlx::query_scalar("SELECT jsonb_build_object('contract_symbol',contract_symbol,'contract_token',contract_token,'contract_expiry',contract_expiry,'lot_size',lot_size,'exchange_segment',exchange_segment,'execution_key',execution_key,'fetched_at',fetched_at) FROM strategy_market_snapshots WHERE strategy_key=$1 AND instrument=$2 AND contract_expiry >= $3 ORDER BY (execution_key='catalog-preview') ASC,fetched_at DESC LIMIT 1")
+            .bind(STRATEGY_KEY).bind(instrument).bind(today).fetch_optional(&state.db).await?;
         instruments.push(json!({
             "instrument":instrument,
             "label":instrument_label(instrument),
@@ -854,7 +967,8 @@ pub async fn catalog_item(state: &AppState, user_id: Uuid) -> AppResult<Value> {
             "require_volume":config.and_then(|value|value.get("require_volume")).and_then(Value::as_bool).unwrap_or(false),
             "premium_min":config.and_then(|value|value.get("premium_min")).and_then(Value::as_f64).unwrap_or(200.0),
             "premium_max":config.and_then(|value|value.get("premium_max")).and_then(Value::as_f64).unwrap_or(300.0),
-            "snapshot":snapshot
+            "snapshot":snapshot,
+            "contract_error":preview_errors.get(instrument)
         }));
     }
     Ok(json!({
@@ -923,6 +1037,9 @@ pub async fn update(
         return Err(AppError::BadRequest(
             "Activate the strategy before enabling an instrument.".into(),
         ));
+    }
+    if input.enabled {
+        refresh_contract_preview(&state, &instrument).await?;
     }
     sqlx::query("INSERT INTO user_strategy_configs (user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session,interval_key,stop_loss_percent,target_percent,keltner_multiplier,require_volume,premium_min,premium_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (user_id,strategy_key,instrument) DO UPDATE SET enabled=EXCLUDED.enabled,lots=EXCLUDED.lots,run_day_session=EXCLUDED.run_day_session,run_evening_session=EXCLUDED.run_evening_session,interval_key=EXCLUDED.interval_key,stop_loss_percent=EXCLUDED.stop_loss_percent,target_percent=EXCLUDED.target_percent,keltner_multiplier=EXCLUDED.keltner_multiplier,require_volume=EXCLUDED.require_volume,premium_min=EXCLUDED.premium_min,premium_max=EXCLUDED.premium_max,updated_at=NOW()")
         .bind(auth.id).bind(STRATEGY_KEY).bind(&instrument).bind(input.enabled).bind(input.lots)
@@ -1293,6 +1410,25 @@ mod tests {
         }
     }
 
+    fn option_contract(
+        name: &str,
+        symbol: &str,
+        expiry: &str,
+        lot_size: &str,
+        exchange: &str,
+    ) -> MasterContract {
+        MasterContract {
+            token: symbol.into(),
+            symbol: symbol.into(),
+            name: name.into(),
+            expiry: expiry.into(),
+            strike: "2500000".into(),
+            lotsize: lot_size.into(),
+            instrumenttype: "OPTIDX".into(),
+            exch_seg: exchange.into(),
+        }
+    }
+
     fn ist(value: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(value).expect("valid test time")
     }
@@ -1322,6 +1458,25 @@ mod tests {
         invalid = update("NIFTY");
         invalid.interval_key = Some("ONE_HOUR".into());
         assert!(validate_update(&invalid).is_err());
+    }
+
+    #[test]
+    fn contract_preview_uses_nearest_current_expiry_and_broker_lot_size() {
+        let master = vec![
+            option_contract("NIFTY", "NIFTY30JUL26CE", "30JUL2026", "75", "NFO"),
+            option_contract("NIFTY", "NIFTY23JUL26PE", "23JUL2026", "75", "NFO"),
+            option_contract("NIFTY", "NIFTY23JUL26CE", "23JUL2026", "75", "NFO"),
+        ];
+        let (exchange, expiry, lot_size) = option_contract_preview(
+            &master,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exchange, "NFO");
+        assert_eq!(expiry, NaiveDate::from_ymd_opt(2026, 7, 23).unwrap());
+        assert_eq!(lot_size, 75);
+        assert!(option_contract_preview(&master, "BANKNIFTY", expiry).is_err());
     }
 
     #[test]

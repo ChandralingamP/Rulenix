@@ -326,6 +326,8 @@ export default function StrategiesPage() {
                                 (Number(draft.premiumMin) > 0 &&
                                   Number(draft.premiumMax) > Number(draft.premiumMin))));
                           const snapshot = instrument.snapshot;
+                          const isContractPreview =
+                            snapshot?.execution_key === "catalog-preview";
                           return (
                             <Fragment key={instrument.instrument}>
                             <tr>
@@ -346,7 +348,19 @@ export default function StrategiesPage() {
                               </td>
                               <td className="px-4 py-4 font-medium text-slate-200">
                                 {snapshot?.contract_symbol ||
-                                  (draft.enabled ? "Selecting…" : "—")}
+                                  (isContractPreview
+                                    ? `${instrument.instrument} CE/PE selected at signal`
+                                    : draft.enabled
+                                      ? "Loading contract details…"
+                                      : "—")}
+                                {instrument.contract_error ? (
+                                  <p
+                                    className="mt-1 text-xs text-rose-300"
+                                    title={instrument.contract_error}
+                                  >
+                                    Contract details unavailable
+                                  </p>
+                                ) : null}
                               </td>
                               <td className="px-4 py-4 text-slate-300">
                                 {formatDate(snapshot?.contract_expiry)}
@@ -450,7 +464,7 @@ export default function StrategiesPage() {
                                     </div>
                                   </div>
                                   <p className="mt-3 text-xs text-slate-500">
-                                    {instrument.instrument === "GOLDTEN" ? "Signals execute on the selected GOLDTEN future." : "Bullish signals buy CE and bearish signals buy PE; the nearest expiry contract closest to the midpoint of the premium range is selected."}{" "}
+                                    {instrument.instrument === "GOLDTEN" ? "Signals execute on the selected GOLDTEN future." : "Expiry and lot size are preloaded. Bullish signals select CE and bearish signals select PE at entry; the contract closest to the midpoint of the premium range is used."}{" "}
                                     Entry: MARKET. Target: LIMIT. Stop loss: STOPLOSS_LIMIT.
                                   </p>
                                 </td>

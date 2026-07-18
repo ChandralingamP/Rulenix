@@ -182,7 +182,21 @@ describe("StrategiesPage", () => {
       .mockResolvedValue({
         data: {
           strategies: [
-            { ...ichimoku, instruments: [{ ...nifty, enabled: true }] },
+            {
+              ...ichimoku,
+              instruments: [
+                {
+                  ...nifty,
+                  enabled: true,
+                  snapshot: {
+                    contract_symbol: null,
+                    contract_expiry: "2026-07-23",
+                    lot_size: 75,
+                    execution_key: "catalog-preview",
+                  },
+                },
+              ],
+            },
           ],
         },
       });
@@ -212,6 +226,11 @@ describe("StrategiesPage", () => {
         })
       )
     );
+    expect(
+      await screen.findByText("NIFTY CE/PE selected at signal")
+    ).toBeInTheDocument();
+    expect(screen.getByText("23 Jul 2026")).toBeInTheDocument();
+    expect(screen.getByText("75")).toBeInTheDocument();
   });
 
   it("saves Ichimoku live execution parameters through its dedicated route", async () => {
