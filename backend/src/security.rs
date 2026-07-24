@@ -154,6 +154,10 @@ pub async fn rate_limit(
 }
 
 pub async fn request_ids(mut request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
     let request_id = request
         .headers()
         .get("x-request-id")
@@ -171,6 +175,7 @@ pub async fn request_ids(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(RequestContext {
         request_id: request_id.clone(),
         correlation_id: correlation_id.clone(),
+        peer,
     });
     let span = tracing::info_span!(
         "http_request",
@@ -192,6 +197,7 @@ pub async fn request_ids(mut request: Request, next: Next) -> Response {
 pub struct RequestContext {
     pub request_id: String,
     pub correlation_id: String,
+    pub peer: Option<SocketAddr>,
 }
 
 pub async fn security_headers(

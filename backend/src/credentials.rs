@@ -4,13 +4,14 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::{collections::HashMap, env, fmt, sync::Arc};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const SECRET_KINDS: [&str; 4] = ["api_key", "jwt_token", "refresh_token", "feed_token"];
 type EncryptedSecretRow = (Uuid, String, i32, Vec<u8>, Vec<u8>);
+type EncryptedCredentialRow = (String, i32, Vec<u8>, Vec<u8>);
 
 #[derive(Default, Zeroize, ZeroizeOnDrop)]
 pub struct BrokerCredentials {
@@ -168,12 +169,34 @@ impl CredentialStore {
     }
 
     pub async fn load(&self, user_id: Uuid) -> AppResult<BrokerCredentials> {
-        let rows: Vec<(String, i32, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let rows: Vec<EncryptedCredentialRow> = sqlx::query_as(
             "SELECT secret_kind,key_version,nonce,ciphertext FROM broker_secrets WHERE user_id=$1",
         )
         .bind(user_id)
         .fetch_all(&self.db)
         .await?;
+        self.decrypt_credentials(user_id, rows)
+    }
+
+    pub(crate) async fn load_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+    ) -> AppResult<BrokerCredentials> {
+        let rows: Vec<EncryptedCredentialRow> = sqlx::query_as(
+            "SELECT secret_kind,key_version,nonce,ciphertext FROM broker_secrets WHERE user_id=$1",
+        )
+        .bind(user_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        self.decrypt_credentials(user_id, rows)
+    }
+
+    fn decrypt_credentials(
+        &self,
+        user_id: Uuid,
+        rows: Vec<EncryptedCredentialRow>,
+    ) -> AppResult<BrokerCredentials> {
         let mut result = BrokerCredentials::default();
         for (kind, version, nonce, ciphertext) in rows {
             let value = self
@@ -196,6 +219,18 @@ impl CredentialStore {
 
     pub async fn put(&self, user_id: Uuid, values: &[(&str, &str)]) -> AppResult<()> {
         let mut transaction = self.db.begin().await?;
+        self.put_in_transaction(&mut transaction, user_id, values)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn put_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+        values: &[(&str, &str)],
+    ) -> AppResult<()> {
         for (kind, value) in values {
             if !SECRET_KINDS.contains(kind) {
                 return Err(AppError::Internal(anyhow::anyhow!(
@@ -206,20 +241,32 @@ impl CredentialStore {
                 sqlx::query("DELETE FROM broker_secrets WHERE user_id=$1 AND secret_kind=$2")
                     .bind(user_id)
                     .bind(kind)
-                    .execute(&mut *transaction)
+                    .execute(&mut **transaction)
                     .await?;
             } else {
                 let (version, nonce, ciphertext) = self.cipher.encrypt(user_id, kind, value)?;
                 sqlx::query("INSERT INTO broker_secrets (user_id,secret_kind,key_version,nonce,ciphertext) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (user_id,secret_kind) DO UPDATE SET key_version=EXCLUDED.key_version,nonce=EXCLUDED.nonce,ciphertext=EXCLUDED.ciphertext,updated_at=NOW()")
-                    .bind(user_id).bind(kind).bind(version).bind(nonce).bind(ciphertext).execute(&mut *transaction).await?;
+                    .bind(user_id).bind(kind).bind(version).bind(nonce).bind(ciphertext).execute(&mut **transaction).await?;
             }
         }
-        transaction.commit().await?;
         Ok(())
     }
 
     pub async fn clear_tokens(&self, user_id: Uuid) -> AppResult<()> {
         self.put(
+            user_id,
+            &[("jwt_token", ""), ("refresh_token", ""), ("feed_token", "")],
+        )
+        .await
+    }
+
+    pub(crate) async fn clear_tokens_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+    ) -> AppResult<()> {
+        self.put_in_transaction(
+            transaction,
             user_id,
             &[("jwt_token", ""), ("refresh_token", ""), ("feed_token", "")],
         )

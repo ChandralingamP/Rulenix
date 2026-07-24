@@ -12,6 +12,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin rulenix
 WORKDIR /app
+COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/target/release/rulenix-backend /usr/local/bin/rulenix-backend
 USER rulenix
 EXPOSE 8080

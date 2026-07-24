@@ -52,40 +52,19 @@ export const saveStrategyInstrument = createAsyncThunk(
       lots,
       runDaySession = true,
       runEveningSession = true,
-      intervalKey = "FIVE_MINUTE",
-      stopLossPercent = 5,
-      targetPercent = 20,
-      keltnerMultiplier = 2,
-      requireVolume = false,
-      premiumMin = 200,
-      premiumMax = 300,
     },
     thunkAPI
   ) => {
     const username = requireUsername(thunkAPI);
     if (typeof username !== "string") return username;
     try {
-      const endpoint =
-        strategyKey === "ichimoku_keltner_tsi"
-          ? "/strategy/ichimoku"
-          : "/strategy/futures-breakout";
-      await apiClient.put(endpoint, {
+      await apiClient.put("/strategy/futures-breakout", {
+        strategy_key: strategyKey,
         instrument,
         enabled,
         lots,
         run_day_session: runDaySession,
         run_evening_session: runEveningSession,
-        ...(strategyKey === "ichimoku_keltner_tsi"
-          ? {
-              interval_key: intervalKey,
-              stop_loss_percent: stopLossPercent,
-              target_percent: targetPercent,
-              keltner_multiplier: keltnerMultiplier,
-              require_volume: requireVolume,
-              premium_min: premiumMin,
-              premium_max: premiumMax,
-            }
-          : {}),
       });
       const response = await apiClient.get("/strategies");
       return response.data?.strategies || [];

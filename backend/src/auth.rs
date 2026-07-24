@@ -911,9 +911,34 @@ pub async fn update_user(
         ));
     }
     let mut tx = state.db.begin().await?;
-    let changed_id: Option<Uuid> = sqlx::query_scalar("UPDATE users SET can_administer=COALESCE($1,can_administer),can_live_trade=COALESCE($2,can_live_trade),can_backtest=COALESCE($3,can_backtest),updated_at=NOW() WHERE LOWER(username)=LOWER($4) RETURNING id")
-        .bind(input.can_administer).bind(input.can_live_trade).bind(input.can_backtest).bind(&input.username).fetch_optional(&mut *tx).await?;
+    let changed_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM users WHERE LOWER(username)=LOWER($1)")
+            .bind(&input.username)
+            .fetch_optional(&mut *tx)
+            .await?;
     let changed_id = changed_id.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(changed_id)
+        .execute(&mut *tx)
+        .await?;
+    if input.can_live_trade == Some(false) {
+        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+            .bind(changed_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if execution_in_flight {
+            return Err(AppError::BadRequest(
+                "Live-trading permission cannot be revoked while a position or broker order is active. Use the kill switch and reconcile it first.".into(),
+            ));
+        }
+    }
+    sqlx::query("UPDATE users SET can_administer=COALESCE($1,can_administer),can_live_trade=COALESCE($2,can_live_trade),can_backtest=COALESCE($3,can_backtest),updated_at=NOW() WHERE id=$4")
+        .bind(input.can_administer)
+        .bind(input.can_live_trade)
+        .bind(input.can_backtest)
+        .bind(changed_id)
+        .execute(&mut *tx)
+        .await?;
     if input.can_live_trade == Some(false) {
         sqlx::query(
             "UPDATE user_profiles SET trading_mode='demo',updated_at=NOW() WHERE user_id=$1",
@@ -966,13 +991,31 @@ pub async fn delete_user(
             "You cannot delete your own account.".into(),
         ));
     }
-    let result = sqlx::query("DELETE FROM users WHERE LOWER(username)=LOWER($1)")
-        .bind(&input.username)
-        .execute(&state.db)
+    let mut tx = state.db.begin().await?;
+    let target_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM users WHERE LOWER(username)=LOWER($1)")
+            .bind(&input.username)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let target_id = target_id.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(target_id)
+        .execute(&mut *tx)
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("User not found.".into()));
+    let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+        .bind(target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if execution_in_flight {
+        return Err(AppError::BadRequest(
+            "This account has an open position or broker order. Use the kill switch and reconcile it before deletion.".into(),
+        ));
     }
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     let request_context = crate::audit::optional_context(context);
     if let Err(error) = crate::audit::record(
         &state,

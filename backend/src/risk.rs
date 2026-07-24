@@ -43,6 +43,7 @@ pub struct OrderRisk<'a> {
     pub idempotency_key: &'a str,
     pub snapshot_ready: bool,
     pub snapshot_current: bool,
+    pub exchange_segment: &'a str,
     pub contract_token: &'a str,
     pub live_margin_available: Option<f64>,
     pub live_reconciled: bool,
@@ -146,7 +147,7 @@ pub async fn assess_and_reserve(
     order: &OrderRisk<'_>,
 ) -> AppResult<Option<Uuid>> {
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('rulenix:risk:global'))")
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
         .execute(&mut *tx)
         .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
@@ -223,8 +224,9 @@ pub async fn assess_and_reserve(
         }
 
         let tick: Option<(f64, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT price,received_at FROM market_price_ticks WHERE contract_token=$1",
+            "SELECT price,received_at FROM market_price_ticks WHERE exchange_segment=$1 AND contract_token=$2",
         )
+        .bind(order.exchange_segment)
         .bind(order.contract_token)
         .fetch_optional(&mut *tx)
         .await?;
@@ -251,7 +253,7 @@ pub async fn assess_and_reserve(
         }
 
         let exposure: (i64,i64,f64,i64,i64,f64,f64) = sqlx::query_as(
-            "WITH boundary AS (SELECT date_trunc('day',NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata' at), pending AS (SELECT COALESCE(SUM(lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*price),0)::float8 notional,COUNT(*)::bigint positions FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitted')), open AS (SELECT COALESCE(SUM(total_lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*COALESCE(last_price,entry_price)),0)::float8 notional,COUNT(*)::bigint positions,COALESCE(SUM(pnl+(CASE WHEN direction='BUY' THEN COALESCE(last_price,entry_price)-entry_price ELSE entry_price-COALESCE(last_price,entry_price) END)*quantity),0)::float8 unrealized FROM trades WHERE user_id=$1 AND status='open'), daily AS (SELECT (SELECT COUNT(*) FROM trades,boundary WHERE user_id=$1 AND entry_datetime>=boundary.at)::bigint trades,(SELECT COALESCE(SUM(pnl),0)::float8 FROM trades,boundary WHERE user_id=$1 AND status='closed' AND exit_datetime>=boundary.at) realized) SELECT pending.lots+open.lots,pending.quantity+open.quantity,pending.notional+open.notional,pending.positions+open.positions,daily.trades+(SELECT COUNT(*) FROM strategy_orders,boundary WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitted') AND created_at>=boundary.at),daily.realized,open.unrealized FROM pending,open,daily"
+            "WITH boundary AS (SELECT date_trunc('day',NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata' at), pending AS (SELECT COALESCE(SUM(lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*price),0)::float8 notional,COUNT(*)::bigint positions FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')), open AS (SELECT COALESCE(SUM(total_lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*COALESCE(last_price,entry_price)),0)::float8 notional,COUNT(*)::bigint positions,COALESCE(SUM(pnl+(CASE WHEN direction='BUY' THEN COALESCE(last_price,entry_price)-entry_price ELSE entry_price-COALESCE(last_price,entry_price) END)*(CASE WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN' THEN COALESCE(NULLIF(remaining_lots,0),quantity)::float8 ELSE quantity::float8 END)),0)::float8 unrealized FROM trades WHERE user_id=$1 AND status='open'), daily AS (SELECT (SELECT COUNT(*) FROM trades,boundary WHERE user_id=$1 AND entry_datetime>=boundary.at)::bigint trades,(SELECT COALESCE(SUM(pnl),0)::float8 FROM trades,boundary WHERE user_id=$1 AND status='closed' AND exit_datetime>=boundary.at) realized) SELECT pending.lots+open.lots,pending.quantity+open.quantity,pending.notional+open.notional,pending.positions+open.positions,daily.trades+(SELECT COUNT(*) FROM strategy_orders,boundary WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at>=boundary.at),daily.realized,open.unrealized FROM pending,open,daily"
         ).bind(order.user_id).fetch_one(&mut *tx).await?;
         metrics = Metrics {
             lots: exposure.0 + order.lots as i64,
@@ -320,12 +322,17 @@ pub async fn assess_and_reserve(
     }
 }
 
-pub async fn record_tick(state: &AppState, token: &str, price: f64) -> AppResult<()> {
+pub async fn record_tick(
+    state: &AppState,
+    exchange_segment: &str,
+    token: &str,
+    price: f64,
+) -> AppResult<()> {
     if !price.is_finite() || price <= 0.0 {
         return Ok(());
     }
-    sqlx::query("INSERT INTO market_price_ticks (contract_token,price,received_at) VALUES ($1,$2,NOW()) ON CONFLICT (contract_token) DO UPDATE SET price=EXCLUDED.price,received_at=NOW()")
-        .bind(token).bind(price).execute(&state.db).await?;
+    sqlx::query("INSERT INTO market_price_ticks (exchange_segment,contract_token,price,received_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (exchange_segment,contract_token) DO UPDATE SET price=EXCLUDED.price,received_at=NOW()")
+        .bind(exchange_segment).bind(token).bind(price).execute(&state.db).await?;
     Ok(())
 }
 
@@ -344,8 +351,8 @@ pub async fn cancel_pending_entries(
     state: &AppState,
     user_id: Option<Uuid>,
     reason: &str,
-) -> AppResult<Vec<(Uuid, Uuid, String, String, String)>> {
-    let rows=sqlx::query_as("UPDATE strategy_orders SET status='cancelling',broker_status=$2,updated_at=NOW() WHERE role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitted') AND ($1::uuid IS NULL OR user_id=$1) RETURNING id,user_id,execution_mode,broker_order_id,role")
+) -> AppResult<Vec<(Uuid, Uuid, String, String, String, String)>> {
+    let rows=sqlx::query_as("UPDATE strategy_orders SET status='cancelling',broker_status=$2,updated_at=NOW() WHERE role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitted','partially_filled') AND ($1::uuid IS NULL OR user_id=$1) RETURNING id,user_id,execution_mode,broker_order_id,role,order_type")
         .bind(user_id).bind(reason).fetch_all(&state.db).await?;
     Ok(rows)
 }

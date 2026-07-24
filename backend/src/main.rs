@@ -8,7 +8,6 @@ mod config;
 mod credentials;
 mod error;
 mod home;
-mod ichimoku_strategy;
 mod jobs;
 mod logs;
 mod margin;
@@ -35,12 +34,33 @@ use axum::{
 use config::Config;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use state::AppState;
+use std::path::Path;
 use std::{net::SocketAddr, str::FromStr};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+fn configured_initial_admin(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<(String, String, String)>> {
+    let username = lookup("INITIAL_ADMIN_USERNAME").unwrap_or_default();
+    let email = lookup("INITIAL_ADMIN_EMAIL").unwrap_or_default();
+    let password = lookup("INITIAL_ADMIN_PASSWORD").unwrap_or_default();
+    let configured = [
+        !username.trim().is_empty(),
+        !email.trim().is_empty(),
+        !password.trim().is_empty(),
+    ];
+    match configured.iter().filter(|value| **value).count() {
+        0 => Ok(None),
+        3 => Ok(Some((username, email, password))),
+        _ => anyhow::bail!(
+            "INITIAL_ADMIN_USERNAME, INITIAL_ADMIN_EMAIL, and INITIAL_ADMIN_PASSWORD must either all be set or all be empty"
+        ),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -77,14 +97,22 @@ async fn main() -> Result<()> {
         .connect_with(database_options)
         .await
         .context("could not connect to PostgreSQL")?;
+    let mut migration_connection = db
+        .acquire()
+        .await
+        .context("could not acquire migration database connection")?;
     sqlx::query("SELECT pg_advisory_lock(hashtext('rulenix:migrations'))")
-        .execute(&db)
+        .execute(&mut *migration_connection)
         .await
         .context("could not acquire migration advisory lock")?;
-    let migration_result = sqlx::migrate!().run(&db).await;
+    let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
+        .await
+        .context("could not load database migrations")?;
+    let migration_result = migrator.run(&mut *migration_connection).await;
     let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext('rulenix:migrations'))")
-        .execute(&db)
+        .execute(&mut *migration_connection)
         .await;
+    drop(migration_connection);
     migration_result.context("database migration failed")?;
     let credential_store = credentials::CredentialStore::from_env(db.clone())
         .context("credential encryption configuration is invalid")?;
@@ -99,7 +127,7 @@ async fn main() -> Result<()> {
         );
     }
     if config.force_demo_trading {
-        let reset = sqlx::query("UPDATE user_profiles SET trading_mode='demo',updated_at=NOW() WHERE trading_mode='live'")
+        let reset = sqlx::query("UPDATE user_profiles p SET trading_mode='demo',updated_at=NOW() WHERE trading_mode='live' AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.user_id=p.user_id AND t.status='open') AND NOT EXISTS (SELECT 1 FROM strategy_orders o WHERE o.user_id=p.user_id AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
             .execute(&db)
             .await
             .context("could not force demo trading mode")?
@@ -108,6 +136,14 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 profiles = reset,
                 "forced live profiles back to demo trading mode"
+            );
+        }
+        let retained_live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_profiles p WHERE p.trading_mode='live' AND (EXISTS (SELECT 1 FROM trades t WHERE t.user_id=p.user_id AND t.status='open') OR EXISTS (SELECT 1 FROM strategy_orders o WHERE o.user_id=p.user_id AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')))")
+            .fetch_one(&db).await.context("could not inspect active live execution while forcing demo mode")?;
+        if retained_live > 0 {
+            tracing::warn!(
+                profiles = retained_live,
+                "retained live mode for profiles with active execution so broker exits remain safe"
             );
         }
     }
@@ -119,12 +155,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("--create-admin-from-env") {
-        let username = std::env::var("INITIAL_ADMIN_USERNAME")
-            .context("INITIAL_ADMIN_USERNAME is required")?;
-        let email =
-            std::env::var("INITIAL_ADMIN_EMAIL").context("INITIAL_ADMIN_EMAIL is required")?;
-        let password = std::env::var("INITIAL_ADMIN_PASSWORD")
-            .context("INITIAL_ADMIN_PASSWORD is required")?;
+        let (username, email, password) = configured_initial_admin(|key| std::env::var(key).ok())?
+            .context("all INITIAL_ADMIN_* settings are required")?;
         auth::bootstrap_admin(&db, &username, &email, &password).await?;
         println!("Configured Rulenix administrator is ready.");
         return Ok(());
@@ -142,11 +174,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let (Ok(username), Ok(email), Ok(password)) = (
-        std::env::var("INITIAL_ADMIN_USERNAME"),
-        std::env::var("INITIAL_ADMIN_EMAIL"),
-        std::env::var("INITIAL_ADMIN_PASSWORD"),
-    ) {
+    if let Some((username, email, password)) =
+        configured_initial_admin(|key| std::env::var(key).ok())?
+    {
         auth::ensure_admin(&db, &username, &email, &password)
             .await
             .context("could not initialize the configured administrator")?;
@@ -165,8 +195,17 @@ async fn main() -> Result<()> {
         credentials: credential_store,
         abuse_prevention: Default::default(),
     };
+    if let Err(error) = alerts::deliver(
+        &state,
+        "service_started",
+        "info",
+        serde_json::json!({"environment":state.config.app_env}),
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not record the service-started alert");
+    }
     strategy::start(state.clone());
-    ichimoku_strategy::start(state.clone());
     home::start_session_maintenance(state.clone());
     auth::start_session_cleanup(state.clone());
 
@@ -242,10 +281,6 @@ async fn main() -> Result<()> {
             "/strategy/futures-breakout",
             get(strategy::status).put(strategy::update),
         )
-        .route(
-            "/strategy/ichimoku",
-            axum::routing::put(ichimoku_strategy::update),
-        )
         .route("/strategies", get(strategy::catalog))
         .route(
             "/strategies/{strategy_key}/activation",
@@ -301,6 +336,52 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_initial_admin;
+    use std::collections::HashMap;
+
+    fn configured(values: &[(&str, &str)]) -> anyhow::Result<Option<(String, String, String)>> {
+        let values = values
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<HashMap<_, _>>();
+        configured_initial_admin(|key| values.get(key).cloned())
+    }
+
+    #[test]
+    fn empty_initial_admin_settings_are_absent() {
+        assert!(
+            configured(&[
+                ("INITIAL_ADMIN_USERNAME", ""),
+                ("INITIAL_ADMIN_EMAIL", "  "),
+                ("INITIAL_ADMIN_PASSWORD", ""),
+            ])
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_initial_admin_settings_are_rejected() {
+        assert!(configured(&[("INITIAL_ADMIN_USERNAME", "admin")]).is_err());
+    }
+
+    #[test]
+    fn complete_initial_admin_settings_are_returned() {
+        let value = configured(&[
+            ("INITIAL_ADMIN_USERNAME", "admin"),
+            ("INITIAL_ADMIN_EMAIL", "admin@rulenix.in"),
+            ("INITIAL_ADMIN_PASSWORD", "strong secret"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(value.0, "admin");
+        assert_eq!(value.1, "admin@rulenix.in");
+        assert_eq!(value.2, "strong secret");
+    }
 }
 
 async fn shutdown_signal() {

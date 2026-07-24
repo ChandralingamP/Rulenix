@@ -125,7 +125,13 @@ async fn run_bridge(
                     if let Some(tick) = parse_tick(&data) {
                         last_tick=Instant::now();
                         if let (Some(token), Some(ltp)) = (tick["token"].as_str(), tick["last_traded_price"].as_f64())
-                            && let Err(error) = crate::strategy::process_tick(&state, profile.user_id, token, ltp).await {
+                            && let Err(error) = crate::strategy::process_tick(
+                                &state,
+                                profile.user_id,
+                                exchange_segment(query.exchange_type.unwrap_or(1)),
+                                token,
+                                ltp,
+                            ).await {
                             tracing::warn!(%error, "demo strategy tick processing failed");
                         }
                         browser.send(Message::Text(tick.to_string().into())).await?;
@@ -181,17 +187,42 @@ fn parse_tick(data: &[u8]) -> Option<serde_json::Value> {
     Some(tick)
 }
 
-pub async fn ensure_strategy_feed(state: AppState, token: String) {
+fn exchange_type(segment: &str) -> Option<u8> {
+    match segment.to_uppercase().as_str() {
+        "NSE" => Some(1),
+        "NFO" => Some(2),
+        "BSE" => Some(3),
+        "BFO" => Some(4),
+        "MCX" => Some(5),
+        "NCDEX" => Some(7),
+        _ => None,
+    }
+}
+
+fn exchange_segment(exchange_type: u8) -> &'static str {
+    match exchange_type {
+        1 => "NSE",
+        2 => "NFO",
+        3 => "BSE",
+        4 => "BFO",
+        5 => "MCX",
+        7 => "NCDEX",
+        _ => "UNKNOWN",
+    }
+}
+
+pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: String) {
+    let feed_key = format!("{}:{}", exchange.to_uppercase(), token);
     {
         let mut active = state.strategy_feeds.lock().await;
-        if !active.insert(token.clone()) {
+        if !active.insert(feed_key.clone()) {
             return;
         }
     }
     tokio::spawn(async move {
         let mut attempt = 0_u32;
         loop {
-            match run_strategy_feed(&state, &token).await {
+            match run_strategy_feed(&state, &exchange, &token).await {
                 Ok(()) => attempt = 0,
                 Err(error) => {
                     tracing::warn!(%token,%error,attempt,"shared strategy market feed stopped");
@@ -209,8 +240,9 @@ pub async fn ensure_strategy_feed(state: AppState, token: String) {
                     attempt = attempt.saturating_add(1);
                 }
             }
-            let needed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.contract_token=$1 AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing'))")
-                .bind(&token).fetch_one(&state.db).await.unwrap_or(false);
+            let needed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.exchange_segment=$1 AND s.contract_token=$2 AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.exchange_segment=$1 AND s.contract_token=$2)")
+                .bind(&exchange).bind(&token)
+                .fetch_one(&state.db).await.unwrap_or(false);
             if !needed {
                 break;
             }
@@ -218,11 +250,13 @@ pub async fn ensure_strategy_feed(state: AppState, token: String) {
             let jitter = rand::thread_rng().gen_range(0..=ceiling * 250);
             tokio::time::sleep(Duration::from_millis(ceiling * 1000 + jitter)).await;
         }
-        state.strategy_feeds.lock().await.remove(&token);
+        state.strategy_feeds.lock().await.remove(&feed_key);
     });
 }
 
-async fn run_strategy_feed(state: &AppState, token: &str) -> anyhow::Result<()> {
+async fn run_strategy_feed(state: &AppState, exchange: &str, token: &str) -> anyhow::Result<()> {
+    let exchange_type = exchange_type(exchange)
+        .ok_or_else(|| anyhow::anyhow!("unsupported Angel One exchange segment {exchange}"))?;
     let profile: BrokerageProfile = sqlx::query_as(
         "SELECT p.* FROM user_profiles p WHERE p.last_token_status IN ('success','refreshed') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='feed_token') ORDER BY p.token_received_at DESC NULLS LAST LIMIT 1",
     )
@@ -243,7 +277,7 @@ async fn run_strategy_feed(state: &AppState, token: &str) -> anyhow::Result<()> 
             json!({
                 "correlationID":uuid::Uuid::new_v4().simple().to_string()[..10].to_string(),
                 "action":1,
-                "params":{"mode":1,"tokenList":[{"exchangeType":5,"tokens":[token]}]}
+                "params":{"mode":1,"tokenList":[{"exchangeType":exchange_type,"tokens":[token]}]}
             })
             .to_string()
             .into(),
@@ -259,9 +293,10 @@ async fn run_strategy_feed(state: &AppState, token: &str) -> anyhow::Result<()> 
             incoming=receiver.next()=>match incoming {
                 Some(Ok(AngelMessage::Binary(data)))=>if let Some(tick)=parse_tick(&data)
                     && tick["token"].as_str()==Some(token)
+                    && tick["exchange_type"].as_u64()==Some(u64::from(exchange_type))
                     && let Some(ltp)=tick["last_traded_price"].as_f64() {
                     last_tick=Instant::now();
-                    crate::strategy::process_tick_shared(state,token,ltp).await?;
+                    crate::strategy::process_tick_shared(state,exchange,token,ltp).await?;
                 },
                 Some(Ok(AngelMessage::Ping(data)))=>sender.send(AngelMessage::Pong(data)).await?,
                 Some(Ok(AngelMessage::Close(_)))|None=>break,

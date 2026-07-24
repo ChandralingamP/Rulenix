@@ -1,3 +1,4 @@
+import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -6,6 +7,11 @@ const backendUrl = process.env.RULENIX_BACKEND_URL || "http://localhost:8080";
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      "react-router-dom": fileURLToPath(new URL("./src/router.jsx", import.meta.url)),
+    },
+  },
   server: {
     host: "0.0.0.0",
     port: frontendPort,

@@ -364,7 +364,19 @@ export default function Layout({ children }) {
           </div>
         ) : null}
         <main className="flex-1 px-6 pb-12">
-          {typeof children !== "undefined" ? children : <Outlet context={{ session: { username, permissions, tradingMode, ready: sessionReady }, refreshSession: syncAccessStatus }} />}
+          <Outlet
+            context={{
+              session: {
+                username,
+                permissions,
+                tradingMode,
+                ready: sessionReady,
+              },
+              refreshSession: syncAccessStatus,
+            }}
+          >
+            {children}
+          </Outlet>
         </main>
         <footer className="border-t border-slate-800 px-6 py-6 text-xs text-slate-500">
           {isAdmin

@@ -98,17 +98,11 @@ export default function BacktestingPage() {
   const { session } = useOutletContext();
   const navigate = useNavigate();
   const [form, setForm] = useState({
-    strategy_key: "ichimoku_keltner_tsi",
-    instrument: "NIFTY",
+    strategy_key: "futures_breakout_v3",
+    instrument: "GOLDTEN",
     interval: "FIVE_MINUTE",
     lookback_months: 3,
     lots: 1,
-    stop_loss_percent: 5,
-    target_percent: 20,
-    keltner_multiplier: 2,
-    require_volume: false,
-    slippage_bps: 5,
-    cost_bps: 2,
   });
   const [history, setHistory] = useState([]);
   const [result, setResult] = useState(null);
@@ -142,9 +136,8 @@ export default function BacktestingPage() {
 
   const latestRun = result?.run || history[0] || null;
   const latestSummary = latestRun?.summary || null;
-  const isIchimoku = form.strategy_key === "ichimoku_keltner_tsi";
   const backtestingAllowed = availability?.allowed !== false;
-  const summaryIsIchimoku = latestSummary?.strategy_key === "ichimoku_keltner_tsi";
+  const parametersValid = true;
   const recentTrades = useMemo(
     () => (Array.isArray(result?.trades) ? result.trades.slice(-10).reverse() : []),
     [result]
@@ -155,10 +148,12 @@ export default function BacktestingPage() {
   };
 
   const updateStrategy = (strategyKey) => {
+    const optionStrategy = strategyKey === "option_entry_v1";
     setForm((current) => ({
       ...current,
       strategy_key: strategyKey,
-      instrument: strategyKey === "ichimoku_keltner_tsi" ? "NIFTY" : "GOLDTEN",
+      instrument: optionStrategy ? "SENSEX" : "GOLDTEN",
+      interval: optionStrategy ? "FIVE_MINUTE" : current.interval,
     }));
   };
 
@@ -174,12 +169,6 @@ export default function BacktestingPage() {
         interval: form.interval,
         lookback_months: Number(form.lookback_months),
         lots: Number(form.lots),
-        stop_loss_percent: Number(form.stop_loss_percent),
-        target_percent: Number(form.target_percent),
-        keltner_multiplier: Number(form.keltner_multiplier),
-        require_volume: Boolean(form.require_volume),
-        slippage_bps: Number(form.slippage_bps),
-        cost_bps: Number(form.cost_bps),
       });
       setResult(response.data);
       await loadHistory();
@@ -199,7 +188,7 @@ export default function BacktestingPage() {
           </p>
           <h1 className="mt-2 text-3xl font-semibold text-white">Backtesting</h1>
           <p className="mt-2 text-sm text-slate-400">
-            Research Ichimoku Cloud + Keltner Channel + TSI signals for NIFTY 50 and SENSEX.
+            Research closed-candle strategy signals for GOLDTEN.
           </p>
         </div>
         <button
@@ -249,8 +238,8 @@ export default function BacktestingPage() {
               onChange={(event) => updateStrategy(event.target.value)}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
-              <option value="ichimoku_keltner_tsi">Ichimoku + Keltner + TSI</option>
               <option value="futures_breakout_v3">Futures Breakout v3</option>
+              <option value="option_entry_v1">Option Entry Strategy V1.0</option>
             </select>
             <p className="mt-2 text-xs text-slate-500">
               {form.strategy_key} · backtesting only
@@ -264,11 +253,8 @@ export default function BacktestingPage() {
               onChange={(event) => update("instrument", event.target.value)}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
-              {isIchimoku ? (
-                <>
-                  <option value="NIFTY">NIFTY 50</option>
-                  <option value="SENSEX">SENSEX</option>
-                </>
+              {form.strategy_key === "option_entry_v1" ? (
+                <option value="SENSEX">SENSEX</option>
               ) : (
                 <option value="GOLDTEN">GOLDTEN</option>
               )}
@@ -280,6 +266,7 @@ export default function BacktestingPage() {
             <select
               value={form.interval}
               onChange={(event) => update("interval", event.target.value)}
+              disabled={form.strategy_key === "option_entry_v1"}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
               {intervals.map(([value, label]) => (
@@ -304,7 +291,7 @@ export default function BacktestingPage() {
               </select>
             </label>
             <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              {isIchimoku ? "Position size" : "Lots"}
+              Lots
               <input
                 type="number"
                 min="1"
@@ -316,85 +303,16 @@ export default function BacktestingPage() {
             </label>
           </div>
 
-          {isIchimoku ? <div className="grid grid-cols-2 gap-3">
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Stop loss %
-              <input
-                type="number"
-                min="0.01"
-                max="100"
-                step="0.1"
-                value={form.stop_loss_percent}
-                onChange={(event) => update("stop_loss_percent", event.target.value)}
-                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
-              />
-            </label>
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Target %
-              <input
-                type="number"
-                min="0.01"
-                max="500"
-                step="0.1"
-                value={form.target_percent}
-                onChange={(event) => update("target_percent", event.target.value)}
-                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
-              />
-            </label>
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Keltner ATR ×
-              <input
-                type="number"
-                min="0.1"
-                max="10"
-                step="0.1"
-                value={form.keltner_multiplier}
-                onChange={(event) => update("keltner_multiplier", event.target.value)}
-                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
-              />
-            </label>
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Slippage bps
-              <input
-                type="number"
-                min="0"
-                max="1000"
-                step="1"
-                value={form.slippage_bps}
-                onChange={(event) => update("slippage_bps", event.target.value)}
-                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
-              />
-            </label>
-            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Cost / side bps
-              <input
-                type="number"
-                min="0"
-                max="1000"
-                step="1"
-                value={form.cost_bps}
-                onChange={(event) => update("cost_bps", event.target.value)}
-                className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
-              />
-            </label>
-            <label className="flex items-end gap-2 pb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-              <input
-                type="checkbox"
-                checked={form.require_volume}
-                onChange={(event) => update("require_volume", event.target.checked)}
-                className="h-4 w-4 rounded border-slate-600 bg-slate-950 text-brand-500"
-              />
-              Require volume
-            </label>
-          </div> : null}
-
-          {isIchimoku ? <p className="text-xs leading-5 text-slate-500">
-            Signals execute at the next candle open. Index results model directional index points, not historical CE/PE premiums or strikes; GOLDTEN uses its contract lot size. The volume filter is off because cash-index candles commonly report zero volume.
-          </p> : null}
 
           <button
             type="submit"
-            disabled={!backtestingAllowed || status === "running" || Number(form.lots) <= 0}
+            disabled={
+              !backtestingAllowed ||
+              status === "running" ||
+              !Number.isInteger(Number(form.lots)) ||
+              Number(form.lots) <= 0 ||
+              !parametersValid
+            }
             className="w-full rounded-lg bg-brand-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-brand-500/20 transition hover:bg-brand-400 disabled:cursor-wait disabled:bg-slate-700"
           >
             {!backtestingAllowed
@@ -471,64 +389,6 @@ export default function BacktestingPage() {
                   value={currency.format(Number(latestSummary.max_drawdown || 0))}
                   tone="bad"
                 />
-                {summaryIsIchimoku ? (
-                  <>
-                    <Metric
-                      label="Max drawdown %"
-                      value={`${number.format(Number(latestSummary.max_drawdown_percent || 0))}%`}
-                      tone="bad"
-                    />
-                    <Metric
-                      label="Profit factor"
-                      value={
-                        latestSummary.profit_factor == null
-                          ? "-"
-                          : number.format(Number(latestSummary.profit_factor))
-                      }
-                      tone="info"
-                    />
-                    <Metric
-                      label="Sharpe / trade"
-                      value={
-                        latestSummary.sharpe_ratio == null
-                          ? "-"
-                          : number.format(Number(latestSummary.sharpe_ratio))
-                      }
-                      tone="info"
-                    />
-                    <Metric
-                      label="Costs"
-                      value={currency.format(Number(latestSummary.total_costs || 0))}
-                    />
-                  </>
-                ) : (
-                  <>
-                    <Metric
-                      label="Initial margin"
-                      value={currency.format(Number(latestSummary.initial_margin || 0))}
-                      tone="info"
-                    />
-                    <Metric
-                      label="Margin / lot"
-                      value={currency.format(
-                        Number(
-                          latestSummary.calculator_margin_per_lot ||
-                            latestSummary.initial_margin_per_lot ||
-                            0
-                        )
-                      )}
-                      tone="info"
-                    />
-                    <Metric
-                      label="Margin %"
-                      value={`${number.format(Number(latestSummary.margin_requirement_percent || 0))}%`}
-                    />
-                    <Metric
-                      label="Max margin used"
-                      value={currency.format(Number(latestSummary.max_margin_used || 0))}
-                    />
-                  </>
-                )}
                 </div>
                 <EquityCurve points={latestSummary.equity_curve} />
               </>

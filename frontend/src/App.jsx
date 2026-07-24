@@ -1,4 +1,4 @@
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, useLocation } from "react-router-dom";
 import Layout from "./components/Layout.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import ProfitLossPage from "./pages/ProfitLossPage.jsx";
@@ -15,37 +15,35 @@ import LogsViewerPage from "./pages/LogsViewerPage.jsx";
 import StrategiesPage from "./pages/StrategiesPage.jsx";
 import BacktestingPage from "./pages/BacktestingPage.jsx";
 
+function AppRoutes() {
+  const location = useLocation();
+  const path = location.pathname.replace(/\/+$/, "") || "/";
+
+  if (path === "/login") return <LoginPage />;
+  if (path === "/signup") return <SignupPage />;
+  if (path === "/verify-otp") return <VerifyOtpPage />;
+  if (path === "/forgot-password") return <ForgotPasswordPage />;
+  if (path === "/forgot-password/verify") return <VerifyResetOtpPage />;
+  if (path === "/forgot-password/reset") return <ResetPasswordPage />;
+  if (path === "/logs") return <LogsViewerPage />;
+  if (path === "/admin") return <Navigate to="/admin/users" replace />;
+
+  let page = <HomePage />;
+  if (path === "/pnl") page = <ProfitLossPage />;
+  else if (path === "/strategies") page = <StrategiesPage />;
+  else if (path === "/backtesting") page = <BacktestingPage />;
+  else if (path === "/admin/users") page = <AdminPage />;
+  else if (path === "/admin/limits") page = <AdminRiskLimitsPage />;
+  else if (path === "/admin/jobs") page = <AdminJobsPage />;
+  else if (path !== "/") return <Navigate to="/" replace />;
+
+  return <Layout>{page}</Layout>;
+}
+
 export default function App() {
   return (
-    <BrowserRouter
-      future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
-    >
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/signup" element={<SignupPage />} />
-        <Route path="/verify-otp" element={<VerifyOtpPage />} />
-        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-        <Route
-          path="/forgot-password/verify"
-          element={<VerifyResetOtpPage />}
-        />
-        <Route path="/forgot-password/reset" element={<ResetPasswordPage />} />
-
-        <Route element={<Layout />}>
-          <Route index element={<HomePage />} />
-          <Route path="pnl" element={<ProfitLossPage />} />
-          <Route path="strategies" element={<StrategiesPage />} />
-          <Route path="backtesting" element={<BacktestingPage />} />
-          <Route path="admin" element={<Navigate to="/admin/users" replace />} />
-          <Route path="admin/users" element={<AdminPage />} />
-          <Route path="admin/limits" element={<AdminRiskLimitsPage />} />
-          <Route path="admin/jobs" element={<AdminJobsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-
-        {/* Standalone log viewer - must be after Layout routes to avoid catch-all */}
-        <Route path="/logs" element={<LogsViewerPage />} />
-      </Routes>
+    <BrowserRouter>
+      <AppRoutes />
     </BrowserRouter>
   );
 }

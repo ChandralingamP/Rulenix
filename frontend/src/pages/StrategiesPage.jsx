@@ -22,6 +22,15 @@ const formatDate = (value) => {
 const TRADING_PAUSED_MESSAGE =
   "Trading paused: Market data is temporarily unavailable. No trades will be placed until it recovers";
 
+
+const draftFromInstrument = (instrument) => ({
+  enabled: Boolean(instrument.enabled),
+  lots: instrument.lots || 1,
+  runDaySession: instrument.run_day_session ?? true,
+  runEveningSession: instrument.run_evening_session ?? true,
+});
+
+
 const Toggle = ({ active, label, disabled = false, onChange }) => (
   <button
     type="button"
@@ -52,19 +61,8 @@ export default function StrategiesPage() {
     const next = {};
     items.forEach((strategy) => {
       strategy.instruments?.forEach((instrument) => {
-        next[`${strategy.key}:${instrument.instrument}`] = {
-          enabled: Boolean(instrument.enabled),
-          lots: instrument.lots || 1,
-          runDaySession: instrument.run_day_session ?? true,
-          runEveningSession: instrument.run_evening_session ?? true,
-          intervalKey: instrument.interval_key || "FIVE_MINUTE",
-          stopLossPercent: instrument.stop_loss_percent ?? 5,
-          targetPercent: instrument.target_percent ?? 20,
-          keltnerMultiplier: instrument.keltner_multiplier ?? 2,
-          requireVolume: Boolean(instrument.require_volume),
-          premiumMin: instrument.premium_min ?? 200,
-          premiumMax: instrument.premium_max ?? 300,
-        };
+        next[`${strategy.key}:${instrument.instrument}`] =
+          draftFromInstrument(instrument);
       });
     });
     setDrafts(next);
@@ -109,13 +107,6 @@ export default function StrategiesPage() {
         lots,
         runDaySession: Boolean(draft.runDaySession),
         runEveningSession: Boolean(draft.runEveningSession),
-        intervalKey: draft.intervalKey,
-        stopLossPercent: Number(draft.stopLossPercent),
-        targetPercent: Number(draft.targetPercent),
-        keltnerMultiplier: Number(draft.keltnerMultiplier),
-        requireVolume: Boolean(draft.requireVolume),
-        premiumMin: Number(draft.premiumMin),
-        premiumMax: Number(draft.premiumMax),
       })
     );
   };
@@ -301,30 +292,11 @@ export default function StrategiesPage() {
                       <tbody className="divide-y divide-slate-800 bg-slate-950/60">
                         {strategy.instruments?.map((instrument) => {
                           const key = `${strategy.key}:${instrument.instrument}`;
-                          const draft = drafts[key] || {
-                            enabled: instrument.enabled,
-                            lots: instrument.lots,
-                            runDaySession: instrument.run_day_session ?? true,
-                            runEveningSession: instrument.run_evening_session ?? true,
-                            intervalKey: instrument.interval_key || "FIVE_MINUTE",
-                            stopLossPercent: instrument.stop_loss_percent ?? 5,
-                            targetPercent: instrument.target_percent ?? 20,
-                            keltnerMultiplier: instrument.keltner_multiplier ?? 2,
-                            requireVolume: Boolean(instrument.require_volume),
-                            premiumMin: instrument.premium_min ?? 200,
-                            premiumMax: instrument.premium_max ?? 300,
-                          };
+                          const draft =
+                            drafts[key] || draftFromInstrument(instrument);
                           const lots = Number(draft.lots);
                           const lotsValid = Number.isInteger(lots) && lots > 0;
-                          const isIchimoku = strategy.key === "ichimoku_keltner_tsi";
-                          const parametersValid =
-                            !isIchimoku ||
-                            (Number(draft.stopLossPercent) > 0 &&
-                              Number(draft.targetPercent) > 0 &&
-                              Number(draft.keltnerMultiplier) >= 0.1 &&
-                              (instrument.instrument === "GOLDTEN" ||
-                                (Number(draft.premiumMin) > 0 &&
-                                  Number(draft.premiumMax) > Number(draft.premiumMin))));
+                          const parametersValid = true;
                           const snapshot = instrument.snapshot;
                           const isContractPreview =
                             snapshot?.execution_key === "catalog-preview";
@@ -395,12 +367,6 @@ export default function StrategiesPage() {
                                     updateDraft(key, {
                                       enabled,
                                     });
-                                    if (isIchimoku) {
-                                      saveInstrument(strategy, instrument, {
-                                        ...draft,
-                                        enabled,
-                                      });
-                                    }
                                   }}
                                 />
                               </td>
@@ -423,56 +389,9 @@ export default function StrategiesPage() {
                                 </button>
                               </td>
                             </tr>
-                            {isIchimoku ? (
-                              <tr className="bg-slate-900/45">
-                                <td colSpan={7} className="px-4 py-4">
-                                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
-                                    <label className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                      Candle interval
-                                      <select aria-label={`${instrument.instrument} candle interval`} value={draft.intervalKey} onChange={(event) => updateDraft(key, { intervalKey: event.target.value })} className="mt-1 h-9 w-full rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs normal-case text-white">
-                                        <option value="ONE_MINUTE">1 minute</option>
-                                        <option value="FIVE_MINUTE">5 minutes</option>
-                                        <option value="FIFTEEN_MINUTE">15 minutes</option>
-                                      </select>
-                                    </label>
-                                    {[
-                                      ["stopLossPercent", "Stop loss %", 0.01],
-                                      ["targetPercent", "Target %", 0.01],
-                                      ["keltnerMultiplier", "Keltner ATR ×", 0.1],
-                                    ].map(([field, label, min]) => (
-                                      <label key={field} className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                        {label}
-                                        <input aria-label={`${instrument.instrument} ${label}`} type="number" min={min} step="0.1" value={draft[field]} onChange={(event) => updateDraft(key, { [field]: event.target.value })} className="mt-1 h-9 w-full rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs normal-case text-white" />
-                                      </label>
-                                    ))}
-                                    {instrument.instrument !== "GOLDTEN" ? (
-                                      <>
-                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                          Premium min ₹
-                                          <input aria-label={`${instrument.instrument} premium minimum`} type="number" min="1" step="1" value={draft.premiumMin} onChange={(event) => updateDraft(key, { premiumMin: event.target.value })} className="mt-1 h-9 w-full rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs normal-case text-white" />
-                                        </label>
-                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                          Premium max ₹
-                                          <input aria-label={`${instrument.instrument} premium maximum`} type="number" min="1" step="1" value={draft.premiumMax} onChange={(event) => updateDraft(key, { premiumMax: event.target.value })} className="mt-1 h-9 w-full rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs normal-case text-white" />
-                                        </label>
-                                      </>
-                                    ) : null}
-                                    <div className="flex flex-col justify-end gap-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                      <label className="flex items-center gap-2"><input type="checkbox" checked={Boolean(draft.runDaySession)} onChange={(event) => updateDraft(key, { runDaySession: event.target.checked })} /> Day session</label>
-                                      {instrument.instrument === "GOLDTEN" ? <label className="flex items-center gap-2"><input type="checkbox" checked={Boolean(draft.runEveningSession)} onChange={(event) => updateDraft(key, { runEveningSession: event.target.checked })} /> Evening session</label> : null}
-                                      <label className="flex items-center gap-2"><input type="checkbox" checked={Boolean(draft.requireVolume)} onChange={(event) => updateDraft(key, { requireVolume: event.target.checked })} /> Volume filter</label>
-                                    </div>
-                                  </div>
-                                  <p className="mt-3 text-xs text-slate-500">
-                                    {instrument.instrument === "GOLDTEN" ? "Signals execute on the selected GOLDTEN future." : "Expiry and lot size are preloaded. Bullish signals select CE and bearish signals select PE at entry; the contract closest to the midpoint of the premium range is used."}{" "}
-                                    Entry: MARKET. Target: LIMIT. Stop loss: STOPLOSS_LIMIT.
-                                  </p>
-                                </td>
-                              </tr>
-                            ) : null}
                             </Fragment>
                           );
-                        })}
+                          })}
                       </tbody>
                     </table>
                   </div>

@@ -165,12 +165,29 @@ pub async fn update_profile(
     )
     .await?;
 
-    let client_changed = current
-        .brokerage_user_id
-        .as_deref()
-        .unwrap_or("")
-        .ne(client_id.as_str());
     let mut transaction = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(current.id)
+        .execute(&mut *transaction)
+        .await?;
+    let stored_client: Option<String> =
+        sqlx::query_scalar("SELECT brokerage_user_id FROM user_profiles WHERE user_id=$1")
+            .bind(current.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .flatten();
+    let client_changed = stored_client.as_deref().unwrap_or("") != client_id;
+    if client_changed {
+        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+            .bind(current.id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if execution_in_flight {
+            return Err(AppError::BadRequest(
+                "The broker Client ID cannot change while a position or broker order is active. Close or reconcile it first.".into(),
+            ));
+        }
+    }
     let user_update =
         sqlx::query("UPDATE users SET username=$1,email=$2,updated_at=NOW() WHERE id=$3")
             .bind(&new_username)
@@ -190,19 +207,24 @@ pub async fn update_profile(
     }
     sqlx::query(
         "INSERT INTO user_profiles (user_id,brokerage_user_id,api_key,mobile_number) VALUES ($1,$2,'',$3) \
-         ON CONFLICT (user_id) DO UPDATE SET brokerage_user_id=EXCLUDED.brokerage_user_id,mobile_number=EXCLUDED.mobile_number, \
-         token_state=CASE WHEN $4 THEN '' ELSE user_profiles.token_state END,updated_at=NOW()",
+         ON CONFLICT (user_id) DO UPDATE SET brokerage_user_id=EXCLUDED.brokerage_user_id,mobile_number=EXCLUDED.mobile_number,updated_at=NOW()",
     )
     .bind(current.id)
     .bind(&client_id)
     .bind(mobile)
-    .bind(client_changed)
     .execute(&mut *transaction)
     .await?;
-    transaction.commit().await?;
     if client_changed {
-        state.credentials.clear_tokens(user.id).await?;
+        state
+            .credentials
+            .clear_tokens_in_transaction(&mut transaction, current.id)
+            .await?;
+        sqlx::query("UPDATE user_profiles SET broker_credential_revision=broker_credential_revision+1,token_state='invalid',token_received_at=NULL,last_token_check_at=NOW(),last_token_status='invalid',last_token_message='The broker Client ID changed. Establish the broker connection again.',updated_at=NOW() WHERE user_id=$1")
+            .bind(current.id)
+            .execute(&mut *transaction)
+            .await?;
     }
+    transaction.commit().await?;
     let updated = account(&state, user.id).await?;
     let request_context = crate::audit::optional_context(context);
     if let Err(error) = crate::audit::record(
@@ -282,11 +304,41 @@ pub async fn update_trading_mode(
         broker_valid,
         input.confirm_live.unwrap_or(false),
     )?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    let current: (bool, String, Option<String>, Option<String>) = sqlx::query_as("SELECT u.can_live_trade,COALESCE(p.trading_mode,'demo'),p.brokerage_user_id,p.last_token_status FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let current_broker_valid = current.2.as_deref().is_some_and(|value| !value.is_empty())
+        && !credentials.api_key.is_empty()
+        && !credentials.jwt_token.is_empty()
+        && !credentials.feed_token.is_empty()
+        && matches!(current.3.as_deref(), Some("success" | "refreshed"));
+    validate_mode_change(
+        &mode,
+        current.0,
+        current_broker_valid,
+        input.confirm_live.unwrap_or(false),
+    )?;
+    if mode != current.1 {
+        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+            .bind(user.id).fetch_one(&mut *tx).await?;
+        if execution_in_flight {
+            return Err(AppError::BadRequest(
+                "Trading mode cannot change while a position or broker order is still active. Close or reconcile it first.".into(),
+            ));
+        }
+    }
     sqlx::query("UPDATE user_profiles SET trading_mode=$1,updated_at=NOW() WHERE user_id=$2")
         .bind(&mode)
         .bind(user.id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     let updated = account(&state, user.id).await?;
     let request_context = crate::audit::optional_context(context);
     if let Err(error) = crate::audit::record(

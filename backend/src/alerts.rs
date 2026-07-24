@@ -1,5 +1,44 @@
 use crate::{error::AppResult, state::AppState};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    transport::smtp::authentication::Credentials,
+};
 use serde_json::{Value, json};
+
+async fn send_email(
+    state: &AppState,
+    destination: &str,
+    event_type: &str,
+    severity: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let host = state
+        .config
+        .smtp_host
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("SMTP is not configured"))?;
+    let message = Message::builder()
+        .from(state.config.smtp_from.parse()?)
+        .to(destination.parse()?)
+        .subject(format!(
+            "[Rulenix {}] {}",
+            severity.to_uppercase(),
+            event_type
+        ))
+        .body(format!(
+            "Rulenix emitted an operational alert.\n\nEvent: {event_type}\nSeverity: {severity}\n\nPayload:\n{}\n",
+            serde_json::to_string_pretty(payload)?
+        ))?;
+    let mut builder =
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?.port(state.config.smtp_port);
+    if let (Some(username), Some(password)) =
+        (&state.config.smtp_username, &state.config.smtp_password)
+    {
+        builder = builder.credentials(Credentials::new(username.clone(), password.clone()));
+    }
+    builder.build().send(message).await?;
+    Ok(())
+}
 
 pub async fn deliver(
     state: &AppState,
@@ -70,6 +109,11 @@ pub async fn deliver(
         }
     }
     if let Some(destination) = &state.config.alert_email_to {
+        let result = send_email(state, destination, event_type, severity, &payload).await;
+        let (status, error) = match result {
+            Ok(()) => ("sent", String::new()),
+            Err(error) => ("failed", error.to_string()),
+        };
         record_attempt(
             state,
             AlertAttempt {
@@ -77,8 +121,8 @@ pub async fn deliver(
                 severity,
                 channel: "email",
                 destination,
-                status: "skipped",
-                error: "SMTP alert email rendering is documented; webhook delivery is active in this build",
+                status,
+                error: &error,
                 payload: &payload,
             },
         )

@@ -3,7 +3,7 @@
 ## Docker
 
 1. Create `backend/.env.production` from `backend/.env.production.example` and inject real secrets outside source control.
-2. Create `secrets/postgres_password.txt` with the PostgreSQL password.
+2. Create `secrets/postgres_password.txt` with the PostgreSQL password. Provision PostgreSQL with TLS and place its CA certificate at `secrets/postgres_ca.crt`; the production backend verifies the database hostname against that CA.
 3. Build and start:
 
 ```powershell

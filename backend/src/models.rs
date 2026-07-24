@@ -20,6 +20,7 @@ pub struct AdminUser {
 pub struct BrokerageProfile {
     pub user_id: Uuid,
     pub brokerage_user_id: String,
+    pub broker_credential_revision: i64,
     pub token_state: String,
     pub token_received_at: Option<DateTime<Utc>>,
     pub last_token_check_at: Option<DateTime<Utc>>,

@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import BacktestingPage from "./BacktestingPage.jsx";
 import apiClient from "../utils/axiosConfig.js";
@@ -29,41 +29,6 @@ describe("BacktestingPage", () => {
     vi.clearAllMocks();
   });
 
-  it("submits the PDF strategy with the requested index universe and defaults", async () => {
-    apiClient.get.mockResolvedValue({ data: { runs: [] } });
-    apiClient.post.mockResolvedValue({
-      data: {
-        run: {
-          trading_symbol: "Nifty Bank",
-          from_time: "2026-04-01T00:00:00Z",
-          summary: { strategy_key: "ichimoku_keltner_tsi", trades: 0 },
-        },
-        trades: [],
-      },
-    });
-    const user = userEvent.setup();
-    render(<BacktestingPage />);
-
-    expect(await screen.findByText("Ichimoku + Keltner + TSI", { selector: "option" })).toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("Instrument"), "SENSEX");
-    fireEvent.submit(screen.getByRole("button", { name: "Run backtest" }).closest("form"));
-
-    await waitFor(() =>
-      expect(apiClient.post).toHaveBeenCalledWith(
-        "/backtesting/run",
-        expect.objectContaining({
-          strategy_key: "ichimoku_keltner_tsi",
-          instrument: "SENSEX",
-          interval: "FIVE_MINUTE",
-          stop_loss_percent: 5,
-          target_percent: 20,
-          keltner_multiplier: 2,
-          require_volume: false,
-        })
-      )
-    );
-  });
-
   it("keeps the existing GOLDTEN breakout backtest available", async () => {
     apiClient.get.mockResolvedValue({ data: { runs: [] } });
     const user = userEvent.setup();
@@ -73,6 +38,7 @@ describe("BacktestingPage", () => {
     expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDTEN");
     expect(screen.queryByLabelText("Stop loss %")).not.toBeInTheDocument();
   });
+
 
   it("disables new backtests on an Indian trading day", async () => {
     apiClient.get.mockResolvedValue({
