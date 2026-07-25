@@ -209,6 +209,15 @@ struct OptionBacktestSignal {
 }
 
 #[derive(Debug, Clone)]
+struct OptionChainSelection {
+    token: String,
+    symbol: String,
+    premium: f64,
+    strike: f64,
+    underlying: f64,
+}
+
+#[derive(Debug, Clone)]
 enum OptionSetup {
     Idle,
     AwaitRetrace,
@@ -983,6 +992,64 @@ fn option_backtest_exit(
     }
 }
 
+fn underlying_at(index_candles: &[Candle], at: DateTime<Utc>) -> Option<f64> {
+    let index = index_candles.partition_point(|candle| candle.candle_time <= at);
+    index
+        .checked_sub(1)
+        .and_then(|position| index_candles.get(position))
+        .map(|candle| candle.close_price)
+}
+
+fn option_chain_selection_is_better(
+    candidate: &OptionChainSelection,
+    existing: &OptionChainSelection,
+) -> bool {
+    (candidate.premium - OPTION_TARGET_PREMIUM)
+        .abs()
+        .total_cmp(&(existing.premium - OPTION_TARGET_PREMIUM).abs())
+        .then_with(|| {
+            (candidate.strike - candidate.underlying)
+                .abs()
+                .total_cmp(&(existing.strike - existing.underlying).abs())
+        })
+        .then_with(|| candidate.strike.total_cmp(&existing.strike))
+        .is_lt()
+}
+
+fn option_chain_selections(
+    indicator_sets: &[(OptionBacktestContract, Vec<OptionIndicator>)],
+    index_candles: &[Candle],
+) -> HashMap<(OptionBacktestSide, DateTime<Utc>), OptionChainSelection> {
+    let mut selected = HashMap::new();
+    for (contract, indicators) in indicator_sets {
+        for item in indicators {
+            if !option_market_minutes(item.candle.candle_time)
+                || !(OPTION_MIN_PREMIUM..=OPTION_MAX_PREMIUM).contains(&item.candle.close_price)
+            {
+                continue;
+            }
+            let Some(underlying) = underlying_at(index_candles, item.candle.candle_time) else {
+                continue;
+            };
+            let candidate = OptionChainSelection {
+                token: contract.token.clone(),
+                symbol: contract.symbol.clone(),
+                premium: item.candle.close_price,
+                strike: contract.strike,
+                underlying,
+            };
+            let key = (contract.side, item.candle.candle_time);
+            match selected.get(&key) {
+                Some(existing) if !option_chain_selection_is_better(&candidate, existing) => {}
+                _ => {
+                    selected.insert(key, candidate);
+                }
+            }
+        }
+    }
+    selected
+}
+
 async fn effective_margin_requirement(state: &AppState, user_id: Uuid) -> AppResult<f64> {
     Ok(sqlx::query_scalar(
         "SELECT COALESCE(u.margin_requirement_percent,g.margin_requirement_percent,10.0)::float8 FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1 WHERE g.user_id IS NULL",
@@ -1469,17 +1536,16 @@ fn close_option_backtest_trade(
     }
 }
 
-fn simulate_option_contract(
+fn simulate_option_indicators(
     contract: &OptionBacktestContract,
-    candles: &[Candle],
+    indicators: &[OptionIndicator],
     lots: i32,
     margin_requirement_percent: f64,
 ) -> Vec<TradeResult> {
-    let indicators = option_indicators(candles);
     let mut setup = OptionSetup::Idle;
     let mut open_signal: Option<OptionBacktestSignal> = None;
     let mut trades = Vec::new();
-    for item in &indicators {
+    for item in indicators {
         if let Some(signal) = open_signal.clone() {
             if let Some((reason, exit_price)) =
                 option_backtest_exit(item, contract.side, signal.stop_loss)
@@ -1529,12 +1595,51 @@ fn side_key(trade: &TradeResult) -> &str {
         .unwrap_or(&trade.direction)
 }
 
+fn option_side_from_trade(trade: &TradeResult) -> Option<OptionBacktestSide> {
+    match trade.levels.get("option_type").and_then(Value::as_str) {
+        Some("CE") => Some(OptionBacktestSide::Call),
+        Some("PE") => Some(OptionBacktestSide::Put),
+        _ => match trade.direction.as_str() {
+            "BUY" => Some(OptionBacktestSide::Call),
+            "SELL" => Some(OptionBacktestSide::Put),
+            _ => None,
+        },
+    }
+}
+
+fn apply_option_chain_selection(
+    mut trade: TradeResult,
+    selections: &HashMap<(OptionBacktestSide, DateTime<Utc>), OptionChainSelection>,
+) -> Option<TradeResult> {
+    let side = option_side_from_trade(&trade)?;
+    let token = trade.levels.get("symbol_token").and_then(Value::as_str)?;
+    let selection = selections.get(&(side, trade.entry_time))?;
+    if selection.token != token {
+        return None;
+    }
+    if let Some(levels) = trade.levels.as_object_mut() {
+        levels.insert("option_chain_selected_at_entry".into(), json!(true));
+        levels.insert("selected_contract_symbol".into(), json!(selection.symbol));
+        levels.insert("selected_contract_token".into(), json!(selection.token));
+        levels.insert("selected_entry_premium".into(), json!(selection.premium));
+        levels.insert("underlying_at_entry".into(), json!(selection.underlying));
+        levels.insert(
+            "selection_basis".into(),
+            json!("premium_220_300_closest_to_260"),
+        );
+    }
+    Some(trade)
+}
+
 fn option_backtest_summary(
     trades: &[TradeResult],
     lot_size: i32,
     lots: i32,
     contract_count: usize,
     interval_candles: usize,
+    chain_selection_points: usize,
+    potential_signals: usize,
+    selected_signals: usize,
 ) -> Value {
     let equity: f64 = trades.iter().map(|trade| trade.realized_pnl).sum();
     let wins = trades
@@ -1584,6 +1689,7 @@ fn option_backtest_summary(
         "entry_frequency": "one_open_trade_per_option_side",
         "data_basis": "historical_option_candles_for_current_master_contracts",
         "pnl_model": "premium_points_x_quantity",
+        "selection_basis": "entry_time_option_chain_premium_220_300_closest_to_260",
         "parameters": {
             "interval": OPTION_INTERVAL,
             "keltner_ema_period": KELTNER_EMA_PERIOD,
@@ -1596,6 +1702,9 @@ fn option_backtest_summary(
             "max_contracts_per_side": OPTION_BACKTEST_MAX_CONTRACTS_PER_SIDE,
         },
         "contracts_scanned": contract_count,
+        "chain_selection_points": chain_selection_points,
+        "potential_signals": potential_signals,
+        "selected_signals": selected_signals,
         "interval_candles": interval_candles,
         "buy_trades": trades.iter().filter(|trade| trade.direction == "BUY").count(),
         "sell_trades": trades.iter().filter(|trade| trade.direction == "SELL").count(),
@@ -1704,6 +1813,7 @@ async fn run_option_backtest(
     let mut representative_symbol = String::new();
     let mut representative_token = String::new();
     let mut representative_lot_size = 1;
+    let mut indicator_sets: Vec<(OptionBacktestContract, Vec<OptionIndicator>)> = Vec::new();
 
     for contract in &option_contracts {
         let contract_selection = ContractSelection {
@@ -1744,19 +1854,38 @@ async fn run_option_backtest(
         if candles.is_empty() {
             continue;
         }
+        let indicators = option_indicators(&candles);
+        if indicators.is_empty() {
+            continue;
+        }
         if representative_symbol.is_empty() {
             representative_symbol = contract.symbol.clone();
             representative_token = contract.token.clone();
             representative_lot_size = contract.lot_size;
         }
         interval_candles += candles.len();
-        potential_trades.extend(simulate_option_contract(
+        potential_trades.extend(simulate_option_indicators(
             contract,
-            &candles,
+            &indicators,
             input.lots,
             margin_requirement_percent,
         ));
+        indicator_sets.push((contract.clone(), indicators));
     }
+
+    let chain_selections = option_chain_selections(&indicator_sets, &index_candles);
+    let potential_signal_count = potential_trades.len();
+    let mut selected_signal_count = 0_usize;
+    potential_trades = potential_trades
+        .into_iter()
+        .filter_map(|trade| {
+            let selected = apply_option_chain_selection(trade, &chain_selections);
+            if selected.is_some() {
+                selected_signal_count += 1;
+            }
+            selected
+        })
+        .collect();
 
     potential_trades.sort_by(|left, right| {
         left.entry_time.cmp(&right.entry_time).then_with(|| {
@@ -1794,6 +1923,9 @@ async fn run_option_backtest(
         input.lots,
         option_contracts.len(),
         interval_candles,
+        chain_selections.len(),
+        potential_signal_count,
+        selected_signal_count,
     );
     summary["index_candles"] = json!(index_candles.len());
     summary["option_candles"] = json!(interval_candles.saturating_sub(index_candles.len()));
@@ -2392,6 +2524,39 @@ mod tests {
         }
     }
 
+    fn option_contract(
+        token: &str,
+        side: OptionBacktestSide,
+        strike: f64,
+    ) -> OptionBacktestContract {
+        OptionBacktestContract {
+            side,
+            exchange: "BFO".into(),
+            token: token.into(),
+            symbol: format!("SENSEX26JUL{}{}", strike as i32, side.option_type()),
+            expiry: NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+            strike,
+            lot_size: 20,
+        }
+    }
+
+    fn option_indicator(at: DateTime<Utc>, premium: f64) -> OptionIndicator {
+        OptionIndicator {
+            candle: Candle {
+                candle_time: at,
+                open_price: premium,
+                high_price: premium + 5.0,
+                low_price: premium - 5.0,
+                close_price: premium,
+                volume: 100.0,
+            },
+            middle: premium,
+            upper: premium + 10.0,
+            lower: premium - 10.0,
+            tsi: 1.0,
+        }
+    }
+
     #[test]
     fn option_backtest_candidates_use_nearest_expiry_and_api_cap() {
         let mut contracts = vec![sensex_option("old", "26JUL2026", 76000, "CE")];
@@ -2418,6 +2583,79 @@ mod tests {
             contract.expiry == NaiveDate::from_ymd_opt(2026, 8, 2).unwrap()
                 && contract.side == OptionBacktestSide::Call
         }));
+    }
+
+    #[test]
+    fn option_chain_selection_picks_entry_premium_closest_to_target() {
+        let at = Utc.with_ymd_and_hms(2026, 1, 5, 5, 0, 0).single().unwrap();
+        let index_candles = vec![Candle {
+            candle_time: at,
+            open_price: 76_000.0,
+            high_price: 76_100.0,
+            low_price: 75_900.0,
+            close_price: 76_025.0,
+            volume: 100.0,
+        }];
+        let sets = vec![
+            (
+                option_contract("wide", OptionBacktestSide::Call, 76_000.0),
+                vec![option_indicator(at, 225.0)],
+            ),
+            (
+                option_contract("best", OptionBacktestSide::Call, 76_100.0),
+                vec![option_indicator(at, 258.0)],
+            ),
+            (
+                option_contract("outside", OptionBacktestSide::Call, 76_200.0),
+                vec![option_indicator(at, 301.0)],
+            ),
+        ];
+
+        let selections = option_chain_selections(&sets, &index_candles);
+        let selected = selections.get(&(OptionBacktestSide::Call, at)).unwrap();
+
+        assert_eq!(selected.token, "best");
+        assert_eq!(selected.premium, 258.0);
+    }
+
+    #[test]
+    fn option_chain_selection_rejects_non_selected_signal() {
+        let at = Utc.with_ymd_and_hms(2026, 1, 5, 5, 0, 0).single().unwrap();
+        let mut selections = HashMap::new();
+        selections.insert(
+            (OptionBacktestSide::Call, at),
+            OptionChainSelection {
+                token: "selected".into(),
+                symbol: "SENSEX26JUL76100CE".into(),
+                premium: 258.0,
+                strike: 76_100.0,
+                underlying: 76_025.0,
+            },
+        );
+        let trade = |token: &str| TradeResult {
+            id: Uuid::new_v4(),
+            trade_date: NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            direction: "BUY".into(),
+            entry_time: at,
+            entry_price: 258.0,
+            exit_time: at + Duration::minutes(5),
+            exit_price: 270.0,
+            lots: 1,
+            quantity: 20,
+            margin_per_lot: 516.0,
+            margin_used: 516.0,
+            realized_pnl: 240.0,
+            exit_reason: "TARGET".into(),
+            levels: json!({"option_type":"CE","symbol_token":token}),
+        };
+
+        assert!(apply_option_chain_selection(trade("other"), &selections).is_none());
+        let accepted = apply_option_chain_selection(trade("selected"), &selections).unwrap();
+        assert_eq!(accepted.levels["selected_entry_premium"], 258.0);
+        assert_eq!(
+            accepted.levels["selection_basis"],
+            "premium_220_300_closest_to_260"
+        );
     }
 
     #[test]

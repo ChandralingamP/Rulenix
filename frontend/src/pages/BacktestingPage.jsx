@@ -136,6 +136,8 @@ export default function BacktestingPage() {
 
   const latestRun = result?.run || history[0] || null;
   const latestSummary = latestRun?.summary || null;
+  const selectedStrategyLabel =
+    form.strategy_key === "option_entry_v1" ? "SENSEX options" : "GOLDTEN futures";
   const backtestingAllowed = availability?.allowed !== false;
   const parametersValid = true;
   const recentTrades = useMemo(
@@ -188,7 +190,7 @@ export default function BacktestingPage() {
           </p>
           <h1 className="mt-2 text-3xl font-semibold text-white">Backtesting</h1>
           <p className="mt-2 text-sm text-slate-400">
-            Research closed-candle strategy signals for GOLDTEN.
+            Research closed-candle strategy signals for {selectedStrategyLabel}.
           </p>
         </div>
         <button
