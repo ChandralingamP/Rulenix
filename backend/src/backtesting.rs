@@ -833,6 +833,14 @@ fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
     }
 }
 
+fn pnl_multiplier_per_lot(instrument: &str, lot_size: i32) -> f64 {
+    if instrument == SUPPORTED_INSTRUMENT {
+        1.0
+    } else {
+        lot_size.max(1) as f64
+    }
+}
+
 fn margin_per_lot(entry_price: f64, lot_size: i32, margin_requirement_percent: f64) -> f64 {
     entry_price * lot_size as f64 * margin_requirement_percent / 100.0
 }
@@ -1147,6 +1155,7 @@ fn simulate(
     sell_margin_per_lot: Option<f64>,
 ) -> (Vec<TradeResult>, Value) {
     let levels_by_date = build_daily_levels(daily);
+    let pnl_multiplier = pnl_multiplier_per_lot(SUPPORTED_INSTRUMENT, lot_size);
     let mut position: Option<Position> = None;
     let mut trades = Vec::new();
     let mut equity: f64 = 0.0;
@@ -1212,7 +1221,7 @@ fn simulate(
             lots,
             lot_size,
             remaining_lots: lots,
-            pnl_multiplier_per_lot: lot_size as f64,
+            pnl_multiplier_per_lot: pnl_multiplier,
             margin_per_lot,
             margin_used: margin_per_lot * lots as f64,
             realized_pnl: 0.0,
@@ -1293,7 +1302,8 @@ fn simulate(
         "profit_factor": (gross_loss.abs() > 0.0).then_some(gross_profit / gross_loss.abs()),
         "max_drawdown": max_drawdown,
         "lot_size": lot_size,
-        "pnl_multiplier_per_lot": lot_size,
+        "pnl_multiplier_per_lot": pnl_multiplier,
+        "pnl_model": "goldten_points_x_lots",
         "entry_frequency": "one_per_session",
         "margin_requirement_percent": margin_requirement_percent,
         "initial_margin_per_lot": initial_margin_per_lot,
@@ -2445,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_multiplies_gold_pnl_by_contract_lot_size() {
+    fn simulator_uses_gold_lots_for_pnl_not_contract_quantity() {
         let daily = vec![
             candle(1, 95.0, 100.0, 90.0, 96.0),
             candle(2, 96.0, 101.0, 91.0, 97.0),
@@ -2473,12 +2483,13 @@ mod tests {
             Some(13_218.0),
             Some(13_218.0),
         );
-        let expected = (levels.buy_target - levels.buy_entry) * 10.0;
+        let expected = levels.buy_target - levels.buy_entry;
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].exit_reason, "TARGET");
         assert_eq!(trades[0].quantity, 10);
         assert!((trades[0].realized_pnl - expected).abs() < 1e-9);
-        assert_eq!(summary["pnl_multiplier_per_lot"], 10);
+        assert_eq!(summary["pnl_multiplier_per_lot"], 1.0);
+        assert_eq!(summary["pnl_model"], "goldten_points_x_lots");
         assert_eq!(trades[0].levels["contract_lot_size"], 10);
         assert_eq!(trades[0].levels["partial_exit_quantity"], 10);
         assert_eq!(trades[0].levels["final_leg_quantity"], 0);
