@@ -2365,6 +2365,9 @@ pub fn start(state: AppState) {
             if let Err(error) = reconcile_live(&state).await {
                 tracing::warn!(%error,"strategy order reconciliation failed");
             }
+            if let Err(error) = recover_sl2_reversal_intents(&state).await {
+                tracing::warn!(%error, "SL2 reversal recovery failed");
+            }
         }
     });
 }
@@ -2797,9 +2800,29 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             by_tag.insert(tag.to_string(), item);
         }
     }
-    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity,processed_quantity,average_fill_price::float8 FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
+    let orders: Vec<StoredOrder>=sqlx::query_as("SELECT id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,margin_required,broker_order_id,client_order_id,status,filled_quantity,processed_quantity,average_fill_price::float8 FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling') ORDER BY CASE WHEN role IN ('TARGET','SL1','SL2') THEN 0 ELSE 1 END,created_at")
             .bind(user_id).fetch_all(&state.db).await?;
-    for order in orders {
+    for mut order in orders {
+        let current_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM strategy_orders WHERE id=$1")
+                .bind(order.id)
+                .fetch_optional(&state.db)
+                .await?;
+        let Some(current_status) = current_status else {
+            continue;
+        };
+        order.status = current_status;
+        if !matches!(
+            order.status.as_str(),
+            "submitting"
+                | "ambiguous"
+                | "submitted"
+                | "partially_filled"
+                | "processing"
+                | "cancelling"
+        ) {
+            continue;
+        }
         let item = if !order.broker_order_id.is_empty() {
             by_id.get(&order.broker_order_id)
         } else {
@@ -3140,6 +3163,52 @@ fn target_exit_lots(lots: i32) -> i32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sl2ReversalPlan {
+    direction: &'static str,
+    entry_role: &'static str,
+    entry_side: &'static str,
+    lots: i32,
+}
+
+fn sl2_reversal_plan(source_direction: &str, original_lots: i32) -> Option<Sl2ReversalPlan> {
+    let (direction, entry_role, entry_side) = match source_direction {
+        "BUY" => ("SELL", "SELL_ENTRY", "SELL"),
+        "SELL" => ("BUY", "BUY_ENTRY", "BUY"),
+        _ => return None,
+    };
+    (original_lots > 0).then_some(Sl2ReversalPlan {
+        direction,
+        entry_role,
+        entry_side,
+        lots: original_lots,
+    })
+}
+
+fn sl2_reversal_session(source_trade_id: Uuid) -> String {
+    format!("r-{}", &source_trade_id.simple().to_string()[..30])
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct Sl2ReversalIntent {
+    source_trade_id: Uuid,
+    user_id: Uuid,
+    snapshot_id: Uuid,
+    instrument: String,
+    source_direction: String,
+    reversal_direction: String,
+    lots: i32,
+    entry_price: f64,
+    order_session_key: String,
+}
+
+enum Sl2ReversalOutcome {
+    Waiting(String),
+    Submitted,
+    Completed,
+    Cancelled(String),
+}
+
 fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
     let movement = if direction == "BUY" {
         exit - entry
@@ -3204,6 +3273,485 @@ fn contract_log_label(instrument: &str, contract_symbol: Option<&str>) -> String
     } else {
         format!("{instrument} ({symbol})")
     }
+}
+
+async fn clear_entry_orders_for_sl2_reversal(
+    state: &AppState,
+    intent: &Sl2ReversalIntent,
+) -> AppResult<bool> {
+    let orders: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT o.id,o.broker_order_id,o.execution_mode,o.order_type,o.status
+         FROM strategy_orders o
+         JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+         WHERE o.user_id=$1
+           AND s.strategy_key=$2
+           AND s.instrument=$3
+           AND o.session_key<>$4
+           AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+           AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+         ORDER BY o.created_at",
+    )
+    .bind(intent.user_id)
+    .bind(STRATEGY_KEY)
+    .bind(&intent.instrument)
+    .bind(&intent.order_session_key)
+    .fetch_all(&state.db)
+    .await?;
+
+    for (id, broker_id, mode, order_type, status) in orders {
+        if mode == "demo" || (status == "pending" && broker_id.is_empty()) {
+            sqlx::query(
+                "UPDATE strategy_orders
+                 SET status='cancelled',
+                     broker_status='Cancelled before full-lot SL2 reversal',
+                     state_version=state_version+1,
+                     updated_at=NOW()
+                 WHERE id=$1 AND status IN ('pending','submitted','partially_filled')",
+            )
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+            continue;
+        }
+        if !matches!(status.as_str(), "submitted" | "partially_filled") {
+            continue;
+        }
+        if broker_id.is_empty() {
+            continue;
+        }
+        let credentials = state.credentials.load(intent.user_id).await?;
+        angel::cancel_order(
+            state,
+            &credentials.api_key,
+            &credentials.jwt_token,
+            &broker_id,
+            if order_type.starts_with("STOPLOSS") {
+                "STOPLOSS"
+            } else {
+                "NORMAL"
+            },
+        )
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        sqlx::query(
+            "UPDATE strategy_orders
+             SET status='cancelling',
+                 broker_status='SL2 reversal cancellation requested; awaiting broker reconciliation.',
+                 state_version=state_version+1,
+                 updated_at=NOW()
+             WHERE id=$1 AND status IN ('submitted','partially_filled')",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    }
+
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM strategy_orders o
+            JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+            WHERE o.user_id=$1
+              AND s.strategy_key=$2
+              AND s.instrument=$3
+              AND o.session_key<>$4
+              AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+              AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+        )",
+    )
+    .bind(intent.user_id)
+    .bind(STRATEGY_KEY)
+    .bind(&intent.instrument)
+    .bind(&intent.order_session_key)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(!active)
+}
+
+async fn attempt_claimed_sl2_reversal(
+    state: &AppState,
+    intent: &Sl2ReversalIntent,
+) -> AppResult<Sl2ReversalOutcome> {
+    let Some(plan) = sl2_reversal_plan(&intent.source_direction, intent.lots) else {
+        return Ok(Sl2ReversalOutcome::Cancelled(
+            "The source trade has no valid SL2 reversal direction or lot size.".into(),
+        ));
+    };
+    if plan.direction != intent.reversal_direction {
+        return Ok(Sl2ReversalOutcome::Cancelled(
+            "The stored SL2 reversal direction does not match the source trade.".into(),
+        ));
+    }
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM user_strategy_configs c
+            JOIN user_strategy_activations a
+              ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key
+            JOIN users u ON u.id=c.user_id
+            WHERE c.user_id=$1
+              AND c.strategy_key=$2
+              AND c.instrument=$3
+              AND c.enabled=TRUE
+              AND a.is_active=TRUE
+              AND u.is_active=TRUE
+        )",
+    )
+    .bind(intent.user_id)
+    .bind(STRATEGY_KEY)
+    .bind(&intent.instrument)
+    .fetch_one(&state.db)
+    .await?;
+    if !active {
+        return Ok(Sl2ReversalOutcome::Cancelled(
+            "The strategy or instrument was deactivated before the reversal could be submitted."
+                .into(),
+        ));
+    }
+    if !clear_entry_orders_for_sl2_reversal(state, intent).await? {
+        return Ok(Sl2ReversalOutcome::Waiting(
+            "Waiting for earlier breakout entry orders to finish cancelling at the broker.".into(),
+        ));
+    }
+
+    let open_trade: Option<(String, i32)> = sqlx::query_as(
+        "SELECT direction,total_lots
+         FROM trades
+         WHERE user_id=$1
+           AND strategy_key=$2
+           AND instrument_label=$3
+           AND status='open'
+         ORDER BY entry_datetime DESC
+         LIMIT 1",
+    )
+    .bind(intent.user_id)
+    .bind(STRATEGY_KEY)
+    .bind(&intent.instrument)
+    .fetch_optional(&state.db)
+    .await?;
+    let lots_to_place = match open_trade {
+        Some((direction, open_lots)) if direction == plan.direction => {
+            if open_lots >= plan.lots {
+                return Ok(Sl2ReversalOutcome::Completed);
+            }
+            plan.lots - open_lots.max(0)
+        }
+        Some((direction, _)) => {
+            return Ok(Sl2ReversalOutcome::Waiting(format!(
+                "A {direction} position is still open; the {} SL2 reversal is paused.",
+                plan.direction
+            )));
+        }
+        None => plan.lots,
+    };
+
+    let query = format!("{} WHERE id=$1", snapshot_select());
+    let snapshot: Snapshot = sqlx::query_as(&query)
+        .bind(intent.snapshot_id)
+        .fetch_one(&state.db)
+        .await?;
+    if snapshot.strategy_key != STRATEGY_KEY {
+        return Ok(Sl2ReversalOutcome::Cancelled(
+            "The reversal snapshot does not belong to Futures Breakout v3.".into(),
+        ));
+    }
+    let runner = runner_for(state, intent.user_id, &intent.instrument).await?;
+    place_strategy_order(
+        state,
+        &runner,
+        &snapshot,
+        &intent.order_session_key,
+        NewOrder {
+            role: plan.entry_role,
+            side: plan.entry_side,
+            order_type: "MARKET",
+            lots: lots_to_place,
+            price: intent.entry_price,
+            trigger: None,
+            trade_id: Some(intent.source_trade_id),
+            quantity: None,
+        },
+    )
+    .await?;
+
+    let order_status: Option<String> = sqlx::query_scalar(
+        "SELECT status
+         FROM strategy_orders
+         WHERE user_id=$1
+           AND snapshot_id=$2
+           AND session_key=$3
+           AND role=$4
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(intent.user_id)
+    .bind(intent.snapshot_id)
+    .bind(&intent.order_session_key)
+    .bind(plan.entry_role)
+    .fetch_optional(&state.db)
+    .await?;
+    match order_status.as_deref() {
+        Some("filled") => Ok(Sl2ReversalOutcome::Completed),
+        Some(
+            "pending" | "submitting" | "ambiguous" | "submitted" | "partially_filled"
+            | "processing",
+        ) => Ok(Sl2ReversalOutcome::Submitted),
+        Some("rejected" | "cancelled") => Ok(Sl2ReversalOutcome::Cancelled(
+            "The broker rejected or cancelled the SL2 reversal entry.".into(),
+        )),
+        Some("failed") => Err(AppError::BadRequest(
+            "The SL2 reversal entry failed before broker acknowledgement and will retry.".into(),
+        )),
+        Some(status) => Err(AppError::BadRequest(format!(
+            "The SL2 reversal entry reached an unexpected order state: {status}."
+        ))),
+        None => Err(AppError::BadRequest(
+            "The SL2 reversal entry was not reserved and will retry.".into(),
+        )),
+    }
+}
+
+async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) -> AppResult<()> {
+    let intent: Option<Sl2ReversalIntent> = sqlx::query_as(
+        "UPDATE strategy_reversal_intents
+         SET status='processing',
+             attempts=attempts+1,
+             updated_at=NOW()
+         WHERE source_trade_id=$1
+           AND status IN ('pending','waiting','failed')
+           AND next_attempt_at<=NOW()
+         RETURNING source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key",
+    )
+    .bind(source_trade_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+
+    let symbol: String = sqlx::query_scalar(
+        "SELECT COALESCE(contract_symbol,'')
+         FROM strategy_market_snapshots
+         WHERE id=$1",
+    )
+    .bind(intent.snapshot_id)
+    .fetch_one(&state.db)
+    .await?;
+    let contract_label = contract_log_label(&intent.instrument, Some(&symbol));
+    match attempt_claimed_sl2_reversal(state, &intent).await {
+        Ok(Sl2ReversalOutcome::Waiting(message)) => {
+            sqlx::query(
+                "UPDATE strategy_reversal_intents
+                 SET status='waiting',
+                     next_attempt_at=NOW()+INTERVAL '5 seconds',
+                     last_error=$2,
+                     updated_at=NOW()
+                 WHERE source_trade_id=$1 AND status='processing'",
+            )
+            .bind(intent.source_trade_id)
+            .bind(message)
+            .execute(&state.db)
+            .await?;
+            Ok(())
+        }
+        Ok(Sl2ReversalOutcome::Submitted) => {
+            let changed = sqlx::query(
+                "UPDATE strategy_reversal_intents
+                 SET status='submitted',last_error='',updated_at=NOW()
+                 WHERE source_trade_id=$1 AND status='processing'",
+            )
+            .bind(intent.source_trade_id)
+            .execute(&state.db)
+            .await?;
+            if changed.rows_affected() > 0 {
+                emit(
+                    state,
+                    Some(intent.user_id),
+                    &intent.instrument,
+                    "sl2_reversal_submitted",
+                    json!({
+                        "source_trade_id":intent.source_trade_id,
+                        "source_direction":&intent.source_direction,
+                        "reversal_direction":&intent.reversal_direction,
+                        "lots":intent.lots,
+                        "entry_price":intent.entry_price
+                    }),
+                )
+                .await;
+                append_user_log(
+                    state,
+                    intent.user_id,
+                    &format!(
+                        "STRATEGY SL2 REVERSAL SUBMITTED {} {} {} lots @ MARKET ({:.2} reference)",
+                        contract_label, intent.reversal_direction, intent.lots, intent.entry_price
+                    ),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        Ok(Sl2ReversalOutcome::Completed) => {
+            let changed = sqlx::query(
+                "UPDATE strategy_reversal_intents
+                 SET status='completed',last_error='',updated_at=NOW()
+                 WHERE source_trade_id=$1 AND status='processing'",
+            )
+            .bind(intent.source_trade_id)
+            .execute(&state.db)
+            .await?;
+            if changed.rows_affected() > 0 {
+                append_user_log(
+                    state,
+                    intent.user_id,
+                    &format!(
+                        "STRATEGY SL2 REVERSAL COMPLETED {} {} {} lots",
+                        contract_label, intent.reversal_direction, intent.lots
+                    ),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        Ok(Sl2ReversalOutcome::Cancelled(message)) => {
+            let changed = sqlx::query(
+                "UPDATE strategy_reversal_intents
+                 SET status='cancelled',last_error=$2,updated_at=NOW()
+                 WHERE source_trade_id=$1 AND status='processing'",
+            )
+            .bind(intent.source_trade_id)
+            .bind(&message)
+            .execute(&state.db)
+            .await?;
+            if changed.rows_affected() > 0 {
+                append_user_log(
+                    state,
+                    intent.user_id,
+                    &format!(
+                        "STRATEGY SL2 REVERSAL CANCELLED {}: {}",
+                        contract_label, message
+                    ),
+                )
+                .await;
+                operational_alert(
+                    state,
+                    Some(intent.user_id),
+                    &intent.instrument,
+                    "sl2_reversal_cancelled",
+                    "warning",
+                    &message,
+                )
+                .await;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let changed = sqlx::query(
+                "UPDATE strategy_reversal_intents
+                 SET status='failed',
+                     next_attempt_at=NOW()+INTERVAL '30 seconds',
+                     last_error=$2,
+                     updated_at=NOW()
+                 WHERE source_trade_id=$1 AND status='processing'",
+            )
+            .bind(intent.source_trade_id)
+            .bind(&message)
+            .execute(&state.db)
+            .await?;
+            if changed.rows_affected() > 0 {
+                operational_alert(
+                    state,
+                    Some(intent.user_id),
+                    &intent.instrument,
+                    "sl2_reversal_retry",
+                    "error",
+                    &format!("The full-lot SL2 reversal will retry automatically: {message}"),
+                )
+                .await;
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn recover_sl2_reversal_intents(state: &AppState) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE strategy_reversal_intents
+         SET status='pending',
+             next_attempt_at=NOW(),
+             last_error='Backend restarted while the reversal was being processed.',
+             updated_at=NOW()
+         WHERE status='processing' AND updated_at<NOW()-INTERVAL '30 seconds'",
+    )
+    .execute(&state.db)
+    .await?;
+    sqlx::query(
+        "UPDATE strategy_reversal_intents i
+         SET status='failed',
+             next_attempt_at=NOW(),
+             last_error='The reversal order failed before broker acknowledgement.',
+             updated_at=NOW()
+         WHERE i.status='submitted'
+           AND EXISTS(
+               SELECT 1
+               FROM strategy_orders o
+               WHERE o.user_id=i.user_id
+                 AND o.snapshot_id=i.snapshot_id
+                 AND o.session_key=i.order_session_key
+                 AND o.status='failed'
+                 AND o.broker_order_id=''
+           )",
+    )
+    .execute(&state.db)
+    .await?;
+    let terminal: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "UPDATE strategy_reversal_intents i
+         SET status='cancelled',
+             last_error='The broker rejected or cancelled the submitted SL2 reversal order.',
+             updated_at=NOW()
+         WHERE i.status='submitted'
+           AND EXISTS(
+               SELECT 1
+               FROM strategy_orders o
+               WHERE o.user_id=i.user_id
+                 AND o.snapshot_id=i.snapshot_id
+                 AND o.session_key=i.order_session_key
+                 AND o.status IN ('rejected','cancelled')
+           )
+         RETURNING i.source_trade_id,i.user_id,i.instrument",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (source_trade_id, user_id, instrument) in terminal {
+        operational_alert(
+            state,
+            Some(user_id),
+            &instrument,
+            "sl2_reversal_cancelled",
+            "error",
+            &format!(
+                "The broker rejected or cancelled the full-lot SL2 reversal for trade {source_trade_id}."
+            ),
+        )
+        .await;
+    }
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT source_trade_id
+         FROM strategy_reversal_intents
+         WHERE status IN ('pending','waiting','failed')
+           AND next_attempt_at<=NOW()
+         ORDER BY created_at
+         LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for source_trade_id in ids {
+        if let Err(error) = process_sl2_reversal_intent(state, source_trade_id).await {
+            tracing::warn!(%source_trade_id, %error, "SL2 reversal recovery failed");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn complete_order(
@@ -3420,6 +3968,12 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                         .execute(&mut *fill_tx).await?;
                     sqlx::query("UPDATE strategy_orders SET status='filled',trade_id=$2,processed_quantity=GREATEST(processed_quantity,$3),filled_quantity=GREATEST(filled_quantity,$3),updated_at=NOW() WHERE id=$1")
                         .bind(order.id).bind(existing.0).bind(cumulative_fill).execute(&mut *fill_tx).await?;
+                    if let Some(source_trade_id) = order.trade_id {
+                        sqlx::query("UPDATE strategy_reversal_intents SET status='completed',last_error='',updated_at=NOW() WHERE source_trade_id=$1")
+                            .bind(source_trade_id)
+                            .execute(&mut *fill_tx)
+                            .await?;
+                    }
                     fill_tx.commit().await?;
 
                     let runner = runner_for(state, order.user_id, &instrument).await?;
@@ -3493,6 +4047,12 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 .bind(trade_id).bind(order.user_id).bind(direction).bind(order.quantity).bind(fill).bind(&instrument).bind(snapshot.contract_symbol.as_deref().unwrap_or(""))
                 .bind(STRATEGY_KEY).bind(snapshot.id).bind(order.lots.max(1)).bind(target).bind(sl1).bind(sl2).bind(order.id).bind(order.margin_required).execute(&mut *fill_tx).await?;
             sqlx::query("UPDATE strategy_orders SET status='filled',trade_id=$2,processed_quantity=GREATEST(processed_quantity,$3),filled_quantity=GREATEST(filled_quantity,$3),updated_at=NOW() WHERE id=$1").bind(order.id).bind(trade_id).bind(cumulative_fill).execute(&mut *fill_tx).await?;
+            if let Some(source_trade_id) = order.trade_id {
+                sqlx::query("UPDATE strategy_reversal_intents SET status='completed',last_error='',updated_at=NOW() WHERE source_trade_id=$1")
+                    .bind(source_trade_id)
+                    .execute(&mut *fill_tx)
+                    .await?;
+            }
             fill_tx.commit().await?;
             let runner = runner_for(state, order.user_id, &instrument).await?;
             let close_lots = target_exit_lots(order.lots);
@@ -3612,7 +4172,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,f64,f64,f64,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,entry_price::float8,pnl::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64,f64,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
@@ -3620,17 +4180,25 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 let remaining_lots = (trade.2 - closed_lots).max(0);
                 let closing_pnl = trade_pnl(
                     &trade.0,
-                    trade.3,
+                    trade.4,
                     fill,
                     runtime_pnl_units(&instrument, closed_quantity, snapshot.lot_size),
                 );
-                let pnl = trade.4 + closing_pnl;
+                let pnl = trade.5 + closing_pnl;
                 let release_margin = if trade.1 > 0 {
-                    trade.5 * closed_quantity as f64 / trade.1 as f64
+                    trade.6 * closed_quantity as f64 / trade.1 as f64
                 } else {
                     0.0
                 };
-                let remaining_margin = (trade.5 - release_margin).max(0.0);
+                let remaining_margin = (trade.6 - release_margin).max(0.0);
+                let reversal = if order.role == "SL2"
+                    && remaining_quantity == 0
+                    && snapshot.strategy_key == STRATEGY_KEY
+                {
+                    sl2_reversal_plan(&trade.0, trade.3)
+                } else {
+                    None
+                };
                 let mut fill_tx = state.db.begin().await?;
                 if remaining_quantity == 0 {
                     sqlx::query("WITH changed AS (UPDATE trades SET status='closed',quantity=0,remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$4+$5)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).execute(&mut *fill_tx).await?;
@@ -3638,6 +4206,25 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     sqlx::query("WITH changed AS (UPDATE trades SET quantity=$2,remaining_lots=$3,last_price=($4::float8)::numeric,pnl=($5::float8)::numeric,margin_required=$8,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$6+$7)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(remaining_quantity).bind(remaining_lots).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status='filled',processed_quantity=GREATEST(processed_quantity,$2),filled_quantity=GREATEST(filled_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(cumulative_fill).execute(&mut *fill_tx).await?;
+                if let Some(plan) = reversal {
+                    sqlx::query(
+                        "INSERT INTO strategy_reversal_intents
+                         (source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                         ON CONFLICT (source_trade_id) DO NOTHING",
+                    )
+                    .bind(trade_id)
+                    .bind(order.user_id)
+                    .bind(snapshot.id)
+                    .bind(&instrument)
+                    .bind(&trade.0)
+                    .bind(plan.direction)
+                    .bind(plan.lots)
+                    .bind(fill)
+                    .bind(sl2_reversal_session(trade_id))
+                    .execute(&mut *fill_tx)
+                    .await?;
+                }
                 fill_tx.commit().await?;
                 emit(
                     state,
@@ -3653,12 +4240,43 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     &format!(
                         "STRATEGY {} FILLED {} @ {:.2} TOTAL P&L {:+.2}",
                         order.role,
-                        contract_log_label(&instrument, Some(&trade.6)),
+                        contract_log_label(&instrument, Some(&trade.7)),
                         fill,
                         pnl
                     ),
                 )
                 .await;
+                if let Some(plan) = reversal {
+                    emit(
+                        state,
+                        Some(order.user_id),
+                        &instrument,
+                        "sl2_reversal_queued",
+                        json!({
+                            "source_trade_id":trade_id,
+                            "source_direction":&trade.0,
+                            "reversal_direction":plan.direction,
+                            "lots":plan.lots,
+                            "entry_price":fill
+                        }),
+                    )
+                    .await;
+                    append_user_log(
+                        state,
+                        order.user_id,
+                        &format!(
+                            "STRATEGY SL2 REVERSAL QUEUED {} {} -> {} {} lots @ MARKET",
+                            contract_log_label(&instrument, Some(&trade.7)),
+                            trade.0,
+                            plan.direction,
+                            plan.lots
+                        ),
+                    )
+                    .await;
+                    if let Err(error) = process_sl2_reversal_intent(state, trade_id).await {
+                        tracing::warn!(%trade_id, %error, "immediate SL2 reversal submission failed");
+                    }
+                }
                 if remaining_quantity > 0 {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
                     let sl2 = if trade.0 == "BUY" {
@@ -3718,7 +4336,7 @@ async fn process_demo_tick(
 ) -> AppResult<()> {
     sqlx::query("UPDATE trades t SET last_price=($4::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.user_id=$1 AND t.execution_mode='demo' AND t.status='open' AND s.exchange_segment=$2 AND s.contract_token=$3")
         .bind(user_id).bind(exchange_segment).bind(token).bind(ltp).execute(&state.db).await?;
-    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.order_type,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity,o.processed_quantity,o.average_fill_price::float8 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.exchange_segment=$2 AND s.contract_token=$3 ORDER BY o.created_at")
+    let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.order_type,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity,o.processed_quantity,o.average_fill_price::float8 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.exchange_segment=$2 AND s.contract_token=$3 ORDER BY CASE WHEN o.role IN ('TARGET','SL1','SL2') THEN 0 ELSE 1 END,o.created_at")
         .bind(user_id).bind(exchange_segment).bind(token).fetch_all(&state.db).await?;
     for order in orders {
         let triggered = match (order.role.as_str(), order.side.as_str()) {
@@ -3731,7 +4349,15 @@ async fn process_demo_tick(
             _ => false,
         };
         if triggered {
-            complete_order(state, order, ltp).await?;
+            let still_submitted: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE id=$1 AND status='submitted')",
+            )
+            .bind(order.id)
+            .fetch_one(&state.db)
+            .await?;
+            if still_submitted {
+                complete_order(state, order, ltp).await?;
+            }
         }
     }
     Ok(())
@@ -4338,6 +4964,30 @@ mod tests {
         for (lots, closed) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
             assert_eq!(target_exit_lots(lots), closed);
         }
+    }
+
+    #[test]
+    fn sl2_reversal_uses_opposite_side_and_original_lots() {
+        let sell = sl2_reversal_plan("BUY", 2).unwrap();
+        assert_eq!(sell.direction, "SELL");
+        assert_eq!(sell.entry_role, "SELL_ENTRY");
+        assert_eq!(sell.entry_side, "SELL");
+        assert_eq!(sell.lots, 2);
+
+        let buy = sl2_reversal_plan("SELL", 4).unwrap();
+        assert_eq!(buy.direction, "BUY");
+        assert_eq!(buy.entry_role, "BUY_ENTRY");
+        assert_eq!(buy.entry_side, "BUY");
+        assert_eq!(buy.lots, 4);
+        assert!(sl2_reversal_plan("BUY", 0).is_none());
+    }
+
+    #[test]
+    fn sl2_reversal_session_is_stable_and_fits_order_storage() {
+        let trade_id = Uuid::parse_str("630e1867-1bb3-4f77-a753-d663f5efc1fe").unwrap();
+        let session = sl2_reversal_session(trade_id);
+        assert_eq!(session, sl2_reversal_session(trade_id));
+        assert_eq!(session.len(), 32);
     }
 
     #[test]

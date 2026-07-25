@@ -95,4 +95,65 @@ describe("BacktestingPage", () => {
       expect(link).toHaveAttribute("download");
     }
   });
+
+  it("shows SL2 reversal entries and each GOLD exit event", async () => {
+    apiClient.get.mockResolvedValue({ data: { runs: [] } });
+    apiClient.post.mockResolvedValue({
+      data: {
+        run: {
+          id: "b89eecb2-dc5a-42cf-bc3a-a447db0f728a",
+          trading_symbol: "GOLDTEN30JUL26FUT",
+          from_time: "2026-07-01T00:00:00Z",
+          summary: { strategy_name: "Futures Breakout v3", trades: 1, net_pnl: 250 },
+        },
+        trades: [
+          {
+            id: "08a59b80-a384-4d55-8adb-a352dad70b08",
+            direction: "SELL",
+            entry_time: "2026-07-10T05:00:00Z",
+            entry_price: 100,
+            exit_time: "2026-07-11T05:00:00Z",
+            exit_price: 98,
+            lots: 2,
+            quantity: 20,
+            realized_pnl: 250,
+            exit_reason: "SL2",
+            levels: {
+              entry_reason: "SL2_REVERSAL",
+              exit_events: [
+                {
+                  event: "TP1",
+                  at: "2026-07-10T06:00:00Z",
+                  price: 96,
+                  lots: 1,
+                  realized_pnl: 200,
+                  remaining_lots: 1,
+                  position_closed: false,
+                },
+                {
+                  event: "SL2",
+                  at: "2026-07-11T05:00:00Z",
+                  price: 98,
+                  lots: 1,
+                  realized_pnl: 50,
+                  remaining_lots: 0,
+                  position_closed: true,
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    const user = userEvent.setup();
+    render(<BacktestingPage />);
+
+    await user.click(screen.getByRole("button", { name: "Run backtest" }));
+
+    expect(await screen.findByText("SL2 reversal")).toBeInTheDocument();
+    expect(screen.getByText(/TP1 1 lot @ 96/)).toBeInTheDocument();
+    expect(screen.getByText(/1 lot remains/)).toBeInTheDocument();
+    expect(screen.getByText(/SL2 1 lot @ 98/)).toBeInTheDocument();
+    expect(screen.getByText(/position closed/)).toBeInTheDocument();
+  });
 });

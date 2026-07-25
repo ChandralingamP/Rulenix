@@ -47,6 +47,22 @@ function tradeSymbolLabel(trade, fallback) {
   );
 }
 
+function tradeEntryReason(trade, strategyKey) {
+  const reason = trade?.levels?.entry_reason;
+  if (reason === "SL2_REVERSAL") return "SL2 reversal";
+  return strategyKey === "option_entry_v1" ? "Option signal" : "Breakout";
+}
+
+function tradeExitEvents(trade) {
+  const events = trade?.levels?.exit_events;
+  return Array.isArray(events) ? events : [];
+}
+
+function formatLots(value) {
+  const lots = Number(value || 0);
+  return `${number.format(lots)} ${lots === 1 ? "lot" : "lots"}`;
+}
+
 function Metric({ label, value, tone = "slate" }) {
   const tones = {
     slate: "text-white",
@@ -420,7 +436,7 @@ export default function BacktestingPage() {
                 <h2 className="text-lg font-semibold text-white">Latest trades</h2>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[900px] text-left text-sm">
+                <table className="w-full min-w-[1220px] text-left text-sm">
                   <thead className="bg-slate-900/80 text-xs uppercase tracking-wide text-slate-500">
                     <tr>
                       <th className="px-4 py-3">Side</th>
@@ -429,44 +445,81 @@ export default function BacktestingPage() {
                       <th className="px-4 py-3">Exit</th>
                       <th className="px-4 py-3 text-right">Lots / quantity</th>
                       <th className="px-4 py-3">Reason</th>
+                      <th className="px-4 py-3">Exit audit</th>
                       <th className="px-4 py-3 text-right">P&L</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800">
-                    {recentTrades.map((trade) => (
-                      <tr key={trade.id}>
-                        <td className="px-4 py-3 font-semibold text-white">
-                          {trade.direction}
-                        </td>
-                        <td className="max-w-[240px] truncate px-4 py-3 text-slate-300">
-                          {tradeSymbolLabel(trade, latestRun?.trading_symbol)}
-                        </td>
-                        <td className="px-4 py-3 text-slate-300">
-                          {formatDateTime(trade.entry_time)} @{" "}
-                          {number.format(Number(trade.entry_price))}
-                        </td>
-                        <td className="px-4 py-3 text-slate-300">
-                          {formatDateTime(trade.exit_time)} @{" "}
-                          {number.format(Number(trade.exit_price))}
-                        </td>
-                        <td className="px-4 py-3 text-right text-slate-300">
-                          {number.format(Number(trade.lots || 0))} /{" "}
-                          {number.format(Number(trade.quantity || 0))}
-                        </td>
-                        <td className="px-4 py-3 text-slate-300">
-                          {trade.exit_reason}
-                        </td>
-                        <td
-                          className={`px-4 py-3 text-right font-semibold ${
-                            Number(trade.realized_pnl) >= 0
-                              ? "text-emerald-300"
-                              : "text-rose-300"
-                          }`}
-                        >
-                          {currency.format(Number(trade.realized_pnl || 0))}
-                        </td>
-                      </tr>
-                    ))}
+                    {recentTrades.map((trade) => {
+                      const exitEvents = tradeExitEvents(trade);
+                      return (
+                        <tr key={trade.id}>
+                          <td className="px-4 py-3 align-top">
+                            <p className="font-semibold text-white">{trade.direction}</p>
+                            <p className="mt-1 text-xs text-sky-300">
+                              {tradeEntryReason(trade, latestRun?.strategy_key)}
+                            </p>
+                          </td>
+                          <td className="max-w-[240px] truncate px-4 py-3 align-top text-slate-300">
+                            {tradeSymbolLabel(trade, latestRun?.trading_symbol)}
+                          </td>
+                          <td className="px-4 py-3 align-top text-slate-300">
+                            {formatDateTime(trade.entry_time)} @{" "}
+                            {number.format(Number(trade.entry_price))}
+                          </td>
+                          <td className="px-4 py-3 align-top text-slate-300">
+                            {formatDateTime(trade.exit_time)} @{" "}
+                            {number.format(Number(trade.exit_price))}
+                          </td>
+                          <td className="px-4 py-3 text-right align-top text-slate-300">
+                            {number.format(Number(trade.lots || 0))} /{" "}
+                            {number.format(Number(trade.quantity || 0))}
+                          </td>
+                          <td className="px-4 py-3 align-top text-slate-300">
+                            {trade.exit_reason}
+                          </td>
+                          <td className="max-w-[360px] px-4 py-3 align-top">
+                            {exitEvents.length ? (
+                              <div className="space-y-2">
+                                {exitEvents.map((event, index) => (
+                                  <div key={`${trade.id}-${event.event}-${index}`}>
+                                    <p className="font-semibold text-white">
+                                      {event.event} {formatLots(event.lots)} @{" "}
+                                      {number.format(Number(event.price || 0))}
+                                    </p>
+                                    <p className="mt-0.5 text-xs leading-5 text-slate-400">
+                                      {formatDateTime(event.at)} |{" "}
+                                      {currency.format(Number(event.realized_pnl || 0))} |{" "}
+                                      {event.position_closed
+                                        ? "position closed"
+                                        : `${formatLots(event.remaining_lots)} ${
+                                            Number(event.remaining_lots) === 1
+                                              ? "remains"
+                                              : "remain"
+                                          }`}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-slate-400">
+                                {trade.exit_reason} @{" "}
+                                {number.format(Number(trade.exit_price || 0))} | position closed
+                              </p>
+                            )}
+                          </td>
+                          <td
+                            className={`px-4 py-3 text-right align-top font-semibold ${
+                              Number(trade.realized_pnl) >= 0
+                                ? "text-emerald-300"
+                                : "text-rose-300"
+                            }`}
+                          >
+                            {currency.format(Number(trade.realized_pnl || 0))}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

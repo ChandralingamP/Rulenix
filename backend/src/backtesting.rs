@@ -140,12 +140,28 @@ struct TradeResult {
     levels: Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ExitEvent {
+    event: String,
+    at: DateTime<Utc>,
+    price: f64,
+    lots: i32,
+    quantity: i32,
+    realized_pnl: f64,
+    remaining_lots: i32,
+    remaining_quantity: i32,
+    position_closed: bool,
+}
+
 #[derive(Debug)]
 struct Position {
+    id: Uuid,
     trade_date: NaiveDate,
     direction: String,
     entry_time: DateTime<Utc>,
     entry_price: f64,
+    entry_reason: String,
+    reversal_of_trade_id: Option<Uuid>,
     lots: i32,
     lot_size: i32,
     remaining_lots: i32,
@@ -155,6 +171,7 @@ struct Position {
     realized_pnl: f64,
     target_done: bool,
     levels: Levels,
+    exit_events: Vec<ExitEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1099,8 +1116,49 @@ fn target_exit_lots(lots: i32) -> i32 {
     }
 }
 
+fn opposite_direction(direction: &str) -> Option<&'static str> {
+    match direction {
+        "BUY" => Some("SELL"),
+        "SELL" => Some("BUY"),
+        _ => None,
+    }
+}
+
+fn open_position(
+    candle: &Candle,
+    direction: &str,
+    entry_price: f64,
+    entry_reason: &str,
+    reversal_of_trade_id: Option<Uuid>,
+    lots: i32,
+    lot_size: i32,
+    pnl_multiplier_per_lot: f64,
+    margin_per_lot: f64,
+    levels: Levels,
+) -> Position {
+    Position {
+        id: Uuid::new_v4(),
+        trade_date: candle_date(candle.candle_time),
+        direction: direction.into(),
+        entry_time: candle.candle_time,
+        entry_price,
+        entry_reason: entry_reason.into(),
+        reversal_of_trade_id,
+        lots,
+        lot_size,
+        remaining_lots: lots,
+        pnl_multiplier_per_lot,
+        margin_per_lot,
+        margin_used: margin_per_lot * lots as f64,
+        realized_pnl: 0.0,
+        target_done: false,
+        levels,
+        exit_events: Vec::new(),
+    }
+}
+
 fn close_position(
-    position: Position,
+    mut position: Position,
     candle: &Candle,
     exit_price: f64,
     reason: &str,
@@ -1113,9 +1171,28 @@ fn close_position(
         pnl_units,
     );
     let pnl = position.realized_pnl + final_leg_pnl;
+    if position.remaining_lots > 0 {
+        position.exit_events.push(ExitEvent {
+            event: reason.into(),
+            at: candle.candle_time,
+            price: exit_price,
+            lots: position.remaining_lots,
+            quantity: position.remaining_lots.saturating_mul(position.lot_size),
+            realized_pnl: final_leg_pnl,
+            remaining_lots: 0,
+            remaining_quantity: 0,
+            position_closed: true,
+        });
+    }
     let quantity = position.lots.saturating_mul(position.lot_size);
     let mut audit_levels = levels_json(position.levels);
     if let Some(levels) = audit_levels.as_object_mut() {
+        levels.insert("entry_reason".into(), json!(position.entry_reason));
+        levels.insert(
+            "reversal_of_trade_id".into(),
+            json!(position.reversal_of_trade_id),
+        );
+        levels.insert("exit_events".into(), json!(position.exit_events));
         levels.insert("contract_lot_size".into(), json!(position.lot_size));
         levels.insert("configured_lots".into(), json!(position.lots));
         levels.insert("quantity".into(), json!(quantity));
@@ -1142,7 +1219,7 @@ fn close_position(
         levels.insert("calculated_pnl".into(), json!(pnl));
     }
     TradeResult {
-        id: Uuid::new_v4(),
+        id: position.id,
         trade_date: position.trade_date,
         direction: position.direction,
         entry_time: position.entry_time,
@@ -1223,14 +1300,26 @@ fn process_exit(
         } else {
             current.levels.sell_target
         };
-        current.realized_pnl += trade_pnl(
+        let target_pnl = trade_pnl(
             &current.direction,
             current.entry_price,
             price,
             close_lots as f64 * current.pnl_multiplier_per_lot,
         );
+        current.realized_pnl += target_pnl;
         current.remaining_lots -= close_lots;
         current.target_done = true;
+        current.exit_events.push(ExitEvent {
+            event: "TP1".into(),
+            at: candle.candle_time,
+            price,
+            lots: close_lots,
+            quantity: close_lots.saturating_mul(current.lot_size),
+            realized_pnl: target_pnl,
+            remaining_lots: current.remaining_lots,
+            remaining_quantity: current.remaining_lots.saturating_mul(current.lot_size),
+            position_closed: current.remaining_lots <= 0,
+        });
         if current.remaining_lots <= 0 {
             return Some(close_position(current, candle, price, "TARGET"));
         }
@@ -1258,11 +1347,45 @@ fn simulate(
     let mut entered_sessions: HashSet<(NaiveDate, &'static str)> = HashSet::new();
 
     for candle in intraday {
+        let closing_levels = position.as_ref().map(|current| current.levels);
         if let Some(trade) = process_exit(&mut position, candle, &levels_by_date) {
+            let reversal = if trade.exit_reason == "SL2" {
+                let reversal_direction = opposite_direction(&trade.direction);
+                let levels = levels_by_date
+                    .get(&candle_date(candle.candle_time))
+                    .copied()
+                    .or(closing_levels);
+                reversal_direction.zip(levels).map(|(direction, levels)| {
+                    let margin_per_lot = if direction == "BUY" {
+                        buy_margin_per_lot
+                    } else {
+                        sell_margin_per_lot
+                    }
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .unwrap_or_else(|| {
+                        margin_per_lot(trade.exit_price, lot_size, margin_requirement_percent)
+                    });
+                    open_position(
+                        candle,
+                        direction,
+                        trade.exit_price,
+                        "SL2_REVERSAL",
+                        Some(trade.id),
+                        trade.lots,
+                        lot_size,
+                        pnl_multiplier,
+                        margin_per_lot,
+                        levels,
+                    )
+                })
+            } else {
+                None
+            };
             equity += trade.realized_pnl;
             peak = f64::max(peak, equity);
             max_drawdown = f64::max(max_drawdown, peak - equity);
             trades.push(trade);
+            position = reversal;
             continue;
         }
         if position.is_some() {
@@ -1307,21 +1430,18 @@ fn simulate(
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or_else(|| margin_per_lot(entry_price, lot_size, margin_requirement_percent));
         entered_sessions.insert(session_key);
-        position = Some(Position {
-            trade_date: date,
-            direction: direction.into(),
-            entry_time: candle.candle_time,
+        position = Some(open_position(
+            candle,
+            direction,
             entry_price,
+            "BREAKOUT",
+            None,
             lots,
             lot_size,
-            remaining_lots: lots,
-            pnl_multiplier_per_lot: pnl_multiplier,
+            pnl_multiplier,
             margin_per_lot,
-            margin_used: margin_per_lot * lots as f64,
-            realized_pnl: 0.0,
-            target_done: false,
             levels,
-        });
+        ));
     }
 
     if let (Some(open), Some(last)) = (position, intraday.last()) {
@@ -1397,9 +1517,14 @@ fn simulate(
         "max_drawdown": max_drawdown,
         "lot_size": lot_size,
         "target_exit_lots": target_exit_lots(lots),
+        "sl2_reversal_lots": lots,
+        "sl2_reversal_rule": "opposite_direction_full_original_lots",
+        "sl2_reversals": trades.iter().filter(|trade| {
+            trade.levels.get("entry_reason").and_then(Value::as_str) == Some("SL2_REVERSAL")
+        }).count(),
         "pnl_multiplier_per_lot": pnl_multiplier,
         "pnl_model": "goldten_points_x_lots",
-        "entry_frequency": "one_per_session",
+        "entry_frequency": "one_breakout_per_session_plus_sl2_reversals",
         "margin_requirement_percent": margin_requirement_percent,
         "initial_margin_per_lot": initial_margin_per_lot,
         "initial_margin": initial_margin,
@@ -2227,6 +2352,40 @@ pub async fn history(
     Ok(Json(json!({"runs":runs,"availability":availability})))
 }
 
+fn exit_events_text(levels: &Value) -> String {
+    levels
+        .get("exit_events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|event| {
+            let label = event
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("EXIT");
+            let at = event.get("at").and_then(Value::as_str).unwrap_or("-");
+            let price = event.get("price").and_then(Value::as_f64).unwrap_or(0.0);
+            let lots = event.get("lots").and_then(Value::as_i64).unwrap_or(0);
+            let quantity = event
+                .get("quantity")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let pnl = event
+                .get("realized_pnl")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let remaining = event
+                .get("remaining_lots")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            format!(
+                "{label} @ {price:.2} on {at}: {lots} lots / {quantity} qty, P&L {pnl:+.2}, {remaining} lots remain"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 pub async fn export(
     State(state): State<AppState>,
     axum::extract::Extension(user): axum::extract::Extension<AuthUser>,
@@ -2350,6 +2509,8 @@ pub async fn export(
         "Costs",
         "Realized P&L",
         "Exit reason",
+        "Entry reason",
+        "Exit events",
         "Calculation check",
     ];
     for (column, heading) in headings.iter().enumerate() {
@@ -2404,6 +2565,12 @@ pub async fn export(
             .get("costs")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let entry_reason = trade
+            .levels
+            .get("entry_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("SIGNAL");
+        let exit_events = exit_events_text(&trade.levels);
         let calculation = if run.strategy_key == STRATEGY_KEY {
             format!(
                 "{partial_pnl:.4} + {final_leg_pnl:.4} = {:.4}",
@@ -2476,10 +2643,16 @@ pub async fn export(
             .write_string(row, 20, &trade.exit_reason)
             .map_err(|error| AppError::Internal(error.into()))?;
         sheet
-            .write_string(row, 21, calculation)
+            .write_string(row, 21, entry_reason)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 22, exit_events)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        sheet
+            .write_string(row, 23, calculation)
             .map_err(|error| AppError::Internal(error.into()))?;
     }
-    for (column, width) in [(3, 24), (5, 24), (20, 18), (21, 34)] {
+    for (column, width) in [(3, 24), (5, 24), (20, 18), (21, 22), (22, 72), (23, 34)] {
         sheet
             .set_column_width(column, width)
             .map_err(|error| AppError::Internal(error.into()))?;
@@ -2544,6 +2717,13 @@ mod tests {
         for (lots, closed) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
             assert_eq!(target_exit_lots(lots), closed);
         }
+    }
+
+    #[test]
+    fn sl2_reversal_direction_is_always_opposite() {
+        assert_eq!(opposite_direction("BUY"), Some("SELL"));
+        assert_eq!(opposite_direction("SELL"), Some("BUY"));
+        assert_eq!(opposite_direction(""), None);
     }
 
     fn sensex_option(token: &str, expiry: &str, strike: i32, option_type: &str) -> MasterContract {
@@ -2721,9 +2901,25 @@ mod tests {
             ),
         ];
         let (trades, summary) = simulate(&intraday, &daily, 1, 3, 10.0, Some(12.0), Some(12.0));
-        assert_eq!(trades.len(), 1);
+        assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].exit_reason, "SL2");
-        assert_eq!(summary["trades"], 1);
+        assert_eq!(trades[0].levels["exit_events"][0]["event"], "TP1");
+        assert_eq!(trades[0].levels["exit_events"][0]["lots"], 2);
+        assert_eq!(trades[0].levels["exit_events"][0]["remaining_lots"], 1);
+        assert_eq!(trades[0].levels["exit_events"][1]["event"], "SL2");
+        assert_eq!(trades[0].levels["exit_events"][1]["lots"], 1);
+        assert_eq!(trades[0].levels["exit_events"][1]["position_closed"], true);
+        assert_eq!(trades[1].direction, "SELL");
+        assert_eq!(trades[1].lots, 3);
+        assert_eq!(trades[1].entry_price, trades[0].exit_price);
+        assert_eq!(trades[1].levels["entry_reason"], "SL2_REVERSAL");
+        assert_eq!(
+            trades[1].levels["reversal_of_trade_id"],
+            trades[0].id.to_string()
+        );
+        assert_eq!(summary["trades"], 2);
+        assert_eq!(summary["sl2_reversals"], 1);
+        assert_eq!(summary["sl2_reversal_lots"], 3);
         assert_eq!(summary["initial_margin_per_lot"], 12.0);
     }
 
@@ -2767,7 +2963,7 @@ mod tests {
 
         let (trades, summary) = simulate(&intraday, &daily, 10, 2, 10.0, Some(12.0), Some(12.0));
 
-        assert_eq!(trades.len(), 1);
+        assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].exit_reason, "SL2");
         assert_eq!(trades[0].levels["partial_exit_lots"], 1);
         assert_eq!(trades[0].levels["final_leg_lots"], 1);
@@ -2777,6 +2973,11 @@ mod tests {
         let expected =
             (entry_day.buy_target - entry_day.buy_entry) + (next_day.buy_sl2 - entry_day.buy_entry);
         assert!((trades[0].realized_pnl - expected).abs() < 1e-9);
+        assert_eq!(trades[1].direction, "SELL");
+        assert_eq!(trades[1].lots, 2);
+        assert_eq!(trades[1].quantity, 20);
+        assert!((trades[1].entry_price - next_day.buy_sl2).abs() < 1e-9);
+        assert_eq!(trades[1].levels["entry_reason"], "SL2_REVERSAL");
         assert_eq!(summary["target_exit_lots"], 1);
     }
 
@@ -2867,6 +3068,9 @@ mod tests {
             Some(13_218.0),
         );
         assert_eq!(trades.len(), 1);
-        assert_eq!(summary["entry_frequency"], "one_per_session");
+        assert_eq!(
+            summary["entry_frequency"],
+            "one_breakout_per_session_plus_sl2_reversals"
+        );
     }
 }
