@@ -1091,6 +1091,14 @@ fn build_daily_levels(daily: &[Candle]) -> std::collections::HashMap<NaiveDate, 
     levels
 }
 
+fn target_exit_lots(lots: i32) -> i32 {
+    if lots <= 1 {
+        lots.max(0)
+    } else {
+        (lots + 1) / 2
+    }
+}
+
 fn close_position(
     position: Position,
     candle: &Candle,
@@ -1151,8 +1159,27 @@ fn close_position(
     }
 }
 
-fn process_exit(position: &mut Option<Position>, candle: &Candle) -> Option<TradeResult> {
+fn refresh_position_levels(
+    position: &mut Position,
+    levels_by_date: &HashMap<NaiveDate, Levels>,
+    date: NaiveDate,
+) {
+    if let Some(levels) = levels_by_date.get(&date).copied() {
+        position.levels = levels;
+    }
+}
+
+fn process_exit(
+    position: &mut Option<Position>,
+    candle: &Candle,
+    levels_by_date: &HashMap<NaiveDate, Levels>,
+) -> Option<TradeResult> {
     let mut current = position.take()?;
+    refresh_position_levels(
+        &mut current,
+        levels_by_date,
+        candle_date(candle.candle_time),
+    );
     let (target, stop) = if current.direction == "BUY" {
         (
             candle.high_price >= current.levels.buy_target,
@@ -1190,7 +1217,7 @@ fn process_exit(position: &mut Option<Position>, candle: &Candle) -> Option<Trad
         return Some(close_position(current, candle, price, reason));
     }
     if target && !current.target_done {
-        let close_lots = (current.lots / 2 + 1).min(current.remaining_lots);
+        let close_lots = target_exit_lots(current.lots).min(current.remaining_lots);
         let price = if current.direction == "BUY" {
             current.levels.buy_target
         } else {
@@ -1231,7 +1258,7 @@ fn simulate(
     let mut entered_sessions: HashSet<(NaiveDate, &'static str)> = HashSet::new();
 
     for candle in intraday {
-        if let Some(trade) = process_exit(&mut position, candle) {
+        if let Some(trade) = process_exit(&mut position, candle, &levels_by_date) {
             equity += trade.realized_pnl;
             peak = f64::max(peak, equity);
             max_drawdown = f64::max(max_drawdown, peak - equity);
@@ -1369,6 +1396,7 @@ fn simulate(
         "profit_factor": (gross_loss.abs() > 0.0).then_some(gross_profit / gross_loss.abs()),
         "max_drawdown": max_drawdown,
         "lot_size": lot_size,
+        "target_exit_lots": target_exit_lots(lots),
         "pnl_multiplier_per_lot": pnl_multiplier,
         "pnl_model": "goldten_points_x_lots",
         "entry_frequency": "one_per_session",
@@ -2511,6 +2539,13 @@ mod tests {
         assert!((v.sell_entry - 89.892).abs() < 1e-9);
     }
 
+    #[test]
+    fn gold_target_lot_split_matches_live_strategy() {
+        for (lots, closed) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
+            assert_eq!(target_exit_lots(lots), closed);
+        }
+    }
+
     fn sensex_option(token: &str, expiry: &str, strike: i32, option_type: &str) -> MasterContract {
         MasterContract {
             token: token.into(),
@@ -2690,6 +2725,59 @@ mod tests {
         assert_eq!(trades[0].exit_reason, "SL2");
         assert_eq!(summary["trades"], 1);
         assert_eq!(summary["initial_margin_per_lot"], 12.0);
+    }
+
+    #[test]
+    fn simulator_closes_partial_target_and_refreshes_next_day_stop() {
+        let daily = vec![
+            candle(1, 95.0, 100.0, 90.0, 96.0),
+            candle(2, 96.0, 101.0, 91.0, 97.0),
+            candle(3, 97.0, 102.0, 92.0, 98.0),
+            candle(4, 98.0, 103.0, 93.0, 99.0),
+            candle(5, 99.0, 120.0, 94.0, 100.0),
+            candle(6, 100.0, 121.0, 95.0, 101.0),
+        ];
+        let entry_day =
+            calculate(&[100.0, 101.0, 102.0, 103.0], &[90.0, 91.0, 92.0, 93.0]).unwrap();
+        let next_day = calculate(&[101.0, 102.0, 103.0, 120.0], &[91.0, 92.0, 93.0, 94.0]).unwrap();
+        assert!(next_day.buy_sl2 > entry_day.buy_sl2);
+        let intraday = vec![
+            candle(
+                5,
+                entry_day.buy_entry,
+                entry_day.buy_entry + 0.1,
+                entry_day.buy_entry - 1.0,
+                entry_day.buy_entry,
+            ),
+            candle(
+                5,
+                entry_day.buy_entry,
+                entry_day.buy_target + 0.1,
+                entry_day.buy_entry,
+                entry_day.buy_target,
+            ),
+            candle(
+                6,
+                next_day.buy_sl2 + 0.5,
+                next_day.buy_sl2 + 0.5,
+                next_day.buy_sl2 - 0.1,
+                next_day.buy_sl2,
+            ),
+        ];
+
+        let (trades, summary) = simulate(&intraday, &daily, 10, 2, 10.0, Some(12.0), Some(12.0));
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].exit_reason, "SL2");
+        assert_eq!(trades[0].levels["partial_exit_lots"], 1);
+        assert_eq!(trades[0].levels["final_leg_lots"], 1);
+        assert_eq!(trades[0].levels["partial_exit_quantity"], 10);
+        assert_eq!(trades[0].levels["final_leg_quantity"], 10);
+        assert!((trades[0].exit_price - next_day.buy_sl2).abs() < 1e-9);
+        let expected =
+            (entry_day.buy_target - entry_day.buy_entry) + (next_day.buy_sl2 - entry_day.buy_entry);
+        assert!((trades[0].realized_pnl - expected).abs() < 1e-9);
+        assert_eq!(summary["target_exit_lots"], 1);
     }
 
     #[test]
