@@ -34,6 +34,19 @@ function formatDateTime(value) {
   });
 }
 
+function tradeSymbolLabel(trade, fallback) {
+  const levels =
+    trade?.levels && typeof trade.levels === "object" ? trade.levels : {};
+  return (
+    levels.selected_contract_symbol ||
+    levels.contract_symbol ||
+    trade?.contract_symbol ||
+    trade?.trading_symbol ||
+    fallback ||
+    "-"
+  );
+}
+
 function Metric({ label, value, tone = "slate" }) {
   const tones = {
     slate: "text-white",
@@ -407,10 +420,11 @@ export default function BacktestingPage() {
                 <h2 className="text-lg font-semibold text-white">Latest trades</h2>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[760px] text-left text-sm">
+                <table className="w-full min-w-[900px] text-left text-sm">
                   <thead className="bg-slate-900/80 text-xs uppercase tracking-wide text-slate-500">
                     <tr>
                       <th className="px-4 py-3">Side</th>
+                      <th className="px-4 py-3">Symbol</th>
                       <th className="px-4 py-3">Entry</th>
                       <th className="px-4 py-3">Exit</th>
                       <th className="px-4 py-3 text-right">Lots / quantity</th>
@@ -423,6 +437,9 @@ export default function BacktestingPage() {
                       <tr key={trade.id}>
                         <td className="px-4 py-3 font-semibold text-white">
                           {trade.direction}
+                        </td>
+                        <td className="max-w-[240px] truncate px-4 py-3 text-slate-300">
+                          {tradeSymbolLabel(trade, latestRun?.trading_symbol)}
                         </td>
                         <td className="px-4 py-3 text-slate-300">
                           {formatDateTime(trade.entry_time)} @{" "}

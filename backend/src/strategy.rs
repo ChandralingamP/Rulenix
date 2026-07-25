@@ -1317,9 +1317,13 @@ pub(crate) async fn place_strategy_order(
                 &message,
             )
             .await;
+            let contract_label = contract_log_label(&runner.instrument, Some(symbol));
             crate::logs::append(
                 &runner.username,
-                &format!("RISK REJECTED {} {}: {}", order.role, order.side, message),
+                &format!(
+                    "RISK REJECTED {} {} {}: {}",
+                    order.role, order.side, contract_label, message
+                ),
             )
             .await;
             return Err(error);
@@ -1452,11 +1456,12 @@ pub(crate) async fn place_strategy_order(
             sqlx::query("INSERT INTO broker_order_events(order_id,user_id,from_state,to_state,event_type,broker_order_id) VALUES($1,$2,$3,'submitted','submission_acknowledged',$4)")
                 .bind(id).bind(runner.user_id).bind(if runner.trading_mode=="live"{"submitting"}else{"pending"}).bind(&broker_id).execute(&state.db).await?;
             emit_for(state, &snapshot.strategy_key, Some(runner.user_id), &runner.instrument, "order_submitted", json!({"order_id":id,"broker_order_id":broker_id,"role":order.role,"side":order.side,"order_type":order.order_type,"price":order.price,"trigger_price":order.trigger,"lots":order.lots,"mode":runner.trading_mode})).await;
+            let contract_label = contract_log_label(&runner.instrument, Some(symbol));
             crate::logs::append(
                 &runner.username,
                 &format!(
-                    "STRATEGY {} {} {} lots @ {:.2}",
-                    order.role, order.side, order.lots, order.price
+                    "STRATEGY {} {} {} {} lots @ {:.2}",
+                    order.role, order.side, contract_label, order.lots, order.price
                 ),
             )
             .await;
@@ -3192,6 +3197,15 @@ async fn append_user_log(state: &AppState, user_id: Uuid, message: &str) {
     }
 }
 
+fn contract_log_label(instrument: &str, contract_symbol: Option<&str>) -> String {
+    let symbol = contract_symbol.unwrap_or("").trim();
+    if symbol.is_empty() || symbol.eq_ignore_ascii_case(instrument) {
+        instrument.to_string()
+    } else {
+        format!("{instrument} ({symbol})")
+    }
+}
+
 pub(crate) async fn complete_order(
     state: &AppState,
     order: StoredOrder,
@@ -3326,6 +3340,23 @@ async fn complete_option_entry_order(
         json!({"trade_id":trade_id,"side":order.side,"fill_price":fill,"target_band":target,"stop_loss":stop,"lots":order.lots}),
     )
     .await;
+    let contract_label =
+        contract_log_label(&snapshot.instrument, snapshot.contract_symbol.as_deref());
+    append_user_log(
+        state,
+        order.user_id,
+        &format!(
+            "OPTION POSITION OPENED {} {} {} lots @ {:.2} TARGET {:.2} SL {:.2} [{}]",
+            contract_label,
+            order.side,
+            order.lots,
+            fill,
+            target,
+            stop,
+            order.execution_mode.to_uppercase()
+        ),
+    )
+    .await;
     Ok(true)
 }
 
@@ -3340,6 +3371,8 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         return Ok(());
     }
     let instrument = snapshot.instrument.clone();
+    let snapshot_contract_label =
+        contract_log_label(&instrument, snapshot.contract_symbol.as_deref());
     match order.role.as_str() {
         "BUY_ENTRY" | "SELL_ENTRY" => {
             let direction = if order.role == "BUY_ENTRY" {
@@ -3355,7 +3388,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
             let target = required_exit_level(target, "target")?;
             let sl1 = required_exit_level(sl1, "initial stop loss")?;
             let sl2 = required_exit_level(sl2, "continuation stop loss")?;
-            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
+            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64,String)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
                 if existing.1!=direction {
                     cancel_active_exits(state,order.user_id,existing.0).await?;
@@ -3363,7 +3396,8 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     let release_margin = existing.6;
                     sqlx::query("WITH closed AS (UPDATE trades SET status='closed',exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),remaining_lots=0,notes=CONCAT(notes,'; SAR reversal'),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'")
                         .bind(existing.0).bind(fill).bind(pnl).bind(release_margin).execute(&state.db).await?;
-                    append_user_log(state, order.user_id, &format!("STRATEGY POSITION CLOSED {} SAR @ {:.2} P&L {:+.2}", instrument, fill, pnl)).await;
+                    let contract_label = contract_log_label(&instrument, Some(&existing.7));
+                    append_user_log(state, order.user_id, &format!("STRATEGY POSITION CLOSED {} SAR @ {:.2} P&L {:+.2}", contract_label, fill, pnl)).await;
                 } else {
                     let old_target_lots = target_exit_lots(existing.4);
                     let new_total_lots = existing.4.saturating_add(order.lots.max(0));
@@ -3432,6 +3466,19 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                         .await?;
                     }
                     emit(state,Some(order.user_id),&instrument,"position_increased",json!({"trade_id":existing.0,"direction":direction,"fill_price":fill,"fill_delta":order.quantity,"cumulative_broker_fill":cumulative_fill,"quantity":new_quantity})).await;
+                    append_user_log(
+                        state,
+                        order.user_id,
+                        &format!(
+                            "STRATEGY POSITION INCREASED {} {} +{} lots @ {:.2} [{}]",
+                            snapshot_contract_label,
+                            direction,
+                            order.lots,
+                            fill,
+                            order.execution_mode.to_uppercase()
+                        ),
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -3493,7 +3540,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 order.user_id,
                 &format!(
                     "STRATEGY POSITION OPENED {} {} {} lots @ {:.2} MARGIN {:.2} [{}]",
-                    instrument,
+                    snapshot_contract_label,
                     direction,
                     order.lots,
                     fill,
@@ -3505,7 +3552,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "TARGET" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,i32,f64,f64)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64,String)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed = order.lots.min(trade.2);
                 let remaining = (trade.2 - closed).max(0);
@@ -3559,12 +3606,13 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     .await?;
                 }
                 emit(state,Some(order.user_id),&instrument,"target_filled",json!({"trade_id":trade_id,"fill_price":fill,"closed_lots":closed,"remaining_lots":remaining})).await;
-                append_user_log(state, order.user_id, &format!("STRATEGY TARGET FILLED {} {} lots @ {:.2} REALIZED P&L {:+.2}; {} lots remain", instrument, closed, fill, realized, remaining)).await;
+                let contract_label = contract_log_label(&instrument, Some(&trade.6));
+                append_user_log(state, order.user_id, &format!("STRATEGY TARGET FILLED {} {} lots @ {:.2} REALIZED P&L {:+.2}; {} lots remain", contract_label, closed, fill, realized, remaining)).await;
             }
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,f64,f64,f64)=sqlx::query_as("SELECT direction,quantity,remaining_lots,entry_price::float8,pnl::float8,margin_required FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,f64,f64,f64,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,entry_price::float8,pnl::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
@@ -3604,7 +3652,10 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     order.user_id,
                     &format!(
                         "STRATEGY {} FILLED {} @ {:.2} TOTAL P&L {:+.2}",
-                        order.role, instrument, fill, pnl
+                        order.role,
+                        contract_log_label(&instrument, Some(&trade.6)),
+                        fill,
+                        pnl
                     ),
                 )
                 .await;
@@ -4288,6 +4339,17 @@ mod tests {
             assert_eq!(target_exit_lots(lots), closed);
         }
     }
+
+    #[test]
+    fn contract_log_label_includes_selected_contract_symbol() {
+        assert_eq!(
+            contract_log_label("GOLDTEN", Some("GOLDTEN05AUG26FUT")),
+            "GOLDTEN (GOLDTEN05AUG26FUT)"
+        );
+        assert_eq!(contract_log_label("GOLDTEN", Some("goldten")), "GOLDTEN");
+        assert_eq!(contract_log_label("SENSEX_CE", None), "SENSEX_CE");
+    }
+
     #[test]
     fn demo_margin_is_calculated_from_quantity_and_price() {
         assert_eq!(demo_margin_amount(100, 200.0, 10.0), 2000.0);
