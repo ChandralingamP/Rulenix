@@ -1243,13 +1243,20 @@ fn close_position(
     }
 }
 
+fn refresh_stop_levels(current: &mut Levels, latest: Levels) {
+    current.buy_sl1 = latest.buy_sl1;
+    current.buy_sl2 = latest.buy_sl2;
+    current.sell_sl1 = latest.sell_sl1;
+    current.sell_sl2 = latest.sell_sl2;
+}
+
 fn refresh_position_levels(
     position: &mut Position,
     levels_by_date: &HashMap<NaiveDate, Levels>,
     date: NaiveDate,
 ) {
     if let Some(levels) = levels_by_date.get(&date).copied() {
-        position.levels = levels;
+        refresh_stop_levels(&mut position.levels, levels);
     }
 }
 
@@ -1532,6 +1539,8 @@ fn simulate(
         "max_drawdown": max_drawdown,
         "lot_size": lot_size,
         "target_exit_lots": target_exit_lots(lots),
+        "tp1_refresh_rule": "fixed_from_entry",
+        "stop_refresh_rule": "sl1_and_sl2_daily",
         "sl2_reversal_lots": lots,
         "sl2_reversal_rule": "opposite_direction_full_original_lots",
         "sl2_reversals": trades.iter().filter(|trade| {
@@ -2957,6 +2966,25 @@ mod tests {
         assert_eq!(futures_margin_per_lot(100_000.0, "GOLD", 10.0), 1_000_000.0);
         assert_eq!(futures_margin_per_lot(100_000.0, "GOLDM", 10.0), 100_000.0);
         assert_eq!(futures_margin_per_lot(100_000.0, "GOLDTEN", 10.0), 10_000.0);
+    }
+
+    #[test]
+    fn daily_refresh_changes_only_sl1_and_sl2() {
+        let mut entry =
+            calculate(&[100.0, 101.0, 102.0, 103.0], &[90.0, 91.0, 92.0, 93.0]).unwrap();
+        let original = entry;
+        let next = calculate(&[101.0, 102.0, 103.0, 120.0], &[91.0, 92.0, 93.0, 94.0]).unwrap();
+
+        refresh_stop_levels(&mut entry, next);
+
+        assert_eq!(entry.buy_target, original.buy_target);
+        assert_eq!(entry.sell_target, original.sell_target);
+        assert_eq!(entry.buy_entry, original.buy_entry);
+        assert_eq!(entry.sell_entry, original.sell_entry);
+        assert_eq!(entry.buy_sl1, next.buy_sl1);
+        assert_eq!(entry.buy_sl2, next.buy_sl2);
+        assert_eq!(entry.sell_sl1, next.sell_sl1);
+        assert_eq!(entry.sell_sl2, next.sell_sl2);
     }
 
     #[test]

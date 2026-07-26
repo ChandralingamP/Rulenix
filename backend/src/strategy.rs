@@ -1917,8 +1917,19 @@ struct OpenTrade {
     quantity: i32,
     remaining_lots: i32,
     total_lots: i32,
+    target_price: Option<f64>,
     strategy_snapshot_id: Option<Uuid>,
     instrument_label: String,
+}
+
+fn carry_exit_role(action: &str, target_done: bool) -> Option<&'static str> {
+    match (action, target_done) {
+        ("TARGET", false) => Some("TARGET"),
+        ("TARGET", true) => None,
+        ("STOP", false) => Some("SL1"),
+        ("STOP", true) => Some("SL2"),
+        _ => None,
+    }
 }
 
 async fn cancel_active_exit_role(
@@ -1960,7 +1971,7 @@ async fn place_carry_orders(
                 .unwrap_or_else(|| "Strategy snapshot is not ready.".into()),
         ));
     }
-    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT id,user_id,direction,quantity,remaining_lots,total_lots,strategy_snapshot_id,instrument_label FROM trades WHERE status='open' AND strategy_key=$1 AND instrument_label=$2 AND remaining_lots>0")
+    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT id,user_id,direction,quantity,remaining_lots,total_lots,target_price::float8 AS target_price,strategy_snapshot_id,instrument_label FROM trades WHERE status='open' AND strategy_key=$1 AND instrument_label=$2 AND remaining_lots>0")
         .bind(STRATEGY_KEY).bind(instrument).fetch_all(&state.db).await?;
     let mut errors = Vec::new();
     for trade in trades {
@@ -1968,19 +1979,22 @@ async fn place_carry_orders(
             continue;
         }
         let runner = runner_for(state, trade.user_id, &trade.instrument_label).await?;
-        if role == "TARGET" && trade.remaining_lots < trade.total_lots {
+        let target_done = trade.remaining_lots < trade.total_lots;
+        let Some(exit_role) = carry_exit_role(role, target_done) else {
             continue;
-        }
-        let (side, price, trigger) = match (trade.direction.as_str(), role) {
-            ("BUY", "TARGET") => ("SELL", snapshot.buy_target, None),
-            ("SELL", "TARGET") => ("BUY", snapshot.sell_target, None),
+        };
+        let (side, price, trigger) = match (trade.direction.as_str(), exit_role) {
+            ("BUY", "TARGET") => ("SELL", trade.target_price, None),
+            ("SELL", "TARGET") => ("BUY", trade.target_price, None),
+            ("BUY", "SL1") => ("SELL", snapshot.buy_sl1, snapshot.buy_sl1),
+            ("SELL", "SL1") => ("BUY", snapshot.sell_sl1, snapshot.sell_sl1),
             ("BUY", "SL2") => ("SELL", snapshot.buy_sl2, snapshot.buy_sl2),
             ("SELL", "SL2") => ("BUY", snapshot.sell_sl2, snapshot.sell_sl2),
             _ => continue,
         };
-        if let Some(price) = price {
+        if let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) {
             let key = format!("carry-{}-{}", date, session);
-            let lots = if role == "TARGET" {
+            let lots = if exit_role == "TARGET" {
                 target_exit_lots(trade.total_lots)
             } else {
                 trade.remaining_lots
@@ -1997,9 +2011,9 @@ async fn place_carry_orders(
                 &snapshot,
                 &key,
                 NewOrder {
-                    role: if role == "TARGET" { "TARGET" } else { "SL2" },
+                    role: exit_role,
                     side,
-                    order_type: if role == "TARGET" {
+                    order_type: if exit_role == "TARGET" {
                         "LIMIT"
                     } else {
                         "STOPLOSS_LIMIT"
@@ -2008,7 +2022,7 @@ async fn place_carry_orders(
                     price,
                     trigger,
                     trade_id: Some(trade.id),
-                    quantity: Some(if role == "TARGET" {
+                    quantity: Some(if exit_role == "TARGET" {
                         (lots * snapshot.lot_size.unwrap_or(1).max(1)).min(trade.quantity)
                     } else {
                         trade.quantity
@@ -2020,21 +2034,31 @@ async fn place_carry_orders(
                 errors.push(error.to_string());
                 continue;
             }
-            if role == "TARGET" {
-                sqlx::query("UPDATE trades SET strategy_snapshot_id=$2,target_price=$3,updated_at=NOW() WHERE id=$1 AND status='open'")
+            if exit_role == "TARGET" {
+                sqlx::query("UPDATE trades SET strategy_snapshot_id=$2,updated_at=NOW() WHERE id=$1 AND status='open'")
                     .bind(trade.id)
                     .bind(snapshot.id)
-                    .bind(price)
                     .execute(&state.db)
                     .await?;
             } else {
-                sqlx::query("UPDATE trades SET strategy_snapshot_id=$2,sl2_price=$3,updated_at=NOW() WHERE id=$1 AND status='open'")
+                let (sl1, sl2) = if trade.direction == "BUY" {
+                    (snapshot.buy_sl1, snapshot.buy_sl2)
+                } else {
+                    (snapshot.sell_sl1, snapshot.sell_sl2)
+                };
+                sqlx::query("UPDATE trades SET strategy_snapshot_id=$2,sl1_price=$3,sl2_price=$4,updated_at=NOW() WHERE id=$1 AND status='open'")
                     .bind(trade.id)
                     .bind(snapshot.id)
-                    .bind(price)
+                    .bind(sl1)
+                    .bind(sl2)
                     .execute(&state.db)
                     .await?;
             }
+        } else {
+            errors.push(format!(
+                "Trade {} has no valid fixed {exit_role} price.",
+                trade.id
+            ));
         }
     }
     if errors.is_empty() {
@@ -2113,7 +2137,7 @@ async fn run_scheduled_action(
     let result = if action == "target" {
         place_carry_orders(state, date, session, "TARGET", instrument).await
     } else {
-        let carry = place_carry_orders(state, date, session, "SL2", instrument).await;
+        let carry = place_carry_orders(state, date, session, "STOP", instrument).await;
         let entries = run_entries(state.clone(), instrument.to_string(), date, session).await;
         match (carry, entries) {
             (Ok(()), Ok(())) => Ok(()),
@@ -3971,7 +3995,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
             let target = required_exit_level(target, "target")?;
             let sl1 = required_exit_level(sl1, "initial stop loss")?;
             let sl2 = required_exit_level(sl2, "continuation stop loss")?;
-            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64,String)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
+            if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64,String,Option<f64>)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required,COALESCE(contract_symbol,''),target_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
                 if existing.1!=direction {
                     cancel_active_exits(state,order.user_id,existing.0).await?;
@@ -3982,6 +4006,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     let contract_label = contract_log_label(&instrument, Some(&existing.7));
                     append_user_log(state, order.user_id, &format!("STRATEGY POSITION CLOSED {} SAR @ {:.2} P&L {:+.2}", contract_label, fill, pnl)).await;
                 } else {
+                    let fixed_target = required_exit_level(existing.8, "fixed target")?;
                     let old_target_lots = target_exit_lots(existing.4);
                     let new_total_lots = existing.4.saturating_add(order.lots.max(0));
                     let new_target_lots = target_exit_lots(new_total_lots);
@@ -4042,7 +4067,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                                 side: exit_side,
                                 order_type: "LIMIT",
                                 lots: added_target_lots,
-                                price: target,
+                                price: fixed_target,
                                 trigger: None,
                                 trade_id: Some(existing.0),
                                 quantity: Some(
@@ -5034,6 +5059,14 @@ mod tests {
         for (lots, closed) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
             assert_eq!(target_exit_lots(lots), closed);
         }
+    }
+
+    #[test]
+    fn carry_orders_keep_target_and_advance_stop_after_tp1() {
+        assert_eq!(carry_exit_role("TARGET", false), Some("TARGET"));
+        assert_eq!(carry_exit_role("TARGET", true), None);
+        assert_eq!(carry_exit_role("STOP", false), Some("SL1"));
+        assert_eq!(carry_exit_role("STOP", true), Some("SL2"));
     }
 
     #[test]
