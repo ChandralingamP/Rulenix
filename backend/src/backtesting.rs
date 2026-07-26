@@ -7,7 +7,7 @@ use crate::{
         is_futures_breakout_instrument,
     },
     state::AppState,
-    strategy::{OPTION_ENTRY_STRATEGY_KEY, STRATEGY_KEY},
+    strategy::{OPTION_ENTRY_STRATEGY_KEY, STRATEGY_KEY, futures_exit_levels_for_entry},
 };
 use axum::{
     Json,
@@ -830,19 +830,21 @@ fn calculate(highs: &[f64], lows: &[f64]) -> Option<Levels> {
     let ll4 = min(lows)?;
     let buy_entry = hh4 * (1.0 + 0.0012);
     let sell_entry = ll4 * (1.0 - 0.0012);
+    let buy = futures_exit_levels_for_entry("BUY", buy_entry, hh2, ll2, hh4, ll4)?;
+    let sell = futures_exit_levels_for_entry("SELL", sell_entry, hh2, ll2, hh4, ll4)?;
     Some(Levels {
         hh2,
         ll2,
         hh4,
         ll4,
         buy_entry,
-        buy_target: buy_entry * (1.0 + 0.015),
-        buy_sl1: (buy_entry * (1.0 - 0.015)).max(ll2 * (1.0 - 0.0012)),
-        buy_sl2: (buy_entry * (1.0 - 0.015)).max(ll4 * (1.0 - 0.0012)),
+        buy_target: buy.target,
+        buy_sl1: buy.sl1,
+        buy_sl2: buy.sl2,
         sell_entry,
-        sell_target: sell_entry * (1.0 - 0.015),
-        sell_sl1: (sell_entry * (1.0 + 0.015)).min(hh2 * (1.0 + 0.0012)),
-        sell_sl2: (sell_entry * (1.0 + 0.015)).min(hh4 * (1.0 + 0.0012)),
+        sell_target: sell.target,
+        sell_sl1: sell.sl1,
+        sell_sl2: sell.sl2,
     })
 }
 
@@ -1164,6 +1166,33 @@ fn open_position(
     }
 }
 
+fn reversal_entry_levels(mut levels: Levels, direction: &str, entry_price: f64) -> Option<Levels> {
+    let exits = futures_exit_levels_for_entry(
+        direction,
+        entry_price,
+        levels.hh2,
+        levels.ll2,
+        levels.hh4,
+        levels.ll4,
+    )?;
+    match direction {
+        "BUY" => {
+            levels.buy_entry = entry_price;
+            levels.buy_target = exits.target;
+            levels.buy_sl1 = exits.sl1;
+            levels.buy_sl2 = exits.sl2;
+        }
+        "SELL" => {
+            levels.sell_entry = entry_price;
+            levels.sell_target = exits.target;
+            levels.sell_sl1 = exits.sl1;
+            levels.sell_sl2 = exits.sl2;
+        }
+        _ => return None,
+    }
+    Some(levels)
+}
+
 fn close_position(
     mut position: Position,
     candle: &Candle,
@@ -1255,8 +1284,29 @@ fn refresh_position_levels(
     levels_by_date: &HashMap<NaiveDate, Levels>,
     date: NaiveDate,
 ) {
-    if let Some(levels) = levels_by_date.get(&date).copied() {
-        refresh_stop_levels(&mut position.levels, levels);
+    let Some(latest) = levels_by_date.get(&date).copied() else {
+        return;
+    };
+    if position.reversal_of_trade_id.is_none() {
+        refresh_stop_levels(&mut position.levels, latest);
+        return;
+    }
+    let Some(exits) = futures_exit_levels_for_entry(
+        &position.direction,
+        position.entry_price,
+        latest.hh2,
+        latest.ll2,
+        latest.hh4,
+        latest.ll4,
+    ) else {
+        return;
+    };
+    if position.direction == "BUY" {
+        position.levels.buy_sl1 = exits.sl1;
+        position.levels.buy_sl2 = exits.sl2;
+    } else {
+        position.levels.sell_sl1 = exits.sl1;
+        position.levels.sell_sl2 = exits.sl2;
     }
 }
 
@@ -1370,33 +1420,36 @@ fn simulate(
                     .get(&candle_date(candle.candle_time))
                     .copied()
                     .or(closing_levels);
-                reversal_direction.zip(levels).map(|(direction, levels)| {
-                    let margin_per_lot = if direction == "BUY" {
-                        buy_margin_per_lot
-                    } else {
-                        sell_margin_per_lot
-                    }
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .unwrap_or_else(|| {
-                        futures_margin_per_lot(
+                reversal_direction
+                    .zip(levels)
+                    .and_then(|(direction, levels)| {
+                        let levels = reversal_entry_levels(levels, direction, trade.exit_price)?;
+                        let margin_per_lot = if direction == "BUY" {
+                            buy_margin_per_lot
+                        } else {
+                            sell_margin_per_lot
+                        }
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .unwrap_or_else(|| {
+                            futures_margin_per_lot(
+                                trade.exit_price,
+                                instrument,
+                                margin_requirement_percent,
+                            )
+                        });
+                        Some(open_position(
+                            candle,
+                            direction,
                             trade.exit_price,
-                            instrument,
-                            margin_requirement_percent,
-                        )
-                    });
-                    open_position(
-                        candle,
-                        direction,
-                        trade.exit_price,
-                        "SL2_REVERSAL",
-                        Some(trade.id),
-                        trade.lots,
-                        lot_size,
-                        pnl_multiplier,
-                        margin_per_lot,
-                        levels,
-                    )
-                })
+                            "SL2_REVERSAL",
+                            Some(trade.id),
+                            trade.lots,
+                            lot_size,
+                            pnl_multiplier,
+                            margin_per_lot,
+                            levels,
+                        ))
+                    })
             } else {
                 None
             };
@@ -1543,6 +1596,7 @@ fn simulate(
         "stop_refresh_rule": "sl1_and_sl2_daily",
         "sl2_reversal_lots": lots,
         "sl2_reversal_rule": "opposite_direction_full_original_lots",
+        "sl2_reversal_management": "fresh_tp1_and_sl1_then_sl2_after_tp1",
         "sl2_reversals": trades.iter().filter(|trade| {
             trade.levels.get("entry_reason").and_then(Value::as_str) == Some("SL2_REVERSAL")
         }).count(),
@@ -2959,6 +3013,83 @@ mod tests {
     }
 
     #[test]
+    fn simulator_treats_sl2_reversal_as_fresh_tp1_then_sl2_trade() {
+        let daily = vec![
+            candle(1, 150.0, 170.0, 140.0, 160.0),
+            candle(2, 150.0, 160.0, 141.0, 150.0),
+            candle(3, 145.0, 150.0, 142.0, 146.0),
+            candle(4, 146.0, 151.0, 143.0, 147.0),
+            candle(5, 147.0, 152.0, 144.0, 148.0),
+        ];
+        let levels =
+            calculate(&[170.0, 160.0, 150.0, 151.0], &[140.0, 141.0, 142.0, 143.0]).unwrap();
+        let reversal = reversal_entry_levels(levels, "SELL", levels.buy_sl2).unwrap();
+        assert!(levels.sell_sl1 < levels.buy_sl2);
+        assert!(reversal.sell_sl1 > levels.buy_sl2);
+        let intraday = vec![
+            candle(
+                5,
+                levels.buy_entry - 0.5,
+                levels.buy_entry + 0.1,
+                levels.buy_entry - 1.0,
+                levels.buy_entry,
+            ),
+            candle(
+                5,
+                levels.buy_entry,
+                levels.buy_target + 0.1,
+                levels.buy_sl2 + 1.0,
+                levels.buy_target,
+            ),
+            candle(
+                5,
+                levels.buy_target,
+                levels.buy_target,
+                levels.buy_sl2 - 0.1,
+                levels.buy_sl2,
+            ),
+            candle(
+                5,
+                levels.buy_sl2,
+                reversal.sell_sl1 - 0.1,
+                reversal.sell_target - 0.1,
+                reversal.sell_target,
+            ),
+            candle(
+                5,
+                reversal.sell_target,
+                reversal.sell_sl2 + 0.1,
+                reversal.sell_target,
+                reversal.sell_sl2,
+            ),
+        ];
+
+        let (trades, _) = simulate(
+            &intraday,
+            &daily,
+            "GOLDTEN",
+            10,
+            2,
+            10.0,
+            Some(12.0),
+            Some(12.0),
+        );
+
+        assert_eq!(trades[1].levels["entry_reason"], "SL2_REVERSAL");
+        assert_eq!(trades[1].exit_reason, "SL2");
+        assert_eq!(trades[1].levels["exit_events"][0]["event"], "TP1");
+        assert_eq!(trades[1].levels["exit_events"][0]["lots"], 1);
+        assert_eq!(trades[1].levels["exit_events"][1]["event"], "SL2");
+        assert_eq!(trades[1].levels["exit_events"][1]["lots"], 1);
+        assert!(reversal.sell_target < trades[1].entry_price);
+        assert!(reversal.sell_sl1 > trades[1].entry_price);
+        assert!(reversal.sell_sl2 > trades[1].entry_price);
+        assert_eq!(trades[1].levels["sell_target"], reversal.sell_target);
+        assert_eq!(trades[1].levels["sell_sl1"], reversal.sell_sl1);
+        assert_eq!(trades[1].levels["sell_sl2"], reversal.sell_sl2);
+    }
+
+    #[test]
     fn futures_backtest_uses_contract_specific_point_values() {
         assert_eq!(pnl_multiplier_per_lot("GOLD"), 100.0);
         assert_eq!(pnl_multiplier_per_lot("GOLDM"), 10.0);
@@ -2985,6 +3116,53 @@ mod tests {
         assert_eq!(entry.buy_sl2, next.buy_sl2);
         assert_eq!(entry.sell_sl1, next.sell_sl1);
         assert_eq!(entry.sell_sl2, next.sell_sl2);
+    }
+
+    #[test]
+    fn daily_refresh_keeps_reversal_tp1_and_rebases_its_stops() {
+        let entry_day =
+            calculate(&[100.0, 101.0, 102.0, 103.0], &[90.0, 91.0, 92.0, 93.0]).unwrap();
+        let next_day = calculate(&[101.0, 102.0, 103.0, 120.0], &[91.0, 92.0, 93.0, 94.0]).unwrap();
+        let reversal_entry = entry_day.buy_sl2;
+        let reversal_levels = reversal_entry_levels(entry_day, "SELL", reversal_entry).unwrap();
+        let fixed_target = reversal_levels.sell_target;
+        let mut position = open_position(
+            &candle(
+                5,
+                reversal_entry,
+                reversal_entry,
+                reversal_entry,
+                reversal_entry,
+            ),
+            "SELL",
+            reversal_entry,
+            "SL2_REVERSAL",
+            Some(Uuid::new_v4()),
+            2,
+            10,
+            1.0,
+            12.0,
+            reversal_levels,
+        );
+        let next_date = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
+        let levels_by_date = HashMap::from([(next_date, next_day)]);
+        let expected = futures_exit_levels_for_entry(
+            "SELL",
+            reversal_entry,
+            next_day.hh2,
+            next_day.ll2,
+            next_day.hh4,
+            next_day.ll4,
+        )
+        .unwrap();
+
+        refresh_position_levels(&mut position, &levels_by_date, next_date);
+
+        assert_eq!(position.levels.sell_target, fixed_target);
+        assert_eq!(position.levels.sell_sl1, expected.sl1);
+        assert_eq!(position.levels.sell_sl2, expected.sl2);
+        assert!(position.levels.sell_sl1 > reversal_entry);
+        assert!(position.levels.sell_sl2 > reversal_entry);
     }
 
     #[test]

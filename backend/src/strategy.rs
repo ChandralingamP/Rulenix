@@ -189,6 +189,66 @@ struct Levels {
     sell_sl2: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FuturesExitLevels {
+    pub target: f64,
+    pub sl1: f64,
+    pub sl2: f64,
+}
+
+pub(crate) fn futures_exit_levels_for_entry(
+    direction: &str,
+    entry: f64,
+    hh2: f64,
+    ll2: f64,
+    hh4: f64,
+    ll4: f64,
+) -> Option<FuturesExitLevels> {
+    if [entry, hh2, ll2, hh4, ll4]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    let (target, sl1, sl2) = match direction {
+        "BUY" => {
+            let main_stop = entry * (1.0 - 0.015);
+            let stop = |technical: f64| {
+                if technical < entry {
+                    main_stop.max(technical)
+                } else {
+                    main_stop
+                }
+            };
+            (
+                entry * (1.0 + 0.015),
+                stop(ll2 * (1.0 - 0.0012)),
+                stop(ll4 * (1.0 - 0.0012)),
+            )
+        }
+        "SELL" => {
+            let main_stop = entry * (1.0 + 0.015);
+            let stop = |technical: f64| {
+                if technical > entry {
+                    main_stop.min(technical)
+                } else {
+                    main_stop
+                }
+            };
+            (
+                entry * (1.0 - 0.015),
+                stop(hh2 * (1.0 + 0.0012)),
+                stop(hh4 * (1.0 + 0.0012)),
+            )
+        }
+        _ => return None,
+    };
+    [target, sl1, sl2]
+        .iter()
+        .all(|value| value.is_finite() && *value > 0.0)
+        .then_some(FuturesExitLevels { target, sl1, sl2 })
+}
+
 fn calculate(highs: &[f64], lows: &[f64]) -> Option<Levels> {
     if highs.len() != 4 || lows.len() != 4 {
         return None;
@@ -201,19 +261,21 @@ fn calculate(highs: &[f64], lows: &[f64]) -> Option<Levels> {
     let ll4 = min(lows)?;
     let buy_entry = hh4 * (1.0 + 0.0012);
     let sell_entry = ll4 * (1.0 - 0.0012);
+    let buy = futures_exit_levels_for_entry("BUY", buy_entry, hh2, ll2, hh4, ll4)?;
+    let sell = futures_exit_levels_for_entry("SELL", sell_entry, hh2, ll2, hh4, ll4)?;
     Some(Levels {
         hh2,
         ll2,
         hh4,
         ll4,
         buy_entry,
-        buy_target: buy_entry * (1.0 + 0.015),
-        buy_sl1: (buy_entry * (1.0 - 0.015)).max(ll2 * (1.0 - 0.0012)),
-        buy_sl2: (buy_entry * (1.0 - 0.015)).max(ll4 * (1.0 - 0.0012)),
+        buy_target: buy.target,
+        buy_sl1: buy.sl1,
+        buy_sl2: buy.sl2,
         sell_entry,
-        sell_target: sell_entry * (1.0 - 0.015),
-        sell_sl1: (sell_entry * (1.0 + 0.015)).min(hh2 * (1.0 + 0.0012)),
-        sell_sl2: (sell_entry * (1.0 + 0.015)).min(hh4 * (1.0 + 0.0012)),
+        sell_target: sell.target,
+        sell_sl1: sell.sl1,
+        sell_sl2: sell.sl2,
     })
 }
 
@@ -1917,7 +1979,10 @@ struct OpenTrade {
     quantity: i32,
     remaining_lots: i32,
     total_lots: i32,
+    target_done: bool,
+    entry_price: f64,
     target_price: Option<f64>,
+    reversal_of_trade_id: Option<Uuid>,
     strategy_snapshot_id: Option<Uuid>,
     instrument_label: String,
 }
@@ -1971,7 +2036,7 @@ async fn place_carry_orders(
                 .unwrap_or_else(|| "Strategy snapshot is not ready.".into()),
         ));
     }
-    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT id,user_id,direction,quantity,remaining_lots,total_lots,target_price::float8 AS target_price,strategy_snapshot_id,instrument_label FROM trades WHERE status='open' AND strategy_key=$1 AND instrument_label=$2 AND remaining_lots>0")
+    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT trade.id,trade.user_id,trade.direction,trade.quantity,trade.remaining_lots,trade.total_lots,EXISTS(SELECT 1 FROM strategy_orders target_order WHERE target_order.trade_id=trade.id AND target_order.role='TARGET' AND target_order.processed_quantity>0) AS target_done,trade.entry_price::float8 AS entry_price,trade.target_price::float8 AS target_price,trade.reversal_of_trade_id,trade.strategy_snapshot_id,trade.instrument_label FROM trades trade WHERE trade.status='open' AND trade.strategy_key=$1 AND trade.instrument_label=$2 AND trade.remaining_lots>0")
         .bind(STRATEGY_KEY).bind(instrument).fetch_all(&state.db).await?;
     let mut errors = Vec::new();
     for trade in trades {
@@ -1979,17 +2044,28 @@ async fn place_carry_orders(
             continue;
         }
         let runner = runner_for(state, trade.user_id, &trade.instrument_label).await?;
-        let target_done = trade.remaining_lots < trade.total_lots;
-        let Some(exit_role) = carry_exit_role(role, target_done) else {
+        let Some(exit_role) = carry_exit_role(role, trade.target_done) else {
             continue;
+        };
+        let exit_levels = match snapshot_exit_levels(
+            &snapshot,
+            &trade.direction,
+            trade.entry_price,
+            trade.reversal_of_trade_id.is_some(),
+        ) {
+            Ok(levels) => levels,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
         };
         let (side, price, trigger) = match (trade.direction.as_str(), exit_role) {
             ("BUY", "TARGET") => ("SELL", trade.target_price, None),
             ("SELL", "TARGET") => ("BUY", trade.target_price, None),
-            ("BUY", "SL1") => ("SELL", snapshot.buy_sl1, snapshot.buy_sl1),
-            ("SELL", "SL1") => ("BUY", snapshot.sell_sl1, snapshot.sell_sl1),
-            ("BUY", "SL2") => ("SELL", snapshot.buy_sl2, snapshot.buy_sl2),
-            ("SELL", "SL2") => ("BUY", snapshot.sell_sl2, snapshot.sell_sl2),
+            ("BUY", "SL1") => ("SELL", Some(exit_levels.sl1), Some(exit_levels.sl1)),
+            ("SELL", "SL1") => ("BUY", Some(exit_levels.sl1), Some(exit_levels.sl1)),
+            ("BUY", "SL2") => ("SELL", Some(exit_levels.sl2), Some(exit_levels.sl2)),
+            ("SELL", "SL2") => ("BUY", Some(exit_levels.sl2), Some(exit_levels.sl2)),
             _ => continue,
         };
         if let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) {
@@ -2041,16 +2117,11 @@ async fn place_carry_orders(
                     .execute(&state.db)
                     .await?;
             } else {
-                let (sl1, sl2) = if trade.direction == "BUY" {
-                    (snapshot.buy_sl1, snapshot.buy_sl2)
-                } else {
-                    (snapshot.sell_sl1, snapshot.sell_sl2)
-                };
                 sqlx::query("UPDATE trades SET strategy_snapshot_id=$2,sl1_price=$3,sl2_price=$4,updated_at=NOW() WHERE id=$1 AND status='open'")
                     .bind(trade.id)
                     .bind(snapshot.id)
-                    .bind(sl1)
-                    .bind(sl2)
+                    .bind(exit_levels.sl1)
+                    .bind(exit_levels.sl2)
                     .execute(&state.db)
                     .await?;
             }
@@ -2581,8 +2652,19 @@ async fn recover_residual_protective_orders(state: &AppState) -> AppResult<()> {
             .bind(&lock_key)
             .execute(&mut *tx)
             .await?;
-        let trade: Option<(Uuid, Uuid, String, String, String, i32, i32)> =
-            sqlx::query_as("SELECT user_id,strategy_snapshot_id,strategy_key,instrument_label,direction,quantity,remaining_lots FROM trades WHERE id=$1 AND execution_mode='live' AND status='open' FOR UPDATE")
+        let trade: Option<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            i32,
+            i32,
+            Option<f64>,
+            Option<f64>,
+            bool,
+        )> =
+            sqlx::query_as("SELECT trade.user_id,trade.strategy_snapshot_id,trade.strategy_key,trade.instrument_label,trade.direction,trade.quantity,trade.remaining_lots,trade.sl1_price::float8,trade.sl2_price::float8,EXISTS(SELECT 1 FROM strategy_orders target_order WHERE target_order.trade_id=trade.id AND target_order.role='TARGET' AND target_order.processed_quantity>0) AS target_done FROM trades trade WHERE trade.id=$1 AND trade.execution_mode='live' AND trade.status='open' FOR UPDATE")
                 .bind(trade_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -2594,6 +2676,9 @@ async fn recover_residual_protective_orders(state: &AppState) -> AppResult<()> {
             direction,
             quantity,
             remaining_lots,
+            sl1_price,
+            sl2_price,
+            target_done,
         )) = trade
         else {
             tx.commit().await?;
@@ -2617,14 +2702,11 @@ async fn recover_residual_protective_orders(state: &AppState) -> AppResult<()> {
         if strategy_key != STRATEGY_KEY {
             continue;
         }
-        let (role, stop) = (
-            "SL2",
-            if direction == "BUY" {
-                snapshot.buy_sl2
-            } else {
-                snapshot.sell_sl2
-            },
-        );
+        let (role, stop) = if target_done {
+            ("SL2", sl2_price)
+        } else {
+            ("SL1", sl1_price)
+        };
         let stop = stop
             .filter(|value| value.is_finite() && *value > 0.0)
             .ok_or_else(|| {
@@ -3293,6 +3375,40 @@ fn required_exit_level(value: Option<f64>, label: &str) -> AppResult<f64> {
                 "Futures Breakout snapshot has no valid {label}; the position was not opened."
             ))
         })
+}
+
+fn snapshot_exit_levels(
+    snapshot: &Snapshot,
+    direction: &str,
+    entry_price: f64,
+    rebase_to_entry: bool,
+) -> AppResult<FuturesExitLevels> {
+    if rebase_to_entry {
+        let hh2 = required_exit_level(snapshot.hh2, "HH2")?;
+        let ll2 = required_exit_level(snapshot.ll2, "LL2")?;
+        let hh4 = required_exit_level(snapshot.hh4, "HH4")?;
+        let ll4 = required_exit_level(snapshot.ll4, "LL4")?;
+        return futures_exit_levels_for_entry(direction, entry_price, hh2, ll2, hh4, ll4)
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Futures Breakout could not calculate valid reversal exit levels.".into(),
+                )
+            });
+    }
+    let (target, sl1, sl2) = match direction {
+        "BUY" => (snapshot.buy_target, snapshot.buy_sl1, snapshot.buy_sl2),
+        "SELL" => (snapshot.sell_target, snapshot.sell_sl1, snapshot.sell_sl2),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Futures Breakout trade direction is invalid.".into(),
+            ));
+        }
+    };
+    Ok(FuturesExitLevels {
+        target: required_exit_level(target, "target")?,
+        sl1: required_exit_level(sl1, "initial stop loss")?,
+        sl2: required_exit_level(sl2, "continuation stop loss")?,
+    })
 }
 
 #[cfg(test)]
@@ -3987,14 +4103,25 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
             } else {
                 "SELL"
             };
-            let (target, sl1, sl2) = if direction == "BUY" {
-                (snapshot.buy_target, snapshot.buy_sl1, snapshot.buy_sl2)
-            } else {
-                (snapshot.sell_target, snapshot.sell_sl1, snapshot.sell_sl2)
-            };
-            let target = required_exit_level(target, "target")?;
-            let sl1 = required_exit_level(sl1, "initial stop loss")?;
-            let sl2 = required_exit_level(sl2, "continuation stop loss")?;
+            let reversal_source_trade_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT source_trade_id
+                 FROM strategy_reversal_intents
+                 WHERE user_id=$1 AND order_session_key=$2
+                 LIMIT 1",
+            )
+            .bind(order.user_id)
+            .bind(&order.session_key)
+            .fetch_optional(&state.db)
+            .await?;
+            let exit_levels = snapshot_exit_levels(
+                &snapshot,
+                direction,
+                fill,
+                reversal_source_trade_id.is_some(),
+            )?;
+            let target = exit_levels.target;
+            let sl1 = exit_levels.sl1;
+            let sl2 = exit_levels.sl2;
             if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64,String,Option<f64>)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required,COALESCE(contract_symbol,''),target_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
                 if existing.1!=direction {
@@ -4028,7 +4155,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                         .execute(&mut *fill_tx).await?;
                     sqlx::query("UPDATE strategy_orders SET status='filled',trade_id=$2,processed_quantity=GREATEST(processed_quantity,$3),filled_quantity=GREATEST(filled_quantity,$3),updated_at=NOW() WHERE id=$1")
                         .bind(order.id).bind(existing.0).bind(cumulative_fill).execute(&mut *fill_tx).await?;
-                    if let Some(source_trade_id) = order.trade_id {
+                    if let Some(source_trade_id) = reversal_source_trade_id {
                         sqlx::query("UPDATE strategy_reversal_intents SET status='completed',last_error='',updated_at=NOW() WHERE source_trade_id=$1")
                             .bind(source_trade_id)
                             .execute(&mut *fill_tx)
@@ -4103,11 +4230,11 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 sqlx::query("UPDATE user_profiles SET demo_balance=(GREATEST((demo_balance::float8 - $2),0::numeric))::numeric,updated_at=NOW() WHERE user_id=$1")
                     .bind(order.user_id).bind(reserved_margin).execute(&mut *fill_tx).await?;
             }
-            sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,sl2_price,margin_required) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,'Futures Breakout v3',$8,$9,$10,$10,$11,$12,$13,$15 FROM strategy_orders WHERE id=$14")
+            sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,sl2_price,reversal_of_trade_id,margin_required) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,'Futures Breakout v3',$8,$9,$10,$10,$11,$12,$13,$14,$16 FROM strategy_orders WHERE id=$15")
                 .bind(trade_id).bind(order.user_id).bind(direction).bind(order.quantity).bind(fill).bind(&instrument).bind(snapshot.contract_symbol.as_deref().unwrap_or(""))
-                .bind(STRATEGY_KEY).bind(snapshot.id).bind(order.lots.max(1)).bind(target).bind(sl1).bind(sl2).bind(order.id).bind(order.margin_required).execute(&mut *fill_tx).await?;
+                .bind(STRATEGY_KEY).bind(snapshot.id).bind(order.lots.max(1)).bind(target).bind(sl1).bind(sl2).bind(reversal_source_trade_id).bind(order.id).bind(order.margin_required).execute(&mut *fill_tx).await?;
             sqlx::query("UPDATE strategy_orders SET status='filled',trade_id=$2,processed_quantity=GREATEST(processed_quantity,$3),filled_quantity=GREATEST(filled_quantity,$3),updated_at=NOW() WHERE id=$1").bind(order.id).bind(trade_id).bind(cumulative_fill).execute(&mut *fill_tx).await?;
-            if let Some(source_trade_id) = order.trade_id {
+            if let Some(source_trade_id) = reversal_source_trade_id {
                 sqlx::query("UPDATE strategy_reversal_intents SET status='completed',last_error='',updated_at=NOW() WHERE source_trade_id=$1")
                     .bind(source_trade_id)
                     .execute(&mut *fill_tx)
@@ -4172,7 +4299,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "TARGET" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,i32,f64,f64,String)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64,Option<f64>,String)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed = order.lots.min(trade.2);
                 let remaining = (trade.2 - closed).max(0);
@@ -4200,12 +4327,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 fill_tx.commit().await?;
                 if remaining_quantity > 0 {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
-                    let sl2 = if trade.0 == "BUY" {
-                        snapshot.buy_sl2
-                    } else {
-                        snapshot.sell_sl2
-                    };
-                    let sl2 = required_exit_level(sl2, "continuation stop loss")?;
+                    let sl2 = required_exit_level(trade.6, "continuation stop loss")?;
                     let side = if trade.0 == "BUY" { "SELL" } else { "BUY" };
                     place_strategy_order(
                         state,
@@ -4226,13 +4348,13 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     .await?;
                 }
                 emit(state,Some(order.user_id),&instrument,"target_filled",json!({"trade_id":trade_id,"fill_price":fill,"closed_lots":closed,"remaining_lots":remaining})).await;
-                let contract_label = contract_log_label(&instrument, Some(&trade.6));
+                let contract_label = contract_log_label(&instrument, Some(&trade.7));
                 append_user_log(state, order.user_id, &format!("STRATEGY TARGET FILLED {} {} lots @ {:.2} REALIZED P&L {:+.2}; {} lots remain", contract_label, closed, fill, realized, remaining)).await;
             }
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,i32,f64,f64,f64,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64,f64,Option<f64>,Option<f64>,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,sl1_price::float8,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
@@ -4300,7 +4422,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     &format!(
                         "STRATEGY {} FILLED {} @ {:.2} TOTAL P&L {:+.2}",
                         order.role,
-                        contract_log_label(&instrument, Some(&trade.7)),
+                        contract_log_label(&instrument, Some(&trade.9)),
                         fill,
                         pnl
                     ),
@@ -4326,7 +4448,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                         order.user_id,
                         &format!(
                             "STRATEGY SL2 REVERSAL QUEUED {} {} -> {} {} lots @ MARKET",
-                            contract_log_label(&instrument, Some(&trade.7)),
+                            contract_log_label(&instrument, Some(&trade.9)),
                             trade.0,
                             plan.direction,
                             plan.lots
@@ -4339,24 +4461,24 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 }
                 if remaining_quantity > 0 {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
-                    let sl2 = if trade.0 == "BUY" {
-                        snapshot.buy_sl2
+                    let (next_role, stop) = if order.role == "SL1" {
+                        ("SL1", trade.7)
                     } else {
-                        snapshot.sell_sl2
+                        ("SL2", trade.8)
                     };
-                    let sl2 = required_exit_level(sl2, "continuation stop loss")?;
+                    let stop = required_exit_level(stop, "remaining-position stop loss")?;
                     place_strategy_order(
                         state,
                         &runner,
                         &snapshot,
                         &order.session_key,
                         NewOrder {
-                            role: "SL2",
+                            role: next_role,
                             side: if trade.0 == "BUY" { "SELL" } else { "BUY" },
                             order_type: "STOPLOSS_LIMIT",
                             lots: remaining_lots.max(1),
-                            price: sl2,
-                            trigger: Some(sl2),
+                            price: stop,
+                            trigger: Some(stop),
                             trade_id: Some(trade_id),
                             quantity: Some(remaining_quantity),
                         },
@@ -4859,7 +4981,7 @@ pub async fn status(
     let strategy_active = activation_state(&state, user).await?;
     let snapshot = load_snapshot(&state, &instrument, ist_now().date_naive()).await?;
     let orders:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'role',role,'side',side,'status',status,'lots',lots,'quantity',quantity,'price',price,'trigger_price',trigger_price,'margin_required',margin_required,'client_order_id',client_order_id,'broker_order_id',broker_order_id,'filled_quantity',filled_quantity,'average_fill_price',average_fill_price,'broker_error_class',broker_error_class,'broker_error_code',broker_error_code,'broker_http_status',broker_http_status,'last_reconciled_at',last_reconciled_at,'created_at',created_at) FROM strategy_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100").bind(user).fetch_all(&state.db).await?;
-    let trades:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'status',status,'direction',direction,'lots',total_lots,'remaining_lots',remaining_lots,'quantity',quantity,'entry_price',entry_price,'exit_price',exit_price,'pnl',pnl,'margin_required',margin_required,'trigger_time',entry_datetime,'exit_time',exit_datetime,'contract_symbol',contract_symbol,'target',target_price,'sl1',sl1_price,'sl2',sl2_price) FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 ORDER BY created_at DESC LIMIT 100").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
+    let trades:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'status',status,'direction',direction,'lots',total_lots,'remaining_lots',remaining_lots,'quantity',quantity,'entry_price',entry_price,'exit_price',exit_price,'pnl',pnl,'margin_required',margin_required,'trigger_time',entry_datetime,'exit_time',exit_datetime,'contract_symbol',contract_symbol,'target',target_price,'sl1',sl1_price,'sl2',sl2_price,'reversal_of_trade_id',reversal_of_trade_id) FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 ORDER BY created_at DESC LIMIT 100").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
     let alerts:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 20").bind(STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
     Ok(Json(
         json!({"strategy_key":STRATEGY_KEY,"strategy_active":strategy_active,"instrument":instrument,"configuration":config.map(|v|json!({"enabled":v.0,"lots":v.1,"run_day_session":v.2,"run_evening_session":v.3})),"snapshot":snapshot,"orders":orders,"trades":trades,"operational_alerts":alerts}),
@@ -5083,6 +5205,29 @@ mod tests {
         assert_eq!(buy.entry_side, "BUY");
         assert_eq!(buy.lots, 4);
         assert!(sl2_reversal_plan("BUY", 0).is_none());
+    }
+
+    #[test]
+    fn reversal_exit_levels_are_anchored_to_the_new_entry() {
+        let buy = futures_exit_levels_for_entry("BUY", 100.0, 110.0, 90.0, 120.0, 80.0).unwrap();
+        assert!((buy.target - 101.5).abs() < 1e-9);
+        assert!(buy.sl1 < 100.0);
+        assert!(buy.sl2 < 100.0);
+
+        let sell = futures_exit_levels_for_entry("SELL", 100.0, 110.0, 90.0, 120.0, 80.0).unwrap();
+        assert!((sell.target - 98.5).abs() < 1e-9);
+        assert!(sell.sl1 > 100.0);
+        assert!(sell.sl2 > 100.0);
+
+        let crossed_buy =
+            futures_exit_levels_for_entry("BUY", 100.0, 120.0, 110.0, 130.0, 105.0).unwrap();
+        assert!((crossed_buy.sl1 - 98.5).abs() < 1e-9);
+        assert!((crossed_buy.sl2 - 98.5).abs() < 1e-9);
+
+        let crossed_sell =
+            futures_exit_levels_for_entry("SELL", 100.0, 90.0, 70.0, 95.0, 60.0).unwrap();
+        assert!((crossed_sell.sl1 - 101.5).abs() < 1e-9);
+        assert!((crossed_sell.sl2 - 101.5).abs() < 1e-9);
     }
 
     #[test]
