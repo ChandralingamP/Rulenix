@@ -166,7 +166,7 @@ export default function BacktestingPage() {
   const latestRun = result?.run || history[0] || null;
   const latestSummary = latestRun?.summary || null;
   const selectedStrategyLabel =
-    form.strategy_key === "option_entry_v1" ? "SENSEX options" : "GOLDTEN futures";
+    form.strategy_key === "option_entry_v1" ? "SENSEX options" : `${form.instrument} futures`;
   const backtestingAllowed = availability?.allowed !== false;
   const parametersValid = true;
   const recentTrades = useMemo(
@@ -287,7 +287,11 @@ export default function BacktestingPage() {
               {form.strategy_key === "option_entry_v1" ? (
                 <option value="SENSEX">SENSEX</option>
               ) : (
-                <option value="GOLDTEN">GOLDTEN</option>
+                <>
+                  <option value="GOLDTEN">GOLDTEN</option>
+                  <option value="GOLDM">GOLDM · Gold Mini</option>
+                  <option value="GOLD">GOLD · Gold</option>
+                </>
               )}
             </select>
           </label>

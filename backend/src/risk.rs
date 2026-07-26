@@ -1,6 +1,7 @@
 use crate::{
     auth::{AuthUser, require_admin_permission},
     error::{AppError, AppResult},
+    instruments::futures_pnl_units,
     state::AppState,
 };
 use axum::{
@@ -252,13 +253,116 @@ pub async fn assess_and_reserve(
             );
         }
 
-        let exposure: (i64,i64,f64,i64,i64,f64,f64) = sqlx::query_as(
-            "WITH boundary AS (SELECT date_trunc('day',NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata' at), pending AS (SELECT COALESCE(SUM(lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*price),0)::float8 notional,COUNT(*)::bigint positions FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')), open AS (SELECT COALESCE(SUM(total_lots),0)::bigint lots,COALESCE(SUM(quantity),0)::bigint quantity,COALESCE(SUM(quantity*COALESCE(last_price,entry_price)),0)::float8 notional,COUNT(*)::bigint positions,COALESCE(SUM(pnl+(CASE WHEN direction='BUY' THEN COALESCE(last_price,entry_price)-entry_price ELSE entry_price-COALESCE(last_price,entry_price) END)*(CASE WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN' THEN COALESCE(NULLIF(remaining_lots,0),quantity)::float8 ELSE quantity::float8 END)),0)::float8 unrealized FROM trades WHERE user_id=$1 AND status='open'), daily AS (SELECT (SELECT COUNT(*) FROM trades,boundary WHERE user_id=$1 AND entry_datetime>=boundary.at)::bigint trades,(SELECT COALESCE(SUM(pnl),0)::float8 FROM trades,boundary WHERE user_id=$1 AND status='closed' AND exit_datetime>=boundary.at) realized) SELECT pending.lots+open.lots,pending.quantity+open.quantity,pending.notional+open.notional,pending.positions+open.positions,daily.trades+(SELECT COUNT(*) FROM strategy_orders,boundary WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at>=boundary.at),daily.realized,open.unrealized FROM pending,open,daily"
-        ).bind(order.user_id).fetch_one(&mut *tx).await?;
+        let exposure: (i64, i64, f64, i64, i64, f64, f64) = sqlx::query_as(
+            r#"
+            WITH boundary AS (
+                SELECT date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                    AT TIME ZONE 'Asia/Kolkata' at
+            ),
+            pending AS (
+                SELECT
+                    COALESCE(SUM(o.lots), 0)::bigint lots,
+                    COALESCE(SUM(o.quantity), 0)::bigint quantity,
+                    COALESCE(SUM(
+                        o.price * CASE
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLD'
+                                THEN o.lots::float8 * 100.0
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLDM'
+                                THEN o.lots::float8 * 10.0
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLDTEN'
+                                THEN o.lots::float8
+                            ELSE o.quantity::float8
+                        END
+                    ), 0)::float8 notional,
+                    COUNT(*)::bigint positions
+                FROM strategy_orders o
+                JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+                WHERE o.user_id=$1
+                  AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                  AND o.status IN (
+                      'pending','submitting','ambiguous','submitted','partially_filled',
+                      'processing','cancelling'
+                  )
+            ),
+            open AS (
+                SELECT
+                    COALESCE(SUM(total_lots), 0)::bigint lots,
+                    COALESCE(SUM(quantity), 0)::bigint quantity,
+                    COALESCE(SUM(
+                        COALESCE(last_price,entry_price) * CASE
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                            ELSE quantity::float8
+                        END
+                    ), 0)::float8 notional,
+                    COUNT(*)::bigint positions,
+                    COALESCE(SUM(
+                        pnl + (
+                            CASE WHEN direction='BUY'
+                                THEN COALESCE(last_price,entry_price)-entry_price
+                                ELSE entry_price-COALESCE(last_price,entry_price)
+                            END
+                        ) * CASE
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                            ELSE quantity::float8
+                        END
+                    ), 0)::float8 unrealized
+                FROM trades
+                WHERE user_id=$1 AND status='open'
+            ),
+            daily AS (
+                SELECT
+                    (SELECT COUNT(*) FROM trades,boundary
+                     WHERE user_id=$1 AND entry_datetime>=boundary.at)::bigint trades,
+                    (SELECT COALESCE(SUM(pnl),0)::float8 FROM trades,boundary
+                     WHERE user_id=$1 AND status='closed' AND exit_datetime>=boundary.at) realized
+            )
+            SELECT
+                pending.lots+open.lots,
+                pending.quantity+open.quantity,
+                pending.notional+open.notional,
+                pending.positions+open.positions,
+                daily.trades+(
+                    SELECT COUNT(*) FROM strategy_orders,boundary
+                    WHERE user_id=$1
+                      AND role IN ('BUY_ENTRY','SELL_ENTRY')
+                      AND status IN (
+                          'pending','submitting','ambiguous','submitted','partially_filled',
+                          'processing','cancelling'
+                      )
+                      AND created_at>=boundary.at
+                ),
+                daily.realized,
+                open.unrealized
+            FROM pending,open,daily
+            "#,
+        )
+        .bind(order.user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let snapshot_contract: Option<(String, String, Option<i32>)> = sqlx::query_as(
+            "SELECT strategy_key,instrument,lot_size FROM strategy_market_snapshots WHERE id=$1",
+        )
+        .bind(order.snapshot_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let order_notional_units = snapshot_contract
+            .filter(|snapshot| snapshot.0 == "futures_breakout_v3")
+            .map(|snapshot| futures_pnl_units(&snapshot.1, order.quantity, snapshot.2))
+            .unwrap_or(order.quantity as f64);
         metrics = Metrics {
             lots: exposure.0 + order.lots as i64,
             quantity: exposure.1 + order.quantity as i64,
-            notional: exposure.2 + order.quantity as f64 * order.price,
+            notional: exposure.2 + order_notional_units * order.price,
             positions: exposure.3 + 1,
             trades_today: exposure.4 + 1,
             realized_pnl: exposure.5,
@@ -273,7 +377,7 @@ pub async fn assess_and_reserve(
             .margin_required
             .filter(|value| *value > 0.0)
             .unwrap_or(
-                order.quantity as f64 * order.price * limits.margin_requirement_percent / 100.0,
+                order_notional_units * order.price * limits.margin_requirement_percent / 100.0,
             );
         if code == "allowed" && order.mode == "demo" {
             let demo_balance: Option<f64> = sqlx::query_scalar(

@@ -152,4 +152,55 @@ describe("StrategiesPage", () => {
     expect(screen.queryByText("Older broker issue")).not.toBeInTheDocument();
   });
 
+  it("renders Gold, Gold Mini, and Gold Ten as independent instruments", async () => {
+    setAuthUsername("TRADER01");
+    apiClient.get.mockResolvedValue({
+      data: {
+        strategies: [
+          {
+            ...strategy,
+            active: true,
+            instruments: [
+              { ...instrument, label: "Gold Ten" },
+              {
+                ...instrument,
+                instrument: "GOLDM",
+                label: "Gold Mini",
+                snapshot: {
+                  ...instrument.snapshot,
+                  contract_symbol: "GOLDM04SEP26FUT",
+                  lot_size: 100,
+                },
+              },
+              {
+                ...instrument,
+                instrument: "GOLD",
+                label: "Gold",
+                snapshot: {
+                  ...instrument.snapshot,
+                  contract_symbol: "GOLD05OCT26FUT",
+                  lot_size: 1,
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const store = configureStore({ reducer: { strategies: strategiesReducer } });
+
+    render(
+      <Provider store={store}>
+        <StrategiesPage />
+      </Provider>
+    );
+
+    expect(await screen.findByText("Gold Ten")).toBeInTheDocument();
+    expect(screen.getByText("Gold Mini")).toBeInTheDocument();
+    expect(screen.getByText("Gold")).toBeInTheDocument();
+    expect(screen.getByLabelText("GOLDTEN trade lots")).toBeInTheDocument();
+    expect(screen.getByLabelText("GOLDM trade lots")).toBeInTheDocument();
+    expect(screen.getByLabelText("GOLD trade lots")).toBeInTheDocument();
+  });
+
 });

@@ -8,6 +8,7 @@ mod config;
 mod credentials;
 mod error;
 mod home;
+mod instruments;
 mod jobs;
 mod logs;
 mod margin;

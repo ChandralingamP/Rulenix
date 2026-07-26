@@ -306,7 +306,7 @@ export default function StrategiesPage() {
                               <td className="px-4 py-4">
                                 <div className="flex items-center gap-3">
                                   <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-amber-500/15 font-bold text-amber-300">
-                                    {instrument.instrument === "GOLDTEN" ? "Au" : "IDX"}
+                                    {instrument.instrument.startsWith("GOLD") ? "Au" : "IDX"}
                                   </div>
                                   <div>
                                     <p className="font-semibold text-white">

@@ -2,6 +2,10 @@ use crate::{
     angel,
     auth::AuthUser,
     error::{AppError, AppResult},
+    instruments::{
+        FUTURES_BREAKOUT_INSTRUMENTS, futures_pnl_multiplier_per_lot,
+        is_futures_breakout_instrument,
+    },
     state::AppState,
     strategy::{OPTION_ENTRY_STRATEGY_KEY, STRATEGY_KEY},
 };
@@ -23,7 +27,6 @@ use uuid::Uuid;
 
 const MASTER_URL: &str =
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json";
-const SUPPORTED_INSTRUMENT: &str = "GOLDTEN";
 const OPTION_SUPPORTED_INSTRUMENT: &str = "SENSEX";
 const SENSEX_INDEX_TOKEN: &str = "99919000";
 const OPTION_INTERVAL: &str = "FIVE_MINUTE";
@@ -859,16 +862,20 @@ fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
     }
 }
 
-fn pnl_multiplier_per_lot(instrument: &str, lot_size: i32) -> f64 {
-    if instrument == SUPPORTED_INSTRUMENT {
-        1.0
-    } else {
-        lot_size.max(1) as f64
-    }
+fn pnl_multiplier_per_lot(instrument: &str) -> f64 {
+    futures_pnl_multiplier_per_lot(instrument)
 }
 
 fn margin_per_lot(entry_price: f64, lot_size: i32, margin_requirement_percent: f64) -> f64 {
     entry_price * lot_size as f64 * margin_requirement_percent / 100.0
+}
+
+fn futures_margin_per_lot(
+    entry_price: f64,
+    instrument: &str,
+    margin_requirement_percent: f64,
+) -> f64 {
+    entry_price * pnl_multiplier_per_lot(instrument) * margin_requirement_percent / 100.0
 }
 
 fn ema(values: &[f64], period: usize) -> Vec<Option<f64>> {
@@ -1331,6 +1338,7 @@ fn process_exit(
 fn simulate(
     intraday: &[Candle],
     daily: &[Candle],
+    instrument: &str,
     lot_size: i32,
     lots: i32,
     margin_requirement_percent: f64,
@@ -1338,7 +1346,7 @@ fn simulate(
     sell_margin_per_lot: Option<f64>,
 ) -> (Vec<TradeResult>, Value) {
     let levels_by_date = build_daily_levels(daily);
-    let pnl_multiplier = pnl_multiplier_per_lot(SUPPORTED_INSTRUMENT, lot_size);
+    let pnl_multiplier = pnl_multiplier_per_lot(instrument);
     let mut position: Option<Position> = None;
     let mut trades = Vec::new();
     let mut equity: f64 = 0.0;
@@ -1363,7 +1371,11 @@ fn simulate(
                     }
                     .filter(|value| value.is_finite() && *value > 0.0)
                     .unwrap_or_else(|| {
-                        margin_per_lot(trade.exit_price, lot_size, margin_requirement_percent)
+                        futures_margin_per_lot(
+                            trade.exit_price,
+                            instrument,
+                            margin_requirement_percent,
+                        )
                     });
                     open_position(
                         candle,
@@ -1428,7 +1440,9 @@ fn simulate(
             sell_margin_per_lot
         }
         .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or_else(|| margin_per_lot(entry_price, lot_size, margin_requirement_percent));
+        .unwrap_or_else(|| {
+            futures_margin_per_lot(entry_price, instrument, margin_requirement_percent)
+        });
         entered_sessions.insert(session_key);
         position = Some(open_position(
             candle,
@@ -1503,6 +1517,7 @@ fn simulate(
     let summary = json!({
         "strategy_key": STRATEGY_KEY,
         "strategy_name": "Futures Breakout v3",
+        "instrument": instrument,
         "trades":trades.len(),
         "wins":wins,
         "losses":losses,
@@ -1523,7 +1538,7 @@ fn simulate(
             trade.levels.get("entry_reason").and_then(Value::as_str) == Some("SL2_REVERSAL")
         }).count(),
         "pnl_multiplier_per_lot": pnl_multiplier,
-        "pnl_model": "goldten_points_x_lots",
+        "pnl_model": "gold_price_points_x_contract_value_x_lots",
         "entry_frequency": "one_breakout_per_session_plus_sl2_reversals",
         "margin_requirement_percent": margin_requirement_percent,
         "initial_margin_per_lot": initial_margin_per_lot,
@@ -2146,7 +2161,7 @@ pub async fn run(
     let instrument = input
         .instrument
         .clone()
-        .unwrap_or_else(|| SUPPORTED_INSTRUMENT.into())
+        .unwrap_or_else(|| "GOLDTEN".into())
         .trim()
         .to_uppercase();
     if !matches!(input.lookback_months, 1 | 3 | 6) {
@@ -2185,10 +2200,11 @@ pub async fn run(
             "Unknown backtesting strategy key.".into(),
         ));
     }
-    if instrument != SUPPORTED_INSTRUMENT {
-        return Err(AppError::BadRequest(
-            "Futures Breakout v3 backtesting supports only GOLDTEN.".into(),
-        ));
+    if !is_futures_breakout_instrument(&instrument) {
+        return Err(AppError::BadRequest(format!(
+            "Futures Breakout v3 backtesting supports {}.",
+            FUTURES_BREAKOUT_INSTRUMENTS.join(", ")
+        )));
     }
     let contract = current_contract(&state, &instrument).await?;
     let buy_margin = crate::margin::estimate(
@@ -2278,6 +2294,7 @@ pub async fn run(
     let (trades, mut summary) = simulate(
         &intraday,
         &daily,
+        &instrument,
         contract.lot_size,
         input.lots,
         margin_requirement_percent,
@@ -2900,7 +2917,16 @@ mod tests {
                 levels.buy_sl2,
             ),
         ];
-        let (trades, summary) = simulate(&intraday, &daily, 1, 3, 10.0, Some(12.0), Some(12.0));
+        let (trades, summary) = simulate(
+            &intraday,
+            &daily,
+            "GOLDTEN",
+            10,
+            3,
+            10.0,
+            Some(12.0),
+            Some(12.0),
+        );
         assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].exit_reason, "SL2");
         assert_eq!(trades[0].levels["exit_events"][0]["event"], "TP1");
@@ -2921,6 +2947,16 @@ mod tests {
         assert_eq!(summary["sl2_reversals"], 1);
         assert_eq!(summary["sl2_reversal_lots"], 3);
         assert_eq!(summary["initial_margin_per_lot"], 12.0);
+    }
+
+    #[test]
+    fn futures_backtest_uses_contract_specific_point_values() {
+        assert_eq!(pnl_multiplier_per_lot("GOLD"), 100.0);
+        assert_eq!(pnl_multiplier_per_lot("GOLDM"), 10.0);
+        assert_eq!(pnl_multiplier_per_lot("GOLDTEN"), 1.0);
+        assert_eq!(futures_margin_per_lot(100_000.0, "GOLD", 10.0), 1_000_000.0);
+        assert_eq!(futures_margin_per_lot(100_000.0, "GOLDM", 10.0), 100_000.0);
+        assert_eq!(futures_margin_per_lot(100_000.0, "GOLDTEN", 10.0), 10_000.0);
     }
 
     #[test]
@@ -2961,7 +2997,16 @@ mod tests {
             ),
         ];
 
-        let (trades, summary) = simulate(&intraday, &daily, 10, 2, 10.0, Some(12.0), Some(12.0));
+        let (trades, summary) = simulate(
+            &intraday,
+            &daily,
+            "GOLDTEN",
+            10,
+            2,
+            10.0,
+            Some(12.0),
+            Some(12.0),
+        );
 
         assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].exit_reason, "SL2");
@@ -3004,6 +3049,7 @@ mod tests {
         let (trades, summary) = simulate(
             &intraday,
             &daily,
+            "GOLDTEN",
             10,
             1,
             10.0,
@@ -3016,7 +3062,10 @@ mod tests {
         assert_eq!(trades[0].quantity, 10);
         assert!((trades[0].realized_pnl - expected).abs() < 1e-9);
         assert_eq!(summary["pnl_multiplier_per_lot"], 1.0);
-        assert_eq!(summary["pnl_model"], "goldten_points_x_lots");
+        assert_eq!(
+            summary["pnl_model"],
+            "gold_price_points_x_contract_value_x_lots"
+        );
         assert_eq!(trades[0].levels["contract_lot_size"], 10);
         assert_eq!(trades[0].levels["partial_exit_quantity"], 10);
         assert_eq!(trades[0].levels["final_leg_quantity"], 0);
@@ -3061,6 +3110,7 @@ mod tests {
         let (trades, summary) = simulate(
             &intraday,
             &daily,
+            "GOLDTEN",
             10,
             1,
             10.0,

@@ -29,13 +29,17 @@ describe("BacktestingPage", () => {
     vi.clearAllMocks();
   });
 
-  it("keeps the existing GOLDTEN breakout backtest available", async () => {
+  it("offers all supported gold futures breakout instruments", async () => {
     apiClient.get.mockResolvedValue({ data: { runs: [] } });
     const user = userEvent.setup();
     render(<BacktestingPage />);
 
     await user.selectOptions(screen.getByLabelText("Strategy"), "futures_breakout_v3");
     expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDTEN");
+    expect(screen.getByRole("option", { name: "GOLDM · Gold Mini" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "GOLD · Gold" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Instrument"), "GOLDM");
+    expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDM");
     expect(screen.queryByLabelText("Stop loss %")).not.toBeInTheDocument();
   });
 

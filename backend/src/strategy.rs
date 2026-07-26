@@ -3,6 +3,10 @@ use crate::{
     auth::AuthUser,
     credentials::BrokerCredentials,
     error::{AppError, AppResult},
+    instruments::{
+        FUTURES_BREAKOUT_INSTRUMENTS, futures_breakout_label, futures_pnl_units,
+        is_futures_breakout_instrument,
+    },
     risk,
     state::AppState,
 };
@@ -28,7 +32,6 @@ use uuid::Uuid;
 
 pub const STRATEGY_KEY: &str = "futures_breakout_v3";
 pub const OPTION_ENTRY_STRATEGY_KEY: &str = "option_entry_v1";
-const SUPPORTED_INSTRUMENTS: [&str; 1] = ["GOLDTEN"];
 const SENSEX_INDEX_TOKEN: &str = "99919000";
 const OPTION_INTERVAL: &str = "FIVE_MINUTE";
 const OPTION_MIN_PREMIUM: f64 = 220.0;
@@ -741,39 +744,20 @@ async fn load_snapshot(
         .await?)
 }
 
-async fn ensure_contract_metadata(
-    state: &AppState,
-    instrument: &str,
-    date: NaiveDate,
-) -> AppResult<Snapshot> {
-    if let Some(snapshot) = load_snapshot(state, instrument, date).await?
-        && snapshot.contract_token.is_some()
+fn has_contract_metadata(snapshot: &Snapshot) -> bool {
+    snapshot.contract_token.is_some()
         && snapshot.contract_symbol.is_some()
         && snapshot.contract_expiry.is_some()
         && snapshot.lot_size.is_some()
-    {
-        return Ok(snapshot);
-    }
-    let contracts: Vec<MasterContract> = state
-        .http
-        .get(MASTER_URL)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!(
-                "Unable to download Angel One contract master: {error}"
-            ))
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            AppError::BadRequest(format!("Angel One contract master failed: {error}"))
-        })?
-        .json()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!("Invalid Angel One contract master: {error}"))
-        })?;
-    let (contract, expiry) = select_contract(&contracts, instrument, date).ok_or_else(|| {
+}
+
+async fn upsert_contract_metadata(
+    state: &AppState,
+    contracts: &[MasterContract],
+    instrument: &str,
+    date: NaiveDate,
+) -> AppResult<Snapshot> {
+    let (contract, expiry) = select_contract(contracts, instrument, date).ok_or_else(|| {
         AppError::BadRequest(format!(
             "No eligible MCX {instrument} FUTCOM contract is at least 10 trading days from expiry."
         ))
@@ -797,6 +781,45 @@ async fn ensure_contract_metadata(
     )
     .await;
     Ok(snapshot)
+}
+
+async fn ensure_contract_metadata(
+    state: &AppState,
+    instrument: &str,
+    date: NaiveDate,
+) -> AppResult<Snapshot> {
+    if let Some(snapshot) = load_snapshot(state, instrument, date).await?
+        && has_contract_metadata(&snapshot)
+    {
+        return Ok(snapshot);
+    }
+    let contracts = load_contract_master(state).await?;
+    upsert_contract_metadata(state, &contracts, instrument, date).await
+}
+
+async fn ensure_supported_contract_metadata(
+    state: &AppState,
+    date: NaiveDate,
+) -> AppResult<HashMap<String, Snapshot>> {
+    let mut snapshots = HashMap::new();
+    let mut missing = Vec::new();
+    for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
+        match load_snapshot(state, instrument, date).await? {
+            Some(snapshot) if has_contract_metadata(&snapshot) => {
+                snapshots.insert(instrument.to_string(), snapshot);
+            }
+            _ => missing.push(instrument),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(snapshots);
+    }
+    let contracts = load_contract_master(state).await?;
+    for instrument in missing {
+        let snapshot = upsert_contract_metadata(state, &contracts, instrument, date).await?;
+        snapshots.insert(instrument.to_string(), snapshot);
+    }
+    Ok(snapshots)
 }
 
 async fn create_snapshot(
@@ -2228,8 +2251,8 @@ pub fn start(state: AppState) {
             tracing::warn!(%error, "could not recover interrupted scheduler runs");
         }
         let startup_date = ist_now().date_naive();
-        for instrument in SUPPORTED_INSTRUMENTS {
-            if let Err(error) = ensure_contract_metadata(&state, instrument, startup_date).await {
+        if let Err(error) = ensure_supported_contract_metadata(&state, startup_date).await {
+            for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
                 tracing::warn!(%instrument, %error, "startup contract selection failed");
                 operational_alert(
                     &state,
@@ -2255,13 +2278,11 @@ pub fn start(state: AppState) {
                     .bind(date).execute(&state.db).await {
                 tracing::warn!(%error, "could not expire prior-day strategy orders");
             }
-            for instrument in SUPPORTED_INSTRUMENTS {
-                if dispatched.insert(format!("{date}:contract:{instrument}")) {
-                    let cloned = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            ensure_contract_metadata(&cloned, instrument, date).await
-                        {
+            if dispatched.insert(format!("{date}:contracts")) {
+                let cloned = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = ensure_supported_contract_metadata(&cloned, date).await {
+                        for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
                             tracing::warn!(%instrument, %error, "daily contract selection failed");
                             operational_alert(
                                 &cloned,
@@ -2273,8 +2294,8 @@ pub fn start(state: AppState) {
                             )
                             .await;
                         }
-                    });
-                }
+                    }
+                });
             }
             let day_open = session_is_open(&state, date, "day")
                 .await
@@ -2285,13 +2306,12 @@ pub fn start(state: AppState) {
                 .unwrap_or((false, String::new()))
                 .0;
             if (now.hour(), now.minute()) >= (8, 30) && (day_open || evening_open) {
-                for instrument in SUPPORTED_INSTRUMENTS {
-                    let ready = load_snapshot(&state, instrument, date)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|snapshot| snapshot.status == "ready");
-                    if !ready
+                for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
+                    let snapshot = load_snapshot(&state, instrument, date).await.ok().flatten();
+                    let metadata_ready = snapshot.as_ref().is_some_and(has_contract_metadata);
+                    let levels_ready = snapshot.is_some_and(|snapshot| snapshot.status == "ready");
+                    if metadata_ready
+                        && !levels_ready
                         && dispatched.insert(format!(
                             "{date}:levels:{instrument}:{}:{}",
                             now.hour(),
@@ -2323,7 +2343,7 @@ pub fn start(state: AppState) {
                     }
                 }
             }
-            for instrument in SUPPORTED_INSTRUMENTS {
+            for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
                 if let Err(error) = schedule_session(&state, now, instrument, "day", 9).await {
                     tracing::warn!(%instrument, %error, "day scheduler failed");
                 }
@@ -2378,7 +2398,11 @@ pub fn refresh_after_broker_connect(state: AppState) {
         if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
             return;
         }
-        for instrument in SUPPORTED_INSTRUMENTS {
+        if let Err(error) = ensure_supported_contract_metadata(&state, now.date_naive()).await {
+            tracing::warn!(%error, "broker-connect contract selection failed");
+            return;
+        }
+        for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
             let result = if (now.hour(), now.minute()) >= (8, 30) {
                 create_snapshot(&state, instrument, now.date_naive()).await
             } else {
@@ -3219,11 +3243,7 @@ fn trade_pnl(direction: &str, entry: f64, exit: f64, units: f64) -> f64 {
 }
 
 fn runtime_pnl_units(instrument: &str, quantity: i32, lot_size: Option<i32>) -> f64 {
-    if instrument == "GOLDTEN" {
-        quantity.max(0) as f64 / lot_size.unwrap_or(1).max(1) as f64
-    } else {
-        quantity.max(0) as f64
-    }
+    futures_pnl_units(instrument, quantity, lot_size)
 }
 
 fn required_exit_level(value: Option<f64>, label: &str) -> AppResult<f64> {
@@ -4547,11 +4567,11 @@ pub async fn catalog(
     let user = user.id;
     let active = activation_state(&state, user).await?;
     let option_active = activation_state_for(&state, user, OPTION_ENTRY_STRATEGY_KEY).await?;
-    let config: Option<(bool, i32, bool, bool)> = sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument='GOLDTEN'")
-        .bind(user).bind(STRATEGY_KEY).fetch_optional(&state.db).await?;
+    let configs: Vec<(String, bool, i32, bool, bool)> = sqlx::query_as("SELECT instrument,enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2")
+        .bind(user).bind(STRATEGY_KEY).fetch_all(&state.db).await?;
     let option_config: Option<(bool, i32, bool, bool)> = sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument='SENSEX'")
         .bind(user).bind(OPTION_ENTRY_STRATEGY_KEY).fetch_optional(&state.db).await?;
-    let snapshot = Some(ensure_contract_metadata(&state, "GOLDTEN", ist_now().date_naive()).await?);
+    let snapshots = ensure_supported_contract_metadata(&state, ist_now().date_naive()).await?;
     // The strategy card is a current-status surface, not an incident log. Keep the
     // complete event history in strategy_events/logs and return only the newest
     // recent alert here so resolved retries do not clutter the trading controls.
@@ -4559,7 +4579,25 @@ pub async fn catalog(
         .bind(STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
     let runs: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('instrument',instrument,'session',session_key,'action',action,'status',status,'attempts',attempts,'scheduled_for',scheduled_for,'last_error',last_error,'updated_at',updated_at) FROM strategy_scheduler_runs WHERE strategy_key=$1 AND trade_date=$2 ORDER BY scheduled_for,action")
         .bind(STRATEGY_KEY).bind(ist_now().date_naive()).fetch_all(&state.db).await?;
-    let instrument = config.unwrap_or((false, 1, true, true));
+    let breakout_instruments: Vec<Value> = FUTURES_BREAKOUT_INSTRUMENTS
+        .iter()
+        .map(|instrument| {
+            let config = configs
+                .iter()
+                .find(|config| config.0 == *instrument)
+                .map(|config| (config.1, config.2, config.3, config.4))
+                .unwrap_or((false, 1, true, true));
+            json!({
+                "instrument":instrument,
+                "label":futures_breakout_label(instrument),
+                "enabled":config.0,
+                "lots":config.1,
+                "run_day_session":config.2,
+                "run_evening_session":config.3,
+                "snapshot":snapshots.get(*instrument)
+            })
+        })
+        .collect();
     let option_instrument = option_config.unwrap_or((false, 1, true, false));
     let breakout = json!({
         "key":STRATEGY_KEY,
@@ -4568,15 +4606,7 @@ pub async fn catalog(
         "active":active,
         "operational_alerts":alerts,
         "scheduler_runs":runs,
-        "instruments":[{
-            "instrument":"GOLDTEN",
-            "label":"Gold Futures",
-            "enabled":instrument.0,
-            "lots":instrument.1,
-            "run_day_session":instrument.2,
-            "run_evening_session":instrument.3,
-            "snapshot":snapshot
-        }]
+        "instruments":breakout_instruments
     });
     let option_alerts: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1")
         .bind(OPTION_ENTRY_STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
@@ -4724,9 +4754,9 @@ pub async fn update(
         })
         .trim()
         .to_uppercase();
-    if strategy_key == STRATEGY_KEY && instrument != "GOLDTEN" {
+    if strategy_key == STRATEGY_KEY && !is_futures_breakout_instrument(&instrument) {
         return Err(AppError::BadRequest(
-            "Futures Breakout supports only GOLDTEN.".into(),
+            "Futures Breakout supports GOLD, GOLDM, and GOLDTEN.".into(),
         ));
     }
     if strategy_key == OPTION_ENTRY_STRATEGY_KEY && instrument != "SENSEX" {
@@ -4780,6 +4810,11 @@ pub async fn status(
         .instrument
         .unwrap_or_else(|| "GOLDTEN".into())
         .to_uppercase();
+    if !is_futures_breakout_instrument(&instrument) {
+        return Err(AppError::BadRequest(
+            "Futures Breakout supports GOLD, GOLDM, and GOLDTEN.".into(),
+        ));
+    }
     let config:Option<(bool,i32,bool,bool)>=sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument=$3").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await?;
     let strategy_active = activation_state(&state, user).await?;
     let snapshot = load_snapshot(&state, &instrument, ist_now().date_naive()).await?;
@@ -4820,17 +4855,21 @@ async fn events_socket(mut socket: WebSocket, state: AppState, user_id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn contract(expiry: &str) -> MasterContract {
+    fn contract_for(instrument: &str, expiry: &str, lot_size: i32) -> MasterContract {
         MasterContract {
             token: "1".into(),
-            symbol: format!("GOLDTEN{expiry}FUT"),
-            name: "GOLDTEN".into(),
+            symbol: format!("{instrument}{expiry}FUT"),
+            name: instrument.into(),
             expiry: expiry.into(),
             strike: "0.000000".into(),
-            lotsize: "1".into(),
+            lotsize: lot_size.to_string(),
             instrumenttype: "FUTCOM".into(),
             exch_seg: "MCX".into(),
         }
+    }
+
+    fn contract(expiry: &str) -> MasterContract {
+        contract_for("GOLDTEN", expiry, 10)
     }
     #[test]
     fn formulas_match_v3() {
@@ -4959,6 +4998,22 @@ mod tests {
         .unwrap();
         assert_eq!(selected.1, NaiveDate::from_ymd_opt(2026, 7, 31).unwrap());
     }
+
+    #[test]
+    fn selects_each_supported_gold_contract_independently() {
+        let items = vec![
+            contract_for("GOLD", "31AUG2026", 1),
+            contract_for("GOLDM", "31AUG2026", 100),
+            contract_for("GOLDTEN", "31AUG2026", 10),
+        ];
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        for (instrument, lot_size) in [("GOLD", 1), ("GOLDM", 100), ("GOLDTEN", 10)] {
+            let selected = select_contract(&items, instrument, date).unwrap();
+            assert_eq!(selected.0.name, instrument);
+            assert_eq!(parse_lot_size(&selected.0.lotsize), Some(lot_size));
+        }
+    }
+
     #[test]
     fn target_lot_split() {
         for (lots, closed) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
@@ -5019,7 +5074,9 @@ mod tests {
     }
 
     #[test]
-    fn goldten_runtime_pnl_uses_lots_not_broker_quantity() {
+    fn gold_runtime_pnl_uses_each_contract_point_value() {
+        assert_eq!(runtime_pnl_units("GOLD", 4, Some(1)), 400.0);
+        assert_eq!(runtime_pnl_units("GOLDM", 400, Some(100)), 40.0);
         assert_eq!(runtime_pnl_units("GOLDTEN", 40, Some(10)), 4.0);
         assert_eq!(
             trade_pnl(
