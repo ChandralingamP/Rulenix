@@ -2278,7 +2278,22 @@ pub fn start(state: AppState) {
                     .bind(date).execute(&state.db).await {
                 tracing::warn!(%error, "could not expire prior-day strategy orders");
             }
-            if dispatched.insert(format!("{date}:contracts")) {
+            let mut contracts_ready = true;
+            for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
+                let ready = load_snapshot(&state, instrument, date)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|snapshot| has_contract_metadata(&snapshot));
+                contracts_ready &= ready;
+            }
+            if !contracts_ready
+                && dispatched.insert(format!(
+                    "{date}:contracts:{}:{}",
+                    now.hour(),
+                    now.minute() / 5
+                ))
+            {
                 let cloned = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = ensure_supported_contract_metadata(&cloned, date).await {
