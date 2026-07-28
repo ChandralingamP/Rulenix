@@ -146,6 +146,24 @@ describe("BacktestingPage", () => {
               ],
             },
           },
+          {
+            id: "e58de456-1d30-4378-a881-dfd08c876a44",
+            direction: "BUY",
+            entry_time: "2026-07-12T03:45:00Z",
+            entry_price: 101.12,
+            exit_time: "2026-07-12T05:00:00Z",
+            exit_price: 102,
+            lots: 1,
+            quantity: 10,
+            realized_pnl: 88,
+            exit_reason: "END_OF_TEST",
+            levels: {
+              entry_reason: "BREAKOUT",
+              entry_source: "OPENING_RANGE",
+              gap_direction: "UP",
+              exit_events: [],
+            },
+          },
         ],
       },
     });
@@ -155,9 +173,10 @@ describe("BacktestingPage", () => {
     await user.click(screen.getByRole("button", { name: "Run backtest" }));
 
     expect(await screen.findByText("SL2 reversal")).toBeInTheDocument();
+    expect(screen.getByText("15 min gap breakout")).toBeInTheDocument();
     expect(screen.getByText(/TP1 1 lot @ 96/)).toBeInTheDocument();
     expect(screen.getByText(/1 lot remains/)).toBeInTheDocument();
     expect(screen.getByText(/SL2 1 lot @ 98/)).toBeInTheDocument();
-    expect(screen.getByText(/position closed/)).toBeInTheDocument();
+    expect(screen.getAllByText(/position closed/).length).toBeGreaterThan(0);
   });
 });

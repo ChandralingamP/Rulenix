@@ -50,6 +50,11 @@ function tradeSymbolLabel(trade, fallback) {
 function tradeEntryReason(trade, strategyKey) {
   const reason = trade?.levels?.entry_reason;
   if (reason === "SL2_REVERSAL") return "SL2 reversal";
+  if (trade?.levels?.entry_source === "OPENING_RANGE") {
+    return "15 min gap breakout";
+  }
+  if (trade?.levels?.gap_direction === "UP") return "Gap-up breakout";
+  if (trade?.levels?.gap_direction === "DOWN") return "Gap-down breakout";
   return strategyKey === "option_entry_v1" ? "Option signal" : "Breakout";
 }
 

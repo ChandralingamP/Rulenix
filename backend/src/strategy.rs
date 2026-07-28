@@ -170,6 +170,19 @@ pub struct Snapshot {
     pub sell_target: Option<f64>,
     pub sell_sl1: Option<f64>,
     pub sell_sl2: Option<f64>,
+    pub previous_close: Option<f64>,
+    pub market_open: Option<f64>,
+    pub gap_direction: Option<String>,
+    pub entry_direction: Option<String>,
+    pub entry_source: Option<String>,
+    pub gap_plan_status: Option<String>,
+    pub opening_range_high: Option<f64>,
+    pub opening_range_low: Option<f64>,
+    pub planned_entry: Option<f64>,
+    pub planned_target: Option<f64>,
+    pub planned_sl1: Option<f64>,
+    pub planned_sl2: Option<f64>,
+    pub gap_planned_at: Option<DateTime<Utc>>,
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -194,6 +207,89 @@ pub(crate) struct FuturesExitLevels {
     pub target: f64,
     pub sl1: f64,
     pub sl2: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuturesGapDirection {
+    Up,
+    Down,
+    Flat,
+}
+
+impl FuturesGapDirection {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+            Self::Flat => "FLAT",
+        }
+    }
+
+    pub(crate) fn entry_direction(self) -> &'static str {
+        match self {
+            Self::Up => "BUY",
+            Self::Down => "SELL",
+            Self::Flat => "BOTH",
+        }
+    }
+}
+
+pub(crate) fn futures_gap_direction(
+    previous_close: f64,
+    market_open: f64,
+) -> Option<FuturesGapDirection> {
+    if !previous_close.is_finite()
+        || previous_close <= 0.0
+        || !market_open.is_finite()
+        || market_open <= 0.0
+    {
+        return None;
+    }
+    Some(if market_open > previous_close {
+        FuturesGapDirection::Up
+    } else if market_open < previous_close {
+        FuturesGapDirection::Down
+    } else {
+        FuturesGapDirection::Flat
+    })
+}
+
+pub(crate) fn futures_gap_entry_was_jumped(
+    gap: FuturesGapDirection,
+    market_open: f64,
+    buy_entry: f64,
+    sell_entry: f64,
+) -> Option<bool> {
+    if [market_open, buy_entry, sell_entry]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    Some(match gap {
+        FuturesGapDirection::Up => market_open >= buy_entry,
+        FuturesGapDirection::Down => market_open <= sell_entry,
+        FuturesGapDirection::Flat => false,
+    })
+}
+
+pub(crate) fn futures_opening_range_entry(
+    gap: FuturesGapDirection,
+    opening_range_high: f64,
+    opening_range_low: f64,
+) -> Option<f64> {
+    if [opening_range_high, opening_range_low]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || opening_range_high < opening_range_low
+    {
+        return None;
+    }
+    match gap {
+        FuturesGapDirection::Up => Some(opening_range_high * (1.0 + 0.0012)),
+        FuturesGapDirection::Down => Some(opening_range_low * (1.0 - 0.0012)),
+        FuturesGapDirection::Flat => None,
+    }
 }
 
 pub(crate) fn futures_exit_levels_for_entry(
@@ -632,6 +728,16 @@ fn quote_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<Strin
     })
 }
 
+fn quote_number(map: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
+    map.get(key)
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 fn quote_price(map: &serde_json::Map<String, Value>) -> Option<f64> {
     for key in [
         "ltp",
@@ -641,9 +747,7 @@ fn quote_price(map: &serde_json::Map<String, Value>) -> Option<f64> {
         "last_price",
         "close",
     ] {
-        if let Some(price) = map.get(key).and_then(Value::as_f64)
-            && price > 0.0
-        {
+        if let Some(price) = quote_number(map, key) {
             return Some(price);
         }
     }
@@ -675,6 +779,37 @@ fn collect_quote_ltps(value: &Value, prices: &mut HashMap<String, f64>) {
 fn extract_quote_ltps(value: &Value) -> HashMap<String, f64> {
     let mut prices = HashMap::new();
     collect_quote_ltps(value, &mut prices);
+    prices
+}
+
+fn collect_quote_opens(value: &Value, prices: &mut HashMap<String, f64>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_quote_opens(value, prices);
+            }
+        }
+        Value::Object(map) => {
+            let token = ["symbolToken", "symboltoken", "symbol_token", "token"]
+                .iter()
+                .find_map(|key| quote_string(map, key));
+            let open = ["open", "openPrice", "open_price", "open_price_of_the_day"]
+                .iter()
+                .find_map(|key| quote_number(map, key));
+            if let (Some(token), Some(open)) = (token, open) {
+                prices.insert(token, open);
+            }
+            for value in map.values() {
+                collect_quote_opens(value, prices);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_quote_opens(value: &Value) -> HashMap<String, f64> {
+    let mut prices = HashMap::new();
+    collect_quote_opens(value, &mut prices);
     prices
 }
 
@@ -786,7 +921,7 @@ fn parse_intraday_candles(raw: &Value) -> Vec<IntradayCandle> {
 }
 
 fn snapshot_select() -> &'static str {
-    "SELECT id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,fetched_at FROM strategy_market_snapshots"
+    "SELECT id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,previous_close,market_open,gap_direction,entry_direction,entry_source,gap_plan_status,opening_range_high,opening_range_low,planned_entry,planned_target,planned_sl1,planned_sl2,gap_planned_at,fetched_at FROM strategy_market_snapshots"
 }
 
 async fn load_snapshot(
@@ -891,6 +1026,9 @@ async fn create_snapshot(
 ) -> AppResult<Snapshot> {
     if let Some(snapshot) = load_snapshot(state, instrument, date).await?
         && snapshot.status == "ready"
+        && snapshot
+            .previous_close
+            .is_some_and(|value| value.is_finite() && value > 0.0)
     {
         return Ok(snapshot);
     }
@@ -941,7 +1079,7 @@ async fn create_snapshot(
             return Err(error);
         }
     };
-    let mut candles: Vec<(NaiveDate, f64, f64)> = raw
+    let mut candles: Vec<(NaiveDate, f64, f64, f64)> = raw
         .as_array()
         .into_iter()
         .flatten()
@@ -956,7 +1094,18 @@ async fn create_snapshot(
                 .get(3)?
                 .as_f64()
                 .or_else(|| values.get(3)?.as_str()?.parse().ok())?;
-            (day < date && high.is_finite() && low.is_finite()).then_some((day, high, low))
+            let close = values
+                .get(4)?
+                .as_f64()
+                .or_else(|| values.get(4)?.as_str()?.parse().ok())?;
+            (day < date
+                && high.is_finite()
+                && high > 0.0
+                && low.is_finite()
+                && low > 0.0
+                && close.is_finite()
+                && close > 0.0)
+                .then_some((day, high, low, close))
         })
         .collect();
     candles.sort_by_key(|row| row.0);
@@ -968,6 +1117,7 @@ async fn create_snapshot(
     let dates: Vec<NaiveDate> = candles.iter().map(|row| row.0).collect();
     let highs: Vec<f64> = candles.iter().map(|row| row.1).collect();
     let lows: Vec<f64> = candles.iter().map(|row| row.2).collect();
+    let previous_close = candles.last().map(|row| row.3);
     let levels = calculate(&highs, &lows);
     let status = if levels.is_some() { "ready" } else { "missing" };
     let error = (levels.is_none()).then(|| {
@@ -976,13 +1126,14 @@ async fn create_snapshot(
             candles.len()
         )
     });
-    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,fetched_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status=EXCLUDED.status,error=EXCLUDED.error,contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,candle_dates=EXCLUDED.candle_dates,highs=EXCLUDED.highs,lows=EXCLUDED.lows,hh2=EXCLUDED.hh2,ll2=EXCLUDED.ll2,hh4=EXCLUDED.hh4,ll4=EXCLUDED.ll4,buy_entry=EXCLUDED.buy_entry,buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,buy_sl2=EXCLUDED.buy_sl2,sell_entry=EXCLUDED.sell_entry,sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,sell_sl2=EXCLUDED.sell_sl2,fetched_at=NOW()")
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,candle_dates,highs,lows,hh2,ll2,hh4,ll4,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2,previous_close,fetched_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status=EXCLUDED.status,error=EXCLUDED.error,contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,candle_dates=EXCLUDED.candle_dates,highs=EXCLUDED.highs,lows=EXCLUDED.lows,hh2=EXCLUDED.hh2,ll2=EXCLUDED.ll2,hh4=EXCLUDED.hh4,ll4=EXCLUDED.ll4,buy_entry=EXCLUDED.buy_entry,buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,buy_sl2=EXCLUDED.buy_sl2,sell_entry=EXCLUDED.sell_entry,sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,sell_sl2=EXCLUDED.sell_sl2,previous_close=EXCLUDED.previous_close,fetched_at=NOW()")
         .bind(id).bind(STRATEGY_KEY).bind(instrument).bind(date).bind(status).bind(&error)
         .bind(token).bind(symbol).bind(expiry).bind(lot_size)
         .bind(&dates).bind(&highs).bind(&lows)
         .bind(levels.map(|v|v.hh2)).bind(levels.map(|v|v.ll2)).bind(levels.map(|v|v.hh4)).bind(levels.map(|v|v.ll4))
         .bind(levels.map(|v|v.buy_entry)).bind(levels.map(|v|v.buy_target)).bind(levels.map(|v|v.buy_sl1)).bind(levels.map(|v|v.buy_sl2))
         .bind(levels.map(|v|v.sell_entry)).bind(levels.map(|v|v.sell_target)).bind(levels.map(|v|v.sell_sl1)).bind(levels.map(|v|v.sell_sl2))
+        .bind(previous_close)
         .execute(&state.db).await?;
     let snapshot = load_snapshot(state, instrument, date)
         .await?
@@ -1004,9 +1155,381 @@ async fn connected_market_credentials(state: &AppState) -> AppResult<(Uuid, Brok
     )
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| AppError::BadRequest("No connected Angel One session is available for the option strategy.".into()))?;
+    .ok_or_else(|| {
+        AppError::BadRequest(
+            "No connected Angel One session is available for shared market data.".into(),
+        )
+    })?;
     let credentials = state.credentials.load(profile_id).await?;
     Ok((profile_id, credentials))
+}
+
+async fn first_session_open(
+    state: &AppState,
+    profile_id: Uuid,
+    credentials: &BrokerCredentials,
+    snapshot: &Snapshot,
+) -> AppResult<f64> {
+    let token = snapshot
+        .contract_token
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Selected contract token is missing.".into()))?;
+    let date = snapshot.trade_date;
+    let raw = angel::get_candles_with_exchange_interval(
+        state,
+        &credentials.api_key,
+        &credentials.jwt_token,
+        &snapshot.exchange_segment,
+        token,
+        "ONE_MINUTE",
+        &format!("{} 09:00", date.format("%Y-%m-%d")),
+        &format!("{} 09:02", date.format("%Y-%m-%d")),
+    )
+    .await;
+    let raw = match raw {
+        Ok(value) => value,
+        Err(error) => {
+            if angel::is_invalid_api_key_error(&error.to_string()) {
+                crate::home::mark_invalid(
+                    state,
+                    profile_id,
+                    "Angel One API token is invalid. Please establish the broker connection again.",
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
+    parse_intraday_candles(&raw)
+        .into_iter()
+        .find(|candle| {
+            candle.at.date() == date
+                && candle.at.time() == NaiveTime::from_hms_opt(9, 0, 0).expect("valid market open")
+        })
+        .map(|candle| candle.open)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Angel One returned no 09:00 open for {}.",
+                snapshot.instrument
+            ))
+        })
+}
+
+async fn ensure_futures_gap_plans(
+    state: &AppState,
+    date: NaiveDate,
+    required_instrument: &str,
+) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("rulenix:futures-gap-plan:{date}"))
+        .execute(&mut *tx)
+        .await?;
+    let query = format!(
+        "{} WHERE strategy_key=$1 AND trade_date=$2 ORDER BY instrument",
+        snapshot_select()
+    );
+    let snapshots: Vec<Snapshot> = sqlx::query_as(&query)
+        .bind(STRATEGY_KEY)
+        .bind(date)
+        .fetch_all(&mut *tx)
+        .await?;
+    let pending: Vec<Snapshot> = snapshots
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot.status == "ready"
+                && snapshot
+                    .previous_close
+                    .is_some_and(|value| value.is_finite() && value > 0.0)
+                && !matches!(
+                    snapshot.gap_plan_status.as_deref(),
+                    Some("READY" | "WAITING_RANGE")
+                )
+        })
+        .collect();
+    if pending.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    let (profile_id, credentials) = connected_market_credentials(state).await?;
+    let tokens: Vec<String> = pending
+        .iter()
+        .filter_map(|snapshot| snapshot.contract_token.clone())
+        .collect();
+    if tokens.is_empty() {
+        return Err(AppError::BadRequest(
+            "No selected futures contract tokens are available for the gap plan.".into(),
+        ));
+    }
+    let quote = angel::market_quote(
+        state,
+        &credentials.api_key,
+        &credentials.jwt_token,
+        "FULL",
+        json!({"MCX":tokens}),
+    )
+    .await;
+    let quote = match quote {
+        Ok(value) => value,
+        Err(error) => {
+            if angel::is_invalid_api_key_error(&error.to_string()) {
+                crate::home::mark_invalid(
+                    state,
+                    profile_id,
+                    "Angel One API token is invalid. Please establish the broker connection again.",
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
+    let market_opens = extract_quote_opens(&quote);
+    let mut planned = Vec::new();
+    let mut errors = HashMap::new();
+    for snapshot in pending {
+        let plan = async {
+            let token = snapshot.contract_token.as_deref().ok_or_else(|| {
+                AppError::BadRequest("Selected contract token is missing.".into())
+            })?;
+            let market_open = match market_opens.get(token).copied() {
+                Some(value) => value,
+                None => first_session_open(state, profile_id, &credentials, &snapshot).await?,
+            };
+            let previous_close = required_exit_level(snapshot.previous_close, "previous close")?;
+            let buy_entry = required_exit_level(snapshot.buy_entry, "buy entry")?;
+            let sell_entry = required_exit_level(snapshot.sell_entry, "sell entry")?;
+            let gap = futures_gap_direction(previous_close, market_open).ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "Could not calculate a valid gap direction for {}.",
+                    snapshot.instrument
+                ))
+            })?;
+            let jumped = futures_gap_entry_was_jumped(gap, market_open, buy_entry, sell_entry)
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "Could not validate the entry jump for {}.",
+                        snapshot.instrument
+                    ))
+                })?;
+            let direction = gap.entry_direction();
+            let (source, status, entry, exits) = if jumped {
+                ("OPENING_RANGE", "WAITING_RANGE", None, None)
+            } else if gap == FuturesGapDirection::Flat {
+                ("STANDARD", "READY", None, None)
+            } else {
+                let entry = if gap == FuturesGapDirection::Up {
+                    buy_entry
+                } else {
+                    sell_entry
+                };
+                let exits = snapshot_exit_levels(&snapshot, direction, entry, false)?;
+                ("STANDARD", "READY", Some(entry), Some(exits))
+            };
+            Ok::<_, AppError>((
+                market_open,
+                previous_close,
+                gap,
+                direction,
+                source,
+                status,
+                entry,
+                exits,
+            ))
+        };
+        let (market_open, previous_close, gap, direction, source, status, entry, exits) =
+            match plan.await {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.insert(snapshot.instrument.clone(), error.to_string());
+                    continue;
+                }
+            };
+        sqlx::query(
+            "UPDATE strategy_market_snapshots
+             SET market_open=$2,gap_direction=$3,entry_direction=$4,entry_source=$5,
+                 gap_plan_status=$6,opening_range_high=NULL,opening_range_low=NULL,
+                 planned_entry=$7,planned_target=$8,planned_sl1=$9,planned_sl2=$10,
+                 gap_planned_at=NOW()
+             WHERE id=$1",
+        )
+        .bind(snapshot.id)
+        .bind(market_open)
+        .bind(gap.as_str())
+        .bind(direction)
+        .bind(source)
+        .bind(status)
+        .bind(entry)
+        .bind(exits.map(|value| value.target))
+        .bind(exits.map(|value| value.sl1))
+        .bind(exits.map(|value| value.sl2))
+        .execute(&mut *tx)
+        .await?;
+        planned.push((
+            snapshot.instrument,
+            json!({
+                "previous_close": previous_close,
+                "market_open": market_open,
+                "gap_direction": gap.as_str(),
+                "entry_direction": direction,
+                "entry_source": source,
+                "status": status,
+                "standard_entry": entry,
+            }),
+        ));
+    }
+    tx.commit().await?;
+    for (instrument, payload) in planned {
+        emit(state, None, &instrument, "gap_entry_plan_updated", payload).await;
+    }
+    match errors.remove(required_instrument) {
+        Some(error) => Err(AppError::BadRequest(error)),
+        None => Ok(()),
+    }
+}
+
+fn snapshot_gap_direction(snapshot: &Snapshot) -> AppResult<FuturesGapDirection> {
+    match snapshot.gap_direction.as_deref() {
+        Some("UP") => Ok(FuturesGapDirection::Up),
+        Some("DOWN") => Ok(FuturesGapDirection::Down),
+        Some("FLAT") => Ok(FuturesGapDirection::Flat),
+        _ => Err(AppError::BadRequest(format!(
+            "{} has no valid futures gap direction.",
+            snapshot.instrument
+        ))),
+    }
+}
+
+async fn resolve_futures_opening_range_plan(
+    state: &AppState,
+    snapshot: &Snapshot,
+) -> AppResult<Snapshot> {
+    if snapshot.gap_plan_status.as_deref() == Some("READY") {
+        return Ok(snapshot.clone());
+    }
+    if snapshot.gap_plan_status.as_deref() != Some("WAITING_RANGE") {
+        return Err(AppError::BadRequest(format!(
+            "{} has no opening-range entry pending.",
+            snapshot.instrument
+        )));
+    }
+    let (profile_id, credentials) = connected_market_credentials(state).await?;
+    let token = snapshot
+        .contract_token
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Selected contract token is missing.".into()))?;
+    let date = snapshot.trade_date;
+    let raw = angel::get_candles_with_exchange_interval(
+        state,
+        &credentials.api_key,
+        &credentials.jwt_token,
+        &snapshot.exchange_segment,
+        token,
+        "FIFTEEN_MINUTE",
+        &format!("{} 09:00", date.format("%Y-%m-%d")),
+        &format!("{} 09:15", date.format("%Y-%m-%d")),
+    )
+    .await;
+    let raw = match raw {
+        Ok(value) => value,
+        Err(error) => {
+            if angel::is_invalid_api_key_error(&error.to_string()) {
+                crate::home::mark_invalid(
+                    state,
+                    profile_id,
+                    "Angel One API token is invalid. Please establish the broker connection again.",
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
+    let start = NaiveTime::from_hms_opt(9, 0, 0).expect("valid opening range");
+    let end = NaiveTime::from_hms_opt(9, 15, 0).expect("valid opening range");
+    let opening: Vec<IntradayCandle> = parse_intraday_candles(&raw)
+        .into_iter()
+        .filter(|candle| {
+            candle.at.date() == date && candle.at.time() >= start && candle.at.time() < end
+        })
+        .collect();
+    let opening_range_high = opening
+        .iter()
+        .map(|candle| candle.high)
+        .reduce(f64::max)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Angel One returned no completed 09:00-09:15 range for {}.",
+                snapshot.instrument
+            ))
+        })?;
+    let opening_range_low = opening
+        .iter()
+        .map(|candle| candle.low)
+        .reduce(f64::min)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Angel One returned no completed 09:00-09:15 range for {}.",
+                snapshot.instrument
+            ))
+        })?;
+    let gap = snapshot_gap_direction(snapshot)?;
+    let direction = gap.entry_direction();
+    let entry = futures_opening_range_entry(gap, opening_range_high, opening_range_low)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Could not calculate an opening-range entry for {}.",
+                snapshot.instrument
+            ))
+        })?;
+    let hh2 = required_exit_level(snapshot.hh2, "HH2")?;
+    let ll2 = required_exit_level(snapshot.ll2, "LL2")?;
+    let hh4 = required_exit_level(snapshot.hh4, "HH4")?;
+    let ll4 = required_exit_level(snapshot.ll4, "LL4")?;
+    let exits =
+        futures_exit_levels_for_entry(direction, entry, hh2, ll2, hh4, ll4).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Could not calculate opening-range exit levels for {}.",
+                snapshot.instrument
+            ))
+        })?;
+    sqlx::query(
+        "UPDATE strategy_market_snapshots
+         SET opening_range_high=$2,opening_range_low=$3,planned_entry=$4,
+             planned_target=$5,planned_sl1=$6,planned_sl2=$7,
+             gap_plan_status='READY',gap_planned_at=NOW()
+         WHERE id=$1 AND gap_plan_status='WAITING_RANGE'",
+    )
+    .bind(snapshot.id)
+    .bind(opening_range_high)
+    .bind(opening_range_low)
+    .bind(entry)
+    .bind(exits.target)
+    .bind(exits.sl1)
+    .bind(exits.sl2)
+    .execute(&state.db)
+    .await?;
+    let resolved = load_snapshot(state, &snapshot.instrument, date)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Resolved market snapshot is missing.".into()))?;
+    emit(
+        state,
+        None,
+        &snapshot.instrument,
+        "opening_range_entry_ready",
+        json!({
+            "gap_direction": gap.as_str(),
+            "entry_direction": direction,
+            "entry_source": "OPENING_RANGE",
+            "opening_range_high": opening_range_high,
+            "opening_range_low": opening_range_low,
+            "entry": entry,
+            "target": exits.target,
+            "sl1": exits.sl1,
+            "sl2": exits.sl2,
+        }),
+    )
+    .await;
+    Ok(resolved)
 }
 
 async fn load_contract_master(state: &AppState) -> AppResult<Vec<MasterContract>> {
@@ -1621,12 +2144,42 @@ async fn place_entries(
                 .unwrap_or_else(|| "Market snapshot is not ready.".into()),
         ));
     }
-    let buy = snapshot
-        .buy_entry
-        .ok_or_else(|| AppError::BadRequest("Buy entry is missing.".into()))?;
-    let sell = snapshot
-        .sell_entry
-        .ok_or_else(|| AppError::BadRequest("Sell entry is missing.".into()))?;
+    if snapshot.gap_plan_status.as_deref() != Some("READY") {
+        return Err(AppError::BadRequest(format!(
+            "{} gap entry plan is not ready.",
+            snapshot.instrument
+        )));
+    }
+    let orders = match snapshot.entry_direction.as_deref() {
+        Some("BUY") => vec![(
+            "BUY_ENTRY",
+            "BUY",
+            required_exit_level(snapshot.planned_entry, "planned buy entry")?,
+        )],
+        Some("SELL") => vec![(
+            "SELL_ENTRY",
+            "SELL",
+            required_exit_level(snapshot.planned_entry, "planned sell entry")?,
+        )],
+        Some("BOTH") => vec![
+            (
+                "BUY_ENTRY",
+                "BUY",
+                required_exit_level(snapshot.buy_entry, "buy entry")?,
+            ),
+            (
+                "SELL_ENTRY",
+                "SELL",
+                required_exit_level(snapshot.sell_entry, "sell entry")?,
+            ),
+        ],
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "{} gap entry direction is missing.",
+                snapshot.instrument
+            )));
+        }
+    };
     if let Some(token) = snapshot.contract_token.clone() {
         crate::market_ws::ensure_strategy_feed(
             state.clone(),
@@ -1635,40 +2188,26 @@ async fn place_entries(
         )
         .await;
     }
-    place_strategy_order(
-        state,
-        runner,
-        snapshot,
-        session,
-        NewOrder {
-            role: "BUY_ENTRY",
-            side: "BUY",
-            order_type: "STOPLOSS_LIMIT",
-            lots: runner.lots,
-            price: buy,
-            trigger: Some(buy),
-            trade_id: None,
-            quantity: None,
-        },
-    )
-    .await?;
-    place_strategy_order(
-        state,
-        runner,
-        snapshot,
-        session,
-        NewOrder {
-            role: "SELL_ENTRY",
-            side: "SELL",
-            order_type: "STOPLOSS_LIMIT",
-            lots: runner.lots,
-            price: sell,
-            trigger: Some(sell),
-            trade_id: None,
-            quantity: None,
-        },
-    )
-    .await
+    for (role, side, price) in orders {
+        place_strategy_order(
+            state,
+            runner,
+            snapshot,
+            session,
+            NewOrder {
+                role,
+                side,
+                order_type: "STOPLOSS_LIMIT",
+                lots: runner.lots,
+                price,
+                trigger: Some(price),
+                trade_id: None,
+                quantity: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn run_entries(
@@ -1676,7 +2215,23 @@ async fn run_entries(
     instrument: String,
     date: NaiveDate,
     session: &'static str,
+    resolve_opening_range: bool,
 ) -> AppResult<()> {
+    let runners: Vec<Runner> = sqlx::query_as("SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode FROM user_strategy_configs c JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id WHERE c.enabled=TRUE AND a.is_active=TRUE AND c.strategy_key=$1 AND c.instrument=$2 AND u.is_active=TRUE AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))")
+        .bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
+    let runners: Vec<Runner> = runners
+        .into_iter()
+        .filter(|runner| {
+            if session == "day" {
+                runner.run_day_session
+            } else {
+                runner.run_evening_session
+            }
+        })
+        .collect();
+    if runners.is_empty() {
+        return Ok(());
+    }
     let snapshot = create_snapshot(&state, &instrument, date).await?;
     if snapshot.status != "ready" {
         return Err(AppError::BadRequest(
@@ -1685,16 +2240,36 @@ async fn run_entries(
                 .unwrap_or_else(|| "Strategy snapshot is not ready.".into()),
         ));
     }
-    let runners: Vec<Runner> = sqlx::query_as("SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode FROM user_strategy_configs c JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id WHERE c.enabled=TRUE AND a.is_active=TRUE AND c.strategy_key=$1 AND c.instrument=$2 AND u.is_active=TRUE AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))")
-        .bind(STRATEGY_KEY).bind(&instrument).fetch_all(&state.db).await?;
-    let mut tasks = tokio::task::JoinSet::new();
-    for runner in runners.into_iter().filter(|r| {
-        if session == "day" {
-            r.run_day_session
-        } else {
-            r.run_evening_session
+    ensure_futures_gap_plans(&state, date, &instrument).await?;
+    let mut snapshot = load_snapshot(&state, &instrument, date)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Strategy snapshot is missing.".into()))?;
+    if snapshot.gap_plan_status.as_deref() == Some("WAITING_RANGE") {
+        if !resolve_opening_range {
+            emit(
+                &state,
+                None,
+                &instrument,
+                "opening_range_entry_waiting",
+                json!({
+                    "trade_date": date,
+                    "entry_direction": snapshot.entry_direction,
+                    "available_after": "09:15 IST",
+                }),
+            )
+            .await;
+            return Ok(());
         }
-    }) {
+        snapshot = resolve_futures_opening_range_plan(&state, &snapshot).await?;
+    }
+    if snapshot.gap_plan_status.as_deref() != Some("READY") {
+        return Err(AppError::BadRequest(format!(
+            "{} gap entry plan is not ready.",
+            instrument
+        )));
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for runner in runners {
         let state = state.clone();
         let snapshot = snapshot.clone();
         tasks.spawn(async move {
@@ -1980,6 +2555,7 @@ struct OpenTrade {
     remaining_lots: i32,
     total_lots: i32,
     target_done: bool,
+    entry_datetime: Option<DateTime<Utc>>,
     entry_price: f64,
     target_price: Option<f64>,
     reversal_of_trade_id: Option<Uuid>,
@@ -2036,7 +2612,7 @@ async fn place_carry_orders(
                 .unwrap_or_else(|| "Strategy snapshot is not ready.".into()),
         ));
     }
-    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT trade.id,trade.user_id,trade.direction,trade.quantity,trade.remaining_lots,trade.total_lots,EXISTS(SELECT 1 FROM strategy_orders target_order WHERE target_order.trade_id=trade.id AND target_order.role='TARGET' AND target_order.processed_quantity>0) AS target_done,trade.entry_price::float8 AS entry_price,trade.target_price::float8 AS target_price,trade.reversal_of_trade_id,trade.strategy_snapshot_id,trade.instrument_label FROM trades trade WHERE trade.status='open' AND trade.strategy_key=$1 AND trade.instrument_label=$2 AND trade.remaining_lots>0")
+    let trades: Vec<OpenTrade> = sqlx::query_as("SELECT trade.id,trade.user_id,trade.direction,trade.quantity,trade.remaining_lots,trade.total_lots,EXISTS(SELECT 1 FROM strategy_orders target_order WHERE target_order.trade_id=trade.id AND target_order.role='TARGET' AND target_order.processed_quantity>0) AS target_done,trade.entry_datetime,trade.entry_price::float8 AS entry_price,trade.target_price::float8 AS target_price,trade.reversal_of_trade_id,trade.strategy_snapshot_id,trade.instrument_label FROM trades trade WHERE trade.status='open' AND trade.strategy_key=$1 AND trade.instrument_label=$2 AND trade.remaining_lots>0")
         .bind(STRATEGY_KEY).bind(instrument).fetch_all(&state.db).await?;
     let mut errors = Vec::new();
     for trade in trades {
@@ -2047,12 +2623,26 @@ async fn place_carry_orders(
         let Some(exit_role) = carry_exit_role(role, trade.target_done) else {
             continue;
         };
-        let exit_levels = match snapshot_exit_levels(
-            &snapshot,
-            &trade.direction,
-            trade.entry_price,
-            trade.reversal_of_trade_id.is_some(),
-        ) {
+        let entry_date = trade.entry_datetime.map(|value| {
+            value
+                .with_timezone(&FixedOffset::east_opt(19_800).expect("valid IST offset"))
+                .date_naive()
+        });
+        let exit_levels = match if entry_date == Some(date) {
+            snapshot_order_exit_levels(
+                &snapshot,
+                &trade.direction,
+                trade.entry_price,
+                trade.reversal_of_trade_id.is_some(),
+            )
+        } else {
+            snapshot_exit_levels(
+                &snapshot,
+                &trade.direction,
+                trade.entry_price,
+                trade.reversal_of_trade_id.is_some(),
+            )
+        } {
             Ok(levels) => levels,
             Err(error) => {
                 errors.push(error.to_string());
@@ -2205,24 +2795,25 @@ async fn run_scheduled_action(
     let Some(run_id) = claimed else {
         return Ok(());
     };
-    let result = if action == "target" {
-        place_carry_orders(state, date, session, "TARGET", instrument).await
-    } else {
-        let carry = place_carry_orders(state, date, session, "STOP", instrument).await;
-        let entries = run_entries(state.clone(), instrument.to_string(), date, session).await;
-        match (carry, entries) {
-            (Ok(()), Ok(())) => Ok(()),
-            (left, right) => Err(AppError::BadRequest(
-                [
-                    left.err().map(|v| v.to_string()),
-                    right.err().map(|v| v.to_string()),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("; "),
-            )),
+    let result = match action {
+        "target" => place_carry_orders(state, date, session, "TARGET", instrument).await,
+        "stop" => place_carry_orders(state, date, session, "STOP", instrument).await,
+        "entry" => {
+            run_entries(
+                state.clone(),
+                instrument.to_string(),
+                date,
+                session,
+                session == "evening",
+            )
+            .await
         }
+        "gap_entry" => {
+            run_entries(state.clone(), instrument.to_string(), date, session, true).await
+        }
+        _ => Err(AppError::BadRequest(format!(
+            "Unknown strategy scheduler action: {action}"
+        ))),
     };
     match result {
         Ok(()) => {
@@ -2257,7 +2848,11 @@ async fn schedule_session(
     let date = now.date_naive();
     let (open, reason) = session_is_open(state, date, session).await?;
     let current_minute = now.hour() * 60 + now.minute();
-    for (action, minute_offset) in [("target", 0_u32), ("entry", 10_u32)] {
+    let mut actions = vec![("target", 0_u32), ("stop", 10_u32), ("entry", 10_u32)];
+    if session == "day" {
+        actions.push(("gap_entry", 16_u32));
+    }
+    for (action, minute_offset) in actions {
         let due_minute = base_hour * 60 + minute_offset;
         if current_minute < due_minute {
             continue;
@@ -2419,7 +3014,12 @@ pub fn start(state: AppState) {
                 for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
                     let snapshot = load_snapshot(&state, instrument, date).await.ok().flatten();
                     let metadata_ready = snapshot.as_ref().is_some_and(has_contract_metadata);
-                    let levels_ready = snapshot.is_some_and(|snapshot| snapshot.status == "ready");
+                    let levels_ready = snapshot.is_some_and(|snapshot| {
+                        snapshot.status == "ready"
+                            && snapshot
+                                .previous_close
+                                .is_some_and(|value| value.is_finite() && value > 0.0)
+                    });
                     if metadata_ready
                         && !levels_ready
                         && dispatched.insert(format!(
@@ -3411,6 +4011,27 @@ fn snapshot_exit_levels(
     })
 }
 
+fn snapshot_order_exit_levels(
+    snapshot: &Snapshot,
+    direction: &str,
+    entry_price: f64,
+    reversal: bool,
+) -> AppResult<FuturesExitLevels> {
+    if reversal {
+        return snapshot_exit_levels(snapshot, direction, entry_price, true);
+    }
+    if snapshot.gap_plan_status.as_deref() == Some("READY")
+        && snapshot.entry_direction.as_deref() == Some(direction)
+    {
+        return Ok(FuturesExitLevels {
+            target: required_exit_level(snapshot.planned_target, "planned target")?,
+            sl1: required_exit_level(snapshot.planned_sl1, "planned initial stop loss")?,
+            sl2: required_exit_level(snapshot.planned_sl2, "planned continuation stop loss")?,
+        });
+    }
+    snapshot_exit_levels(snapshot, direction, entry_price, false)
+}
+
 #[cfg(test)]
 fn demo_margin_amount(quantity: i32, price: f64, margin_requirement_percent: f64) -> f64 {
     quantity as f64 * price * margin_requirement_percent / 100.0
@@ -4113,7 +4734,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
             .bind(&order.session_key)
             .fetch_optional(&state.db)
             .await?;
-            let exit_levels = snapshot_exit_levels(
+            let exit_levels = snapshot_order_exit_levels(
                 &snapshot,
                 direction,
                 fill,
@@ -4281,16 +4902,33 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                 },
             )
             .await?;
-            emit(state,Some(order.user_id),&instrument,"position_opened",json!({"trade_id":trade_id,"direction":direction,"fill_price":fill,"lots":order.lots})).await;
+            emit(state,Some(order.user_id),&instrument,"position_opened",json!({
+                "trade_id":trade_id,
+                "direction":direction,
+                "fill_price":fill,
+                "lots":order.lots,
+                "gap_direction":snapshot.gap_direction.as_deref(),
+                "entry_source":if reversal_source_trade_id.is_some(){"SL2_REVERSAL"}else{snapshot.entry_source.as_deref().unwrap_or("STANDARD")},
+                "previous_close":snapshot.previous_close,
+                "market_open":snapshot.market_open,
+                "opening_range_high":snapshot.opening_range_high,
+                "opening_range_low":snapshot.opening_range_low,
+                "planned_entry":snapshot.planned_entry,
+            })).await;
             append_user_log(
                 state,
                 order.user_id,
                 &format!(
-                    "STRATEGY POSITION OPENED {} {} {} lots @ {:.2} MARGIN {:.2} [{}]",
+                    "STRATEGY POSITION OPENED {} {} {} lots @ {:.2} {} MARGIN {:.2} [{}]",
                     snapshot_contract_label,
                     direction,
                     order.lots,
                     fill,
+                    if reversal_source_trade_id.is_some() {
+                        "SL2_REVERSAL"
+                    } else {
+                        snapshot.entry_source.as_deref().unwrap_or("STANDARD")
+                    },
                     order.margin_required,
                     runner.trading_mode.to_uppercase()
                 ),
@@ -5205,6 +5843,44 @@ mod tests {
         assert_eq!(buy.entry_side, "BUY");
         assert_eq!(buy.lots, 4);
         assert!(sl2_reversal_plan("BUY", 0).is_none());
+    }
+
+    #[test]
+    fn gap_entry_helpers_select_one_side_and_replace_jumped_entries() {
+        let up = futures_gap_direction(100.0, 105.0).unwrap();
+        assert_eq!(up, FuturesGapDirection::Up);
+        assert_eq!(up.entry_direction(), "BUY");
+        assert_eq!(
+            futures_gap_entry_was_jumped(up, 105.0, 104.0, 90.0),
+            Some(true)
+        );
+        assert_eq!(
+            futures_gap_entry_was_jumped(up, 101.0, 104.0, 90.0),
+            Some(false)
+        );
+        assert!((futures_opening_range_entry(up, 106.0, 101.0).unwrap() - 106.1272).abs() < 1e-9);
+
+        let down = futures_gap_direction(100.0, 95.0).unwrap();
+        assert_eq!(down, FuturesGapDirection::Down);
+        assert_eq!(down.entry_direction(), "SELL");
+        assert_eq!(
+            futures_gap_entry_was_jumped(down, 95.0, 110.0, 96.0),
+            Some(true)
+        );
+        assert_eq!(
+            futures_gap_entry_was_jumped(down, 99.0, 110.0, 96.0),
+            Some(false)
+        );
+        assert!((futures_opening_range_entry(down, 99.0, 94.0).unwrap() - 93.8872).abs() < 1e-9);
+
+        let flat = futures_gap_direction(100.0, 100.0).unwrap();
+        assert_eq!(flat, FuturesGapDirection::Flat);
+        assert_eq!(flat.entry_direction(), "BOTH");
+        assert_eq!(
+            futures_gap_entry_was_jumped(flat, 100.0, 101.0, 99.0),
+            Some(false)
+        );
+        assert!(futures_opening_range_entry(flat, 101.0, 99.0).is_none());
     }
 
     #[test]
