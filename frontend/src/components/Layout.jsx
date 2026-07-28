@@ -40,6 +40,7 @@ export default function Layout({ children }) {
     administer_users: false,
     live_trading: false,
     backtesting: false,
+    backtesting_on_trading_days: false,
   });
   const [tradingMode, setTradingMode] = useState("demo");
   const [sessionReady, setSessionReady] = useState(false);
@@ -91,6 +92,9 @@ export default function Layout({ children }) {
         administer_users: Boolean(nextPermissions.administer_users),
         live_trading: Boolean(nextPermissions.live_trading),
         backtesting: Boolean(nextPermissions.backtesting),
+        backtesting_on_trading_days: Boolean(
+          nextPermissions.backtesting_on_trading_days
+        ),
       });
       setTradingMode(response.data?.trading_mode === "live" ? "live" : "demo");
       if (serverUsername) {
@@ -102,7 +106,12 @@ export default function Layout({ children }) {
       if ([401, 404].includes(requestError.response?.status)) {
         clearAuthUsername();
         setUsername(null);
-        setPermissions({ administer_users: false, live_trading: false, backtesting: false });
+        setPermissions({
+          administer_users: false,
+          live_trading: false,
+          backtesting: false,
+          backtesting_on_trading_days: false,
+        });
         setTradingMode("demo");
         setSessionReady(true);
         navigate("/login", {
@@ -163,7 +172,12 @@ export default function Layout({ children }) {
       }
       clearAuthUsername();
       setUsername(null);
-      setPermissions({ administer_users: false, live_trading: false, backtesting: false });
+      setPermissions({
+        administer_users: false,
+        live_trading: false,
+        backtesting: false,
+        backtesting_on_trading_days: false,
+      });
       setTradingMode("demo");
       const navigationOptions = sourcePath
         ? { replace: true, state: { from: sourcePath } }

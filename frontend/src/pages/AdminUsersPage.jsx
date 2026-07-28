@@ -69,6 +69,9 @@ export default function AdminUsersPage() {
       administrators: users.filter((user) => user.can_administer).length,
       live: users.filter((user) => user.can_live_trade).length,
       backtesting: users.filter((user) => user.can_backtest).length,
+      tradingDayBacktesting: users.filter(
+        (user) => user.can_backtest_on_trading_days
+      ).length,
     }),
     [users]
   );
@@ -143,12 +146,13 @@ export default function AdminUsersPage() {
         </button>
       </header>
 
-      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         {[
           ["Accounts", stats.total],
           ["Administrators", stats.administrators],
           ["Live access", stats.live],
           ["Backtesting access", stats.backtesting],
+          ["Trading-day backtests", stats.tradingDayBacktesting],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-4">
             <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
@@ -183,20 +187,21 @@ export default function AdminUsersPage() {
           <div className="px-5 py-10 text-center text-sm text-slate-400">Loading users...</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-[1050px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
+            <table className="min-w-[1200px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
               <thead className="bg-slate-950/50 text-xs uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-4 py-3">User</th>
                   <th className="px-4 py-3 text-center">Admin</th>
                   <th className="px-4 py-3 text-center">Live trading</th>
                   <th className="px-4 py-3 text-center">Backtesting</th>
+                  <th className="px-4 py-3 text-center">Trading day</th>
                   <th className="px-4 py-3 text-center">Mode</th>
                   <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
                 {filteredUsers.length === 0 ? (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-400">No matching users.</td></tr>
+                  <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No matching users.</td></tr>
                 ) : filteredUsers.map((user) => {
                   const busy = savingUser === user.username || deletingUser === user.username;
                   const isSelf = adminUsername.toLowerCase() === user.username.toLowerCase();
@@ -210,6 +215,41 @@ export default function AdminUsersPage() {
                       <td className="px-4 py-4 text-center"><PermissionBadge allowed={user.can_administer} tone="violet" /></td>
                       <td className="px-4 py-4 text-center"><PermissionBadge allowed={user.can_live_trade} /></td>
                       <td className="px-4 py-4 text-center"><PermissionBadge allowed={user.can_backtest} tone="sky" /></td>
+                      <td className="px-4 py-4 text-center">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={Boolean(user.can_backtest_on_trading_days)}
+                          aria-label={`Allow trading-day backtests for ${user.username}`}
+                          title={
+                            user.can_backtest
+                              ? "Allow this user to run backtests while markets are open"
+                              : "Grant ordinary backtesting access first"
+                          }
+                          disabled={busy || !user.can_backtest}
+                          onClick={() =>
+                            updatePermission(
+                              user.username,
+                              "can_backtest_on_trading_days",
+                              !user.can_backtest_on_trading_days
+                            )
+                          }
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full border transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                            user.can_backtest_on_trading_days
+                              ? "border-amber-400 bg-amber-500"
+                              : "border-slate-600 bg-slate-800"
+                          }`}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={`h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                              user.can_backtest_on_trading_days
+                                ? "translate-x-6"
+                                : "translate-x-1"
+                            }`}
+                          />
+                        </button>
+                      </td>
                       <td className="px-4 py-4 text-center uppercase text-slate-300">{user.can_administer ? "Admin" : user.trading_mode}</td>
                       <td className="px-4 py-4">
                         <div className="flex flex-wrap justify-end gap-2">

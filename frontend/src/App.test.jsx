@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Provider } from "react-redux";
 import axios from "axios";
 import App from "./App.jsx";
@@ -152,6 +152,20 @@ describe("App", () => {
   });
 
   it("redirects administrators into an admin-only user workspace", async () => {
+    axios.patch.mockResolvedValue({
+      data: {
+        user: {
+          id: "trader-id",
+          username: "TRADER01",
+          email: "trader@example.com",
+          can_administer: false,
+          can_live_trade: false,
+          can_backtest: true,
+          can_backtest_on_trading_days: true,
+          trading_mode: "demo",
+        },
+      },
+    });
     axios.get.mockImplementation((url) => {
       if (url === "/auth/access/") {
         return Promise.resolve({
@@ -161,6 +175,7 @@ describe("App", () => {
               administer_users: true,
               live_trading: false,
               backtesting: false,
+              backtesting_on_trading_days: false,
             },
             trading_mode: "demo",
           },
@@ -176,6 +191,17 @@ describe("App", () => {
               can_administer: true,
               can_live_trade: false,
               can_backtest: false,
+              can_backtest_on_trading_days: false,
+              trading_mode: "demo",
+            },
+            {
+              id: "trader-id",
+              username: "TRADER01",
+              email: "trader@example.com",
+              can_administer: false,
+              can_live_trade: false,
+              can_backtest: true,
+              can_backtest_on_trading_days: false,
               trading_mode: "demo",
             },
           ],
@@ -198,6 +224,24 @@ describe("App", () => {
     expect(screen.queryByRole("link", { name: "Strategies" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Profit & Loss" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Account settings")).not.toBeInTheDocument();
+    const tradingDaySwitch = await screen.findByRole("switch", {
+      name: "Allow trading-day backtests for TRADER01",
+    });
+    expect(tradingDaySwitch).toBeEnabled();
+    expect(tradingDaySwitch).toHaveAttribute("aria-checked", "false");
+    expect(
+      screen.getByRole("switch", {
+        name: "Allow trading-day backtests for ADMIN01",
+      })
+    ).toBeDisabled();
+    fireEvent.click(tradingDaySwitch);
+    await waitFor(() => {
+      expect(axios.patch).toHaveBeenCalledWith("/auth/admin/users/", {
+        username: "TRADER01",
+        can_backtest_on_trading_days: true,
+      });
+      expect(tradingDaySwitch).toHaveAttribute("aria-checked", "true");
+    });
     expect(axios.get.mock.calls.some(([url]) => url === "/account/balance")).toBe(false);
   });
 

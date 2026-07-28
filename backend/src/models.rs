@@ -11,6 +11,7 @@ pub struct AdminUser {
     pub can_administer: bool,
     pub can_live_trade: bool,
     pub can_backtest: bool,
+    pub can_backtest_on_trading_days: bool,
     pub trading_mode: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
