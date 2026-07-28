@@ -90,6 +90,9 @@ export default function HomePage() {
 
   const isInitialLoading = status === "loading" && !details;
   const detailsSnapshot = details || {};
+  const connectedForToday = Boolean(
+    detailsSnapshot.connected_for_today
+  );
 
   const lastUpdated =
     detailsSnapshot.last_updated || detailsSnapshot.last_connected_at;
@@ -308,12 +311,22 @@ export default function HomePage() {
 
           <article id="broker-connection" className="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
             <h2 className="text-lg font-semibold text-white">
-              Establish Session
+              {connectedForToday ? "Session Established" : "Establish Session"}
             </h2>
             <p className="mt-1 text-sm text-slate-400">
-              Submit MPIN and TOTP to connect your brokerage session securely.
+              {connectedForToday
+                ? "Your Angel One session is retained for today."
+                : "Submit MPIN and TOTP to connect your brokerage session securely."}
             </p>
-            <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
+            {connectedForToday ? (
+              <div
+                role="status"
+                className="mt-5 border-t border-slate-800 pt-5 text-sm text-emerald-300"
+              >
+                No additional broker login is required today.
+              </div>
+            ) : (
+              <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
               <div className="space-y-2">
                 <label
                   className="text-sm font-medium text-slate-300"
@@ -371,7 +384,8 @@ export default function HomePage() {
                   {connection.message}
                 </p>
               ) : null}
-            </form>
+              </form>
+            )}
           </article>
         </div>
       </section>

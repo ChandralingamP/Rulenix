@@ -5,10 +5,15 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::time::Instant;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS: u64 = 90;
+const MAX_RATE_LIMIT_COOLDOWN_SECONDS: u64 = 300;
 
 #[derive(Debug, Deserialize)]
 pub struct AngelEnvelope<T> {
@@ -63,12 +68,95 @@ fn bounded_diagnostic(body: &[u8], secrets: &[&str]) -> String {
     redact_sensitive(&text, secrets).replace(['\r', '\n'], " ")
 }
 
+pub fn is_rate_limit_error(message: &str) -> bool {
+    let value = message.to_ascii_lowercase();
+    [
+        "rate limit",
+        "too many request",
+        "exceeding access rate",
+        "access rate exceeded",
+        "request limit exceeded",
+        "rate exceeded",
+        "throttl",
+    ]
+    .iter()
+    .any(|phrase| value.contains(phrase))
+}
+
+fn is_rate_limited_response(status: reqwest::StatusCode, message: &str) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || is_rate_limit_error(message)
+}
+
+fn retry_after_seconds(headers: &HeaderMap) -> u64 {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+        .clamp(5, MAX_RATE_LIMIT_COOLDOWN_SECONDS)
+}
+
+fn cooldown_key(api_key: &str, path: &str) -> String {
+    let key_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(api_key.as_bytes()));
+    format!("{key_hash}:{path}")
+}
+
+async fn cooldown_remaining(state: &AppState, api_key: &str, path: &str) -> Option<u64> {
+    let key = cooldown_key(api_key, path);
+    let now = Instant::now();
+    let mut cooldowns = state.angel_api_cooldowns.lock().await;
+    match cooldowns.get(&key).copied() {
+        Some(until) if until > now => Some(until.duration_since(now).as_secs().max(1)),
+        Some(_) => {
+            cooldowns.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+async fn activate_cooldown(state: &AppState, api_key: &str, path: &str, seconds: u64) {
+    let seconds = seconds.clamp(5, MAX_RATE_LIMIT_COOLDOWN_SECONDS);
+    let now = Instant::now();
+    let until = now + std::time::Duration::from_secs(seconds);
+    let mut cooldowns = state.angel_api_cooldowns.lock().await;
+    cooldowns.retain(|_, current| *current > now);
+    cooldowns
+        .entry(cooldown_key(api_key, path))
+        .and_modify(|current| *current = (*current).max(until))
+        .or_insert(until);
+    tracing::warn!(path, seconds, "Angel One API cooldown activated");
+}
+
+fn rate_limit_message(seconds: u64) -> String {
+    format!(
+        "Angel One API rate limit is active. Rulenix will retry automatically in about {seconds} seconds; the broker session remains connected."
+    )
+}
+
+fn rate_limit_error(seconds: u64) -> AppError {
+    AppError::BadRequest(rate_limit_message(seconds))
+}
+
+fn rate_limit_broker_error(seconds: u64, status: Option<u16>) -> BrokerError {
+    BrokerError {
+        class: BrokerErrorClass::Retryable,
+        status,
+        code: "rate_limit".into(),
+        message: rate_limit_message(seconds),
+        diagnostic: "The request was deferred by the Angel One endpoint cooldown.".into(),
+    }
+}
+
 fn classify(
     status: reqwest::StatusCode,
     code: Option<&str>,
     message: &str,
     submission: bool,
 ) -> BrokerErrorClass {
+    if is_rate_limited_response(status, message) {
+        return BrokerErrorClass::Retryable;
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
         || is_expiry_error(message, code)
@@ -78,8 +166,7 @@ fn classify(
     if submission && (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT) {
         return BrokerErrorClass::Ambiguous;
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
+    if status.is_server_error()
         || ["temporar", "timeout", "unavailable", "rate limit"]
             .iter()
             .any(|v| message.to_lowercase().contains(v))
@@ -97,18 +184,23 @@ fn decode_bytes<T: DeserializeOwned>(
     secrets: &[&str],
     submission: bool,
 ) -> Result<AngelEnvelope<T>, BrokerError> {
-    serde_json::from_slice(body).map_err(|_| BrokerError {
-        class: if submission {
-            BrokerErrorClass::Ambiguous
-        } else {
-            BrokerErrorClass::Retryable
-        },
-        status: Some(status.as_u16()),
-        code: "invalid_response".into(),
-        message: format!(
-            "Angel One {operation} returned HTTP {status} with an invalid {content_type} response."
-        ),
-        diagnostic: bounded_diagnostic(body, secrets),
+    serde_json::from_slice(body).map_err(|_| {
+        let diagnostic = bounded_diagnostic(body, secrets);
+        BrokerError {
+            class: if is_rate_limited_response(status, &diagnostic) {
+                BrokerErrorClass::Retryable
+            } else if submission {
+                BrokerErrorClass::Ambiguous
+            } else {
+                BrokerErrorClass::Retryable
+            },
+            status: Some(status.as_u16()),
+            code: "invalid_response".into(),
+            message: format!(
+                "Angel One {operation} returned HTTP {status} with an invalid {content_type} response."
+            ),
+            diagnostic,
+        }
     })
 }
 
@@ -192,15 +284,6 @@ fn authenticated_headers(state: &AppState, api_key: &str, jwt_token: &str) -> Ap
     Ok(headers)
 }
 
-async fn decode_response<T: DeserializeOwned>(
-    response: reqwest::Response,
-    operation: &str,
-) -> AppResult<(reqwest::StatusCode, AngelEnvelope<T>)> {
-    decode_response_detailed(response, operation, &[], false)
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))
-}
-
 pub async fn create_session(
     state: &AppState,
     client_code: &str,
@@ -208,10 +291,11 @@ pub async fn create_session(
     mpin: &str,
     totp: &str,
 ) -> AppResult<AngelSession> {
-    let endpoint = format!(
-        "{}/rest/auth/angelbroking/user/v1/loginByPassword",
-        state.config.angel_api_base
-    );
+    let path = "/rest/auth/angelbroking/user/v1/loginByPassword";
+    if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
+        return Err(rate_limit_error(seconds));
+    }
+    let endpoint = format!("{}{path}", state.config.angel_api_base);
     let mut response = None;
     for attempt in 0..2 {
         match state
@@ -244,13 +328,40 @@ pub async fn create_session(
                 .into(),
         )
     })?;
-
-    let (status, payload): (_, AngelEnvelope<Value>) = decode_response(response, "login").await?;
+    let retry_after = retry_after_seconds(response.headers());
+    let (status, payload): (_, AngelEnvelope<Value>) =
+        match decode_response_detailed(response, "login", &[api_key, mpin, totp], false).await {
+            Ok(value) => value,
+            Err(error)
+                if error.status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16())
+                    || is_rate_limit_error(&error.message)
+                    || is_rate_limit_error(&error.diagnostic) =>
+            {
+                activate_cooldown(state, api_key, path, retry_after).await;
+                return Err(rate_limit_error(retry_after));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    status=?error.status,
+                    code=%error.code,
+                    class=?error.class,
+                    diagnostic=%error.diagnostic,
+                    "Angel One login response decoding failed"
+                );
+                return Err(AppError::BadRequest(error.to_string()));
+            }
+        };
+    if is_rate_limited_response(status, &payload.message) {
+        activate_cooldown(state, api_key, path, retry_after).await;
+        return Err(rate_limit_error(retry_after));
+    }
     if !status.is_success() || !payload.status {
-        return Err(AppError::BadRequest(redact_sensitive(
-            &payload.message,
-            &[api_key, mpin, totp],
-        )));
+        let message = redact_sensitive(&payload.message, &[api_key, mpin, totp]);
+        return Err(AppError::BadRequest(if message.is_empty() {
+            format!("Angel One rejected the login request with HTTP {status}.")
+        } else {
+            message
+        }));
     }
     let data = payload
         .data
@@ -267,28 +378,20 @@ fn numeric_value(value: Option<&Value>) -> Option<f64> {
 }
 
 pub async fn get_margin(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
-    let headers = authenticated_headers(state, api_key, jwt_token)?;
-    let response = state
-        .http
-        .get(format!(
-            "{}/rest/secure/angelbroking/user/v1/getRMS",
-            state.config.angel_api_base
-        ))
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("Unable to reach Angel One: {error}")))?;
-    let (status, payload): (_, AngelEnvelope<Value>) =
-        decode_response(response, "margin request").await?;
-    if !status.is_success() || !payload.status {
-        return Err(AppError::BadRequest(redact_sensitive(
-            &payload.message,
-            &[api_key, jwt_token],
-        )));
+    let data = secure_json(
+        state,
+        reqwest::Method::GET,
+        "/rest/secure/angelbroking/user/v1/getRMS",
+        api_key,
+        jwt_token,
+        None,
+    )
+    .await?;
+    if data.is_null() {
+        return Err(AppError::BadRequest(
+            "Angel One returned no margin data.".into(),
+        ));
     }
-    let data = payload
-        .data
-        .ok_or_else(|| AppError::BadRequest("Angel One returned no margin data.".into()))?;
     let available = numeric_value(data.get("availablecash"))
         .or_else(|| numeric_value(data.get("availableCash")))
         .or_else(|| numeric_value(data.get("net")))
@@ -376,6 +479,9 @@ async fn secure_json(
     jwt_token: &str,
     body: Option<Value>,
 ) -> AppResult<Value> {
+    if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
+        return Err(rate_limit_error(seconds));
+    }
     let mut request = state
         .http
         .request(method, format!("{}{}", state.config.angel_api_base, path))
@@ -387,6 +493,7 @@ async fn secure_json(
         .send()
         .await
         .map_err(|error| AppError::BadRequest(format!("Unable to reach Angel One: {error}")))?;
+    let retry_after = retry_after_seconds(response.headers());
     let (status, payload): (_, AngelEnvelope<Value>) = match decode_response_detailed(
         response,
         "API request",
@@ -398,14 +505,32 @@ async fn secure_json(
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(status=?error.status,code=%error.code,class=?error.class,diagnostic=%error.diagnostic,"Angel One response decoding failed");
+            if error.status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16())
+                || is_rate_limit_error(&error.message)
+                || is_rate_limit_error(&error.diagnostic)
+            {
+                activate_cooldown(state, api_key, path, retry_after).await;
+                return Err(rate_limit_error(retry_after));
+            }
             return Err(AppError::BadRequest(error.to_string()));
         }
     };
+    if is_rate_limited_response(status, &payload.message) {
+        activate_cooldown(state, api_key, path, retry_after).await;
+        return Err(rate_limit_error(retry_after));
+    }
     if !status.is_success() || !payload.status {
-        return Err(AppError::BadRequest(redact_sensitive(
-            &payload.message,
-            &[api_key, jwt_token],
-        )));
+        let mut message = redact_sensitive(&payload.message, &[api_key, jwt_token]);
+        if let Some(code) = payload.errorcode.as_deref().filter(|code| !code.is_empty()) {
+            message = if message.is_empty() {
+                format!("Angel One API request failed with {code}.")
+            } else {
+                format!("{message} ({code})")
+            };
+        } else if message.is_empty() {
+            message = format!("Angel One API request returned HTTP {status}.");
+        }
+        return Err(AppError::BadRequest(message));
     }
     Ok(payload.data.unwrap_or(Value::Null))
 }
@@ -469,6 +594,7 @@ pub async fn get_candles_with_exchange_interval(
         .await
         {
             Ok(value) => return Ok(value),
+            Err(error) if is_rate_limit_error(&error.to_string()) => return Err(error),
             Err(_) if attempt == 0 => {
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
@@ -526,12 +652,34 @@ pub async fn place_order(
     jwt_token: &str,
     order: &OrderRequest<'_>,
 ) -> Result<String, BrokerError> {
+    let path = "/rest/secure/angelbroking/order/v1/placeOrder";
+    if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
+        return Err(rate_limit_broker_error(seconds, None));
+    }
     let body = order_payload(order);
-    let response=state.http.post(format!("{}/rest/secure/angelbroking/order/v1/placeOrder",state.config.angel_api_base))
+    let response=state.http.post(format!("{}{path}",state.config.angel_api_base))
         .headers(authenticated_headers(state,api_key,jwt_token).map_err(|e|BrokerError{class:BrokerErrorClass::Authentication,status:None,code:"invalid_headers".into(),message:e.to_string(),diagnostic:String::new()})?)
         .json(&body).send().await.map_err(|error|BrokerError{class:classify_transport(&error),status:error.status().map(|s|s.as_u16()),code:"transport".into(),message:if error.is_connect(){"Angel One could not be reached before submission.".into()}else{"Angel One submission outcome is unknown and will be reconciled; it will not be retried automatically.".into()},diagnostic:redact_sensitive(&error.to_string(),&[api_key,jwt_token])})?;
+    let retry_after = retry_after_seconds(response.headers());
     let (status, payload): (_, AngelEnvelope<Value>) =
-        decode_response_detailed(response, "order submission", &[api_key, jwt_token], true).await?;
+        match decode_response_detailed(response, "order submission", &[api_key, jwt_token], true)
+            .await
+        {
+            Ok(value) => value,
+            Err(error)
+                if error.status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16())
+                    || is_rate_limit_error(&error.message)
+                    || is_rate_limit_error(&error.diagnostic) =>
+            {
+                activate_cooldown(state, api_key, path, retry_after).await;
+                return Err(rate_limit_broker_error(retry_after, error.status));
+            }
+            Err(error) => return Err(error),
+        };
+    if is_rate_limited_response(status, &payload.message) {
+        activate_cooldown(state, api_key, path, retry_after).await;
+        return Err(rate_limit_broker_error(retry_after, Some(status.as_u16())));
+    }
     if !status.is_success() || !payload.status {
         return Err(BrokerError {
             class: classify(status, payload.errorcode.as_deref(), &payload.message, true),
@@ -598,13 +746,6 @@ pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> App
     .await
 }
 
-#[derive(Debug, PartialEq)]
-pub enum SessionCheck {
-    Valid,
-    Expired(String),
-    Unavailable(String),
-}
-
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RefreshedSession {
     pub jwt_token: String,
@@ -633,21 +774,39 @@ pub fn jwt_expires_within(token: &str, seconds: i64) -> bool {
 }
 
 fn is_expiry_error(message: &str, code: Option<&str>) -> bool {
+    if is_rate_limit_error(message) {
+        return false;
+    }
     let value = message.to_lowercase();
     matches!(
         code,
         Some("AG8001" | "AG8002" | "AG8003" | "AG8004" | "AB1010")
-    ) || ["token", "session", "jwt", "expired", "unauthorized"]
-        .iter()
-        .any(|word| value.contains(word))
+    ) || [
+        "invalid token",
+        "token is invalid",
+        "token has expired",
+        "token expired",
+        "expired token",
+        "invalid jwt",
+        "jwt expired",
+        "invalid session",
+        "session is invalid",
+        "session expired",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|phrase| value.contains(phrase))
 }
 
 pub fn is_invalid_api_key_error(message: &str) -> bool {
+    if is_rate_limit_error(message) {
+        return false;
+    }
     let value = message.to_lowercase();
     value.contains("invalid api key")
         || value.contains("ag8004")
         || value.contains("http 401 unauthorized")
-        || value.contains("http 403 forbidden")
+        || is_expiry_error(message, None)
 }
 
 pub async fn refresh_session(
@@ -661,14 +820,15 @@ pub async fn refresh_session(
             "Angel One refresh token is missing. Please reconnect.".into(),
         );
     }
+    let path = "/rest/auth/angelbroking/jwt/v1/generateTokens";
+    if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
+        return RefreshCheck::Unavailable(rate_limit_message(seconds));
+    }
     let headers = match authenticated_headers(state, api_key, jwt_token) {
         Ok(headers) => headers,
         Err(error) => return RefreshCheck::Unavailable(error.to_string()),
     };
-    let endpoint = format!(
-        "{}/rest/auth/angelbroking/jwt/v1/generateTokens",
-        state.config.angel_api_base
-    );
+    let endpoint = format!("{}{path}", state.config.angel_api_base);
     for attempt in 0..2 {
         let response = state
             .http
@@ -680,9 +840,24 @@ pub async fn refresh_session(
         let result = match response {
             Ok(response) => {
                 let status = response.status();
+                let retry_after = retry_after_seconds(response.headers());
                 match response.bytes().await {
                     Ok(body) => {
-                        parse_refresh_response(status, &body, api_key, jwt_token, refresh_token)
+                        let result = parse_refresh_response(
+                            status,
+                            &body,
+                            api_key,
+                            jwt_token,
+                            refresh_token,
+                        );
+                        if matches!(
+                            &result,
+                            RefreshCheck::Unavailable(message)
+                                if is_rate_limit_error(message)
+                        ) {
+                            activate_cooldown(state, api_key, path, retry_after).await;
+                        }
+                        result
                     }
                     Err(_) => RefreshCheck::Unavailable(
                         "Angel One token refresh could not be read.".into(),
@@ -693,6 +868,12 @@ pub async fn refresh_session(
                 "Angel One token refresh is temporarily unavailable.".into(),
             ),
         };
+        if matches!(
+            &result,
+            RefreshCheck::Unavailable(message) if is_rate_limit_error(message)
+        ) {
+            return result;
+        }
         if !matches!(result, RefreshCheck::Unavailable(_)) || attempt == 1 {
             return result;
         }
@@ -708,6 +889,10 @@ fn parse_refresh_response(
     jwt_token: &str,
     refresh_token: &str,
 ) -> RefreshCheck {
+    let raw = String::from_utf8_lossy(body);
+    if is_rate_limited_response(status, &raw) {
+        return RefreshCheck::Unavailable(rate_limit_message(DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS));
+    }
     let payload = match serde_json::from_slice::<Value>(body) {
         Ok(payload) => payload,
         Err(_)
@@ -736,6 +921,9 @@ fn parse_refresh_response(
         .get("status")
         .or_else(|| payload.get("success"))
         .and_then(Value::as_bool);
+    if is_rate_limited_response(status, message) {
+        return RefreshCheck::Unavailable(rate_limit_message(DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS));
+    }
     if status.is_success() && accepted == Some(true) {
         let data = payload.get("data").unwrap_or(&Value::Null);
         let jwt = data
@@ -774,71 +962,6 @@ fn parse_refresh_response(
         "Angel One could not refresh the session: {}",
         redact_sensitive(message, &[api_key, jwt_token, refresh_token])
     ))
-}
-
-pub async fn verify_session(
-    state: &AppState,
-    api_key: &str,
-    jwt_token: &str,
-    refresh_token: &str,
-) -> SessionCheck {
-    if jwt_expiration(jwt_token).is_some_and(|expiry| expiry <= Utc::now().timestamp()) {
-        return SessionCheck::Expired("Angel One session has expired. Please reconnect.".into());
-    }
-    let response = state
-        .http
-        .get(format!(
-            "{}/rest/secure/angelbroking/user/v1/getProfile",
-            state.config.angel_api_base
-        ))
-        .headers(match authenticated_headers(state, api_key, jwt_token) {
-            Ok(headers) => headers,
-            Err(error) => return SessionCheck::Unavailable(error.to_string()),
-        })
-        .query(&[("refreshToken", refresh_token)])
-        .send()
-        .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(_) => {
-            return SessionCheck::Unavailable(
-                "Angel One session verification is temporarily unavailable.".into(),
-            );
-        }
-    };
-    let status = response.status();
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(error) => {
-            return SessionCheck::Unavailable(format!(
-                "Unable to read Angel One verification response: {error}"
-            ));
-        }
-    };
-    let payload = serde_json::from_slice::<AngelEnvelope<Value>>(&body);
-    match payload {
-        Ok(payload) if status.is_success() && payload.status => SessionCheck::Valid,
-        Ok(payload)
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-                || is_expiry_error(&payload.message, payload.errorcode.as_deref()) =>
-        {
-            SessionCheck::Expired("Angel One session has expired. Please reconnect.".into())
-        }
-        Ok(payload) => SessionCheck::Unavailable(format!(
-            "Angel One could not verify the session: {}",
-            redact_sensitive(&payload.message, &[api_key, jwt_token, refresh_token])
-        )),
-        Err(_)
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN =>
-        {
-            SessionCheck::Expired("Angel One session has expired. Please reconnect.".into())
-        }
-        Err(_) => SessionCheck::Unavailable(format!(
-            "Angel One session verification returned HTTP {status}."
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -881,11 +1004,21 @@ mod tests {
         assert!(is_expiry_error("Invalid Token", None));
         assert!(is_expiry_error("Request rejected", Some("AG8001")));
         assert!(is_expiry_error("Invalid API Key", Some("AG8004")));
+        assert!(!is_expiry_error(
+            "Token generation rate limit exceeded",
+            None
+        ));
         assert!(!is_expiry_error("Service temporarily unavailable", None));
         assert!(is_invalid_api_key_error("Invalid API Key"));
         assert!(is_invalid_api_key_error("Broker error AG8004"));
-        assert!(is_invalid_api_key_error(
+        assert!(!is_invalid_api_key_error(
             "Angel One API request returned HTTP 403 Forbidden"
+        ));
+        assert!(!is_invalid_api_key_error(
+            "Access denied because of exceeding access rate"
+        ));
+        assert!(is_rate_limit_error(
+            "Access denied because of exceeding access rate"
         ));
         assert!(!is_invalid_api_key_error("Service temporarily unavailable"));
     }
@@ -926,6 +1059,38 @@ mod tests {
             }
             _ => panic!("valid refresh payload was rejected"),
         }
+    }
+
+    #[test]
+    fn refresh_rate_limit_never_invalidates_the_session() {
+        let result = parse_refresh_response(
+            reqwest::StatusCode::FORBIDDEN,
+            br#"{"status":false,"message":"Access denied because of exceeding access rate","errorcode":"AB1004","data":null}"#,
+            "api-key",
+            "jwt",
+            "refresh",
+        );
+        assert!(matches!(
+            result,
+            RefreshCheck::Unavailable(message) if is_rate_limit_error(&message)
+        ));
+    }
+
+    #[test]
+    fn malformed_forbidden_rate_response_is_retryable() {
+        let error = decode_bytes::<Value>(
+            reqwest::StatusCode::FORBIDDEN,
+            "text/html",
+            b"Access denied because of exceeding access rate",
+            "API request",
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, BrokerErrorClass::Retryable);
+        assert!(is_rate_limit_error(&error.diagnostic));
+        assert!(!is_invalid_api_key_error(&error.to_string()));
     }
 
     #[tokio::test]
@@ -1090,6 +1255,15 @@ mod tests {
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 None,
                 "rate limit",
+                false
+            ),
+            BrokerErrorClass::Retryable
+        );
+        assert_eq!(
+            classify(
+                reqwest::StatusCode::FORBIDDEN,
+                Some("AB1004"),
+                "Access denied because of exceeding access rate",
                 false
             ),
             BrokerErrorClass::Retryable

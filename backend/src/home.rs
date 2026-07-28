@@ -11,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, Extension, State},
     http::HeaderMap,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
@@ -32,6 +32,41 @@ pub struct ProfileUpdate {
     pub api_key: String,
 }
 
+const SAME_DAY_SESSION_PRESERVED_MESSAGE: &str = "Today's broker session was preserved. Rulenix will retry automatically; no new login is required.";
+
+fn ist_date(value: &DateTime<Utc>) -> chrono::NaiveDate {
+    value
+        .with_timezone(&FixedOffset::east_opt(19_800).expect("valid IST offset"))
+        .date_naive()
+}
+
+fn same_ist_day(left: &DateTime<Utc>, right: &DateTime<Utc>) -> bool {
+    ist_date(left) == ist_date(right)
+}
+
+fn has_session_tokens(credentials: &BrokerCredentials) -> bool {
+    !credentials.api_key.is_empty()
+        && !credentials.jwt_token.is_empty()
+        && !credentials.refresh_token.is_empty()
+        && !credentials.feed_token.is_empty()
+}
+
+fn connected_for_today_at(
+    profile: &BrokerageProfile,
+    credentials: &BrokerCredentials,
+    now: &DateTime<Utc>,
+) -> bool {
+    has_session_tokens(credentials)
+        && profile
+            .token_received_at
+            .as_ref()
+            .is_some_and(|received| same_ist_day(received, now))
+}
+
+fn connected_for_today(profile: &BrokerageProfile, credentials: &BrokerCredentials) -> bool {
+    connected_for_today_at(profile, credentials, &Utc::now())
+}
+
 async fn profile_by_id(state: &AppState, user_id: Uuid) -> AppResult<BrokerageProfile> {
     sqlx::query_as("SELECT * FROM user_profiles WHERE user_id=$1")
         .bind(user_id)
@@ -41,14 +76,22 @@ async fn profile_by_id(state: &AppState, user_id: Uuid) -> AppResult<BrokeragePr
 }
 
 fn details(p: &BrokerageProfile, credentials: &BrokerCredentials) -> Value {
-    let connection_state = match (p.token_state.as_str(), p.last_token_status.as_str()) {
-        ("verification_unavailable", _) => "unavailable",
-        (_, "invalid") => "invalid",
-        (_, "expired") => "expired",
-        (_, "unavailable") => "unavailable",
-        (_, "failed") => "failed",
-        _ if credentials.jwt_token.is_empty() => "idle",
-        _ => "connected",
+    let connected_today = connected_for_today(p, credentials);
+    let connection_state = match (
+        connected_today,
+        p.token_state.as_str(),
+        p.last_token_status.as_str(),
+    ) {
+        (true, "verification_unavailable" | "refresh_required", _) => "unavailable",
+        (true, _, "invalid" | "expired" | "failed") => "unavailable",
+        (true, _, _) => "connected",
+        (false, "verification_unavailable" | "refresh_required", _) => "unavailable",
+        (false, _, "invalid") => "invalid",
+        (false, _, "expired") => "expired",
+        (false, _, "unavailable") => "unavailable",
+        (false, _, "failed") => "failed",
+        (false, _, _) if credentials.jwt_token.is_empty() => "idle",
+        (false, _, _) => "connected",
     };
     json!({
         "client_id": p.brokerage_user_id,
@@ -58,9 +101,11 @@ fn details(p: &BrokerageProfile, credentials: &BrokerCredentials) -> Value {
         "token_state": p.token_state,
         "connection_message": match connection_state {
             "connected" | "idle" => Value::Null,
-            "unavailable" => json!("Angel One verification is temporarily unavailable. Rulenix will check the session again automatically."),
+            "unavailable" if connected_today => json!(SAME_DAY_SESSION_PRESERVED_MESSAGE),
+            "unavailable" => json!("Angel One is temporarily unavailable. Rulenix will retry automatically."),
             _ => json!(p.last_token_message),
         },
+        "connected_for_today": connected_today,
         "last_connected_at": p.token_received_at,
         "last_verified_at": p.last_token_check_at,
     })
@@ -177,27 +222,52 @@ async fn mark_attempt_failed(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvalidationOutcome {
+    Invalidated,
+    Preserved,
+    Unchanged,
+}
+
 async fn invalidate_if_revision(
     state: &AppState,
     user_id: Uuid,
     expected_revision: Option<i64>,
     message: &str,
-) -> AppResult<bool> {
+) -> AppResult<InvalidationOutcome> {
     let mut transaction = state.db.begin().await?;
     lock_user(&mut transaction, user_id).await?;
-    let current: Option<i64> = sqlx::query_scalar(
-        "SELECT broker_credential_revision FROM user_profiles WHERE user_id=$1 FOR UPDATE",
+    let current: Option<(i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT broker_credential_revision,token_received_at FROM user_profiles WHERE user_id=$1 FOR UPDATE",
     )
-    .bind(user_id)
-    .fetch_optional(&mut *transaction)
-    .await?;
-    let Some(current) = current else {
+        .bind(user_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let Some((current_revision, token_received_at)) = current else {
         transaction.rollback().await?;
-        return Ok(false);
+        return Ok(InvalidationOutcome::Unchanged);
     };
-    if expected_revision.is_some_and(|expected| expected != current) {
+    if expected_revision.is_some_and(|expected| expected != current_revision) {
         transaction.rollback().await?;
-        return Ok(false);
+        return Ok(InvalidationOutcome::Unchanged);
+    }
+    if token_received_at
+        .as_ref()
+        .is_some_and(|received| same_ist_day(received, &Utc::now()))
+    {
+        let credentials = state
+            .credentials
+            .load_in_transaction(&mut transaction, user_id)
+            .await?;
+        if has_session_tokens(&credentials) {
+            sqlx::query("UPDATE user_profiles SET token_state='refresh_required',last_token_check_at=NOW(),last_token_status=CASE WHEN last_token_status IN ('success','refreshed') THEN last_token_status ELSE 'unavailable' END,last_token_message=$2,updated_at=NOW() WHERE user_id=$1")
+                .bind(user_id)
+                .bind(SAME_DAY_SESSION_PRESERVED_MESSAGE)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            return Ok(InvalidationOutcome::Preserved);
+        }
     }
     state
         .credentials
@@ -209,21 +279,45 @@ async fn invalidate_if_revision(
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    Ok(true)
+    Ok(InvalidationOutcome::Invalidated)
+}
+
+async fn alert_invalidation(
+    state: &AppState,
+    user_id: Uuid,
+    outcome: InvalidationOutcome,
+    message: &str,
+) {
+    match outcome {
+        InvalidationOutcome::Invalidated => {
+            crate::strategy::operational_alert(
+                state,
+                Some(user_id),
+                "",
+                "broker_session_invalid",
+                "error",
+                message,
+            )
+            .await;
+        }
+        InvalidationOutcome::Preserved => {
+            crate::strategy::operational_alert(
+                state,
+                Some(user_id),
+                "",
+                "broker_session_recovery_deferred",
+                "warning",
+                SAME_DAY_SESSION_PRESERVED_MESSAGE,
+            )
+            .await;
+        }
+        InvalidationOutcome::Unchanged => {}
+    }
 }
 
 pub(crate) async fn mark_invalid(state: &AppState, user_id: Uuid, message: &str) -> AppResult<()> {
-    if invalidate_if_revision(state, user_id, None, message).await? {
-        crate::strategy::operational_alert(
-            state,
-            Some(user_id),
-            "",
-            "broker_session_invalid",
-            "error",
-            message,
-        )
-        .await;
-    }
+    let outcome = invalidate_if_revision(state, user_id, None, message).await?;
+    alert_invalidation(state, user_id, outcome, message).await;
     Ok(())
 }
 
@@ -233,17 +327,8 @@ async fn mark_invalid_at_revision(
     expected_revision: i64,
     message: &str,
 ) -> AppResult<()> {
-    if invalidate_if_revision(state, user_id, Some(expected_revision), message).await? {
-        crate::strategy::operational_alert(
-            state,
-            Some(user_id),
-            "",
-            "broker_session_invalid",
-            "error",
-            message,
-        )
-        .await;
-    }
+    let outcome = invalidate_if_revision(state, user_id, Some(expected_revision), message).await?;
+    alert_invalidation(state, user_id, outcome, message).await;
     Ok(())
 }
 
@@ -274,24 +359,6 @@ async fn mark_unavailable_at_revision(
         )
         .await;
     }
-    Ok(())
-}
-
-async fn mark_valid_at_revision(
-    state: &AppState,
-    user_id: Uuid,
-    expected_revision: i64,
-    token_state: &str,
-) -> AppResult<()> {
-    let mut transaction = state.db.begin().await?;
-    lock_user(&mut transaction, user_id).await?;
-    sqlx::query("UPDATE user_profiles SET token_state=$3,last_token_check_at=NOW(),last_token_status='success',last_token_message='',updated_at=NOW() WHERE user_id=$1 AND broker_credential_revision=$2")
-        .bind(user_id)
-        .bind(expected_revision)
-        .bind(token_state)
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -332,7 +399,7 @@ async fn refresh_tokens(state: &AppState, snapshot: &SessionSnapshot) -> AppResu
                 ],
                 "refreshed",
                 "refreshed",
-                false,
+                true,
             )
             .await?;
             if finalized {
@@ -371,81 +438,26 @@ async fn maintain_user_session(state: &AppState, user_id: Uuid) -> AppResult<()>
 }
 
 async fn maintain_user_session_inner(state: &AppState, user_id: Uuid) -> AppResult<()> {
-    let mut snapshot = session_snapshot(state, user_id).await?;
+    let snapshot = session_snapshot(state, user_id).await?;
     if snapshot.credentials.jwt_token.is_empty() {
         return Ok(());
     }
-    let near_expiry = angel::jwt_expires_within(&snapshot.credentials.jwt_token, 600);
-    let recently_verified = matches!(
-        snapshot.profile.last_token_status.as_str(),
-        "success" | "refreshed"
-    ) && snapshot
-        .profile
-        .last_token_check_at
-        .is_some_and(|checked| checked > Utc::now() - Duration::seconds(30));
-    if recently_verified && !near_expiry {
+    let refresh_required = angel::jwt_expires_within(&snapshot.credentials.jwt_token, 0)
+        || matches!(
+            snapshot.profile.token_state.as_str(),
+            "verification_unavailable" | "refresh_required"
+        );
+    if !refresh_required {
         return Ok(());
     }
-
-    let mut refreshed = false;
-    if near_expiry {
-        refreshed = refresh_tokens(state, &snapshot).await?;
-        if !refreshed {
-            return Ok(());
-        }
-        snapshot = session_snapshot(state, user_id).await?;
+    let recovery_deferred = snapshot
+        .profile
+        .last_token_check_at
+        .is_some_and(|checked| checked > Utc::now() - Duration::minutes(5));
+    if recovery_deferred {
+        return Ok(());
     }
-
-    let mut check = angel::verify_session(
-        state,
-        &snapshot.credentials.api_key,
-        &snapshot.credentials.jwt_token,
-        &snapshot.credentials.refresh_token,
-    )
-    .await;
-    if matches!(check, angel::SessionCheck::Expired(_)) && !refreshed {
-        refreshed = refresh_tokens(state, &snapshot).await?;
-        if !refreshed {
-            return Ok(());
-        }
-        snapshot = session_snapshot(state, user_id).await?;
-        check = angel::verify_session(
-            state,
-            &snapshot.credentials.api_key,
-            &snapshot.credentials.jwt_token,
-            &snapshot.credentials.refresh_token,
-        )
-        .await;
-    }
-    match check {
-        angel::SessionCheck::Valid => {
-            mark_valid_at_revision(
-                state,
-                user_id,
-                snapshot.profile.broker_credential_revision,
-                if refreshed { "refreshed" } else { "connected" },
-            )
-            .await?;
-        }
-        angel::SessionCheck::Expired(_) => {
-            mark_invalid_at_revision(
-                state,
-                user_id,
-                snapshot.profile.broker_credential_revision,
-                "Angel One API token is invalid or expired. Please establish the broker connection again.",
-            )
-            .await?;
-        }
-        angel::SessionCheck::Unavailable(message) => {
-            mark_unavailable_at_revision(
-                state,
-                user_id,
-                snapshot.profile.broker_credential_revision,
-                &message,
-            )
-            .await?;
-        }
-    }
+    refresh_tokens(state, &snapshot).await?;
     Ok(())
 }
 
@@ -491,6 +503,19 @@ pub async fn connect(
     headers: HeaderMap,
     Json(input): Json<ConnectRequest>,
 ) -> AppResult<Json<Value>> {
+    let mut snapshot = session_snapshot(&state, user.id).await?;
+    if connected_for_today(&snapshot.profile, &snapshot.credentials) {
+        maintain_user_session(&state, user.id).await?;
+        let refreshed = session_snapshot(&state, user.id).await?;
+        if connected_for_today(&refreshed.profile, &refreshed.credentials) {
+            return Ok(Json(json!({
+                "message":"Brokerage session is already established for today.",
+                "last_connected_at":refreshed.profile.token_received_at,
+                "details":details(&refreshed.profile, &refreshed.credentials),
+            })));
+        }
+        snapshot = refreshed;
+    }
     let identity = user.id.to_string();
     crate::security::rate_limit(
         &state,
@@ -510,7 +535,6 @@ pub async fn connect(
             "A valid MPIN and numeric TOTP are required.".into(),
         ));
     }
-    let snapshot = session_snapshot(&state, user.id).await?;
     if snapshot.credentials.api_key.is_empty() {
         return Err(AppError::BadRequest(
             "Add an Angel One API key before connecting.".into(),
@@ -629,4 +653,60 @@ pub async fn update_profile(
     Ok(Json(
         json!({"message":"Profile updated successfully.","details":details(&refreshed.profile, &refreshed.credentials)}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn profile(received: DateTime<Utc>) -> BrokerageProfile {
+        BrokerageProfile {
+            user_id: Uuid::nil(),
+            brokerage_user_id: "CLIENT01".into(),
+            broker_credential_revision: 1,
+            token_state: "connected".into(),
+            token_received_at: Some(received),
+            last_token_check_at: None,
+            last_token_status: "success".into(),
+            last_token_message: String::new(),
+            updated_at: timestamp("2026-07-28T03:30:00Z"),
+        }
+    }
+
+    fn credentials() -> BrokerCredentials {
+        BrokerCredentials {
+            api_key: "api".into(),
+            jwt_token: "jwt".into(),
+            refresh_token: "refresh".into(),
+            feed_token: "feed".into(),
+        }
+    }
+
+    #[test]
+    fn same_day_connection_uses_ist_calendar_boundaries() {
+        let before_midnight = timestamp("2026-07-28T18:20:00Z");
+        let after_midnight = timestamp("2026-07-28T18:40:00Z");
+        assert!(!same_ist_day(&before_midnight, &after_midnight));
+        assert!(same_ist_day(
+            &timestamp("2026-07-28T03:30:00Z"),
+            &before_midnight
+        ));
+    }
+
+    #[test]
+    fn same_day_connection_requires_every_session_token() {
+        let now = timestamp("2026-07-28T12:00:00Z");
+        let profile = profile(timestamp("2026-07-28T03:30:00Z"));
+        let mut credentials = credentials();
+        assert!(connected_for_today_at(&profile, &credentials, &now));
+
+        credentials.feed_token.clear();
+        assert!(!connected_for_today_at(&profile, &credentials, &now));
+    }
 }

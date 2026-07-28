@@ -51,9 +51,9 @@ export default function Layout({ children }) {
   const brokerConnectionState = String(
     brokerDetails?.connection_state || ""
   ).toLowerCase();
-  const brokerNeedsReconnect = ["invalid", "expired", "failed"].includes(
-    brokerConnectionState
-  );
+  const brokerNeedsReconnect =
+    !brokerDetails?.connected_for_today &&
+    ["invalid", "expired", "failed"].includes(brokerConnectionState);
 
   const navItems = useMemo(() => {
     if (permissions.administer_users) return adminNavItems;

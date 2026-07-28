@@ -104,6 +104,53 @@ describe("App", () => {
     ).toHaveAttribute("href", "/#broker-connection");
   });
 
+  it("does not request another broker login for a retained same-day session", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/auth/access/") {
+        return Promise.resolve({
+          data: {
+            username: "TRADER01",
+            permissions: { administer_users: false, live_trading: true },
+            trading_mode: "demo",
+          },
+        });
+      }
+      if (url === "/account/balance") {
+        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
+      }
+      return Promise.resolve({
+        data: {
+          client_id: "TRADER01",
+          api_key_configured: true,
+          connection_state: "unavailable",
+          connected_for_today: true,
+          connection_message:
+            "Today's broker session was preserved. Rulenix will retry automatically; no new login is required.",
+        },
+      });
+    });
+
+    setAuthUsername("TRADER01");
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Session Established" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("No additional broker login is required today.")
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Establish broker connection" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Connect" })
+    ).not.toBeInTheDocument();
+  });
+
   it("redirects administrators into an admin-only user workspace", async () => {
     axios.get.mockImplementation((url) => {
       if (url === "/auth/access/") {

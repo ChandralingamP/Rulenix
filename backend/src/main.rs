@@ -194,6 +194,7 @@ async fn main() -> Result<()> {
         strategy_events,
         strategy_feeds: Default::default(),
         session_checks: Default::default(),
+        angel_api_cooldowns: Default::default(),
         credentials: credential_store,
         abuse_prevention: Default::default(),
     };
