@@ -30,6 +30,12 @@ const draftFromInstrument = (instrument) => ({
   runEveningSession: instrument.run_evening_session ?? true,
 });
 
+const instrumentBadge = (instrument) => {
+  if (instrument.startsWith("GOLD")) return "Au";
+  if (instrument.startsWith("SILVER")) return "Ag";
+  if (instrument.startsWith("NATGAS")) return "NG";
+  return "IDX";
+};
 
 const Toggle = ({ active, label, disabled = false, onChange }) => (
   <button
@@ -306,7 +312,7 @@ export default function StrategiesPage() {
                               <td className="px-4 py-4">
                                 <div className="flex items-center gap-3">
                                   <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-amber-500/15 font-bold text-amber-300">
-                                    {instrument.instrument.startsWith("GOLD") ? "Au" : "IDX"}
+                                    {instrumentBadge(instrument.instrument)}
                                   </div>
                                   <div>
                                     <p className="font-semibold text-white">

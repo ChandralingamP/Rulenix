@@ -1,6 +1,7 @@
 use crate::{
     angel,
     auth::AuthUser,
+    contract_master::{self, MasterContract},
     credentials::BrokerCredentials,
     error::{AppError, AppResult},
     instruments::{
@@ -26,7 +27,10 @@ use chrono::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::FromRow;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
 
@@ -42,21 +46,6 @@ const KELTNER_ATR_PERIOD: usize = 10;
 const KELTNER_MULTIPLIER: f64 = 2.0;
 const TSI_LONG_PERIOD: usize = 25;
 const TSI_SHORT_PERIOD: usize = 13;
-const MASTER_URL: &str =
-    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json";
-
-#[derive(Debug, Clone, Deserialize)]
-struct MasterContract {
-    token: String,
-    symbol: String,
-    name: String,
-    expiry: String,
-    strike: String,
-    lotsize: String,
-    instrumenttype: String,
-    exch_seg: String,
-}
-
 #[derive(Debug, Clone)]
 struct OptionContract {
     token: String,
@@ -1532,26 +1521,8 @@ async fn resolve_futures_opening_range_plan(
     Ok(resolved)
 }
 
-async fn load_contract_master(state: &AppState) -> AppResult<Vec<MasterContract>> {
-    state
-        .http
-        .get(MASTER_URL)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!(
-                "Unable to download Angel One contract master: {error}"
-            ))
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            AppError::BadRequest(format!("Angel One contract master failed: {error}"))
-        })?
-        .json()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!("Invalid Angel One contract master: {error}"))
-        })
+async fn load_contract_master(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>> {
+    contract_master::load(state).await
 }
 
 async fn sensex_ltp(
@@ -5375,10 +5346,30 @@ pub async fn catalog(
     // The strategy card is a current-status surface, not an incident log. Keep the
     // complete event history in strategy_events/logs and return only the newest
     // recent alert here so resolved retries do not clutter the trading controls.
-    let alerts: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1")
+    let alerts: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 10")
         .bind(STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
+    let alerts: Vec<Value> = alerts
+        .into_iter()
+        .filter(|alert| {
+            alert
+                .get("instrument")
+                .and_then(Value::as_str)
+                .is_none_or(|instrument| {
+                    instrument.is_empty() || is_futures_breakout_instrument(instrument)
+                })
+        })
+        .take(1)
+        .collect();
     let runs: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('instrument',instrument,'session',session_key,'action',action,'status',status,'attempts',attempts,'scheduled_for',scheduled_for,'last_error',last_error,'updated_at',updated_at) FROM strategy_scheduler_runs WHERE strategy_key=$1 AND trade_date=$2 ORDER BY scheduled_for,action")
         .bind(STRATEGY_KEY).bind(ist_now().date_naive()).fetch_all(&state.db).await?;
+    let runs: Vec<Value> = runs
+        .into_iter()
+        .filter(|run| {
+            run.get("instrument")
+                .and_then(Value::as_str)
+                .is_some_and(is_futures_breakout_instrument)
+        })
+        .collect();
     let breakout_instruments: Vec<Value> = FUTURES_BREAKOUT_INSTRUMENTS
         .iter()
         .map(|instrument| {
@@ -5555,9 +5546,10 @@ pub async fn update(
         .trim()
         .to_uppercase();
     if strategy_key == STRATEGY_KEY && !is_futures_breakout_instrument(&instrument) {
-        return Err(AppError::BadRequest(
-            "Futures Breakout supports GOLD, GOLDM, and GOLDTEN.".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "Futures Breakout supports {}.",
+            FUTURES_BREAKOUT_INSTRUMENTS.join(", ")
+        )));
     }
     if strategy_key == OPTION_ENTRY_STRATEGY_KEY && instrument != "SENSEX" {
         return Err(AppError::BadRequest(
@@ -5611,9 +5603,10 @@ pub async fn status(
         .unwrap_or_else(|| "GOLDTEN".into())
         .to_uppercase();
     if !is_futures_breakout_instrument(&instrument) {
-        return Err(AppError::BadRequest(
-            "Futures Breakout supports GOLD, GOLDM, and GOLDTEN.".into(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "Futures Breakout supports {}.",
+            FUTURES_BREAKOUT_INSTRUMENTS.join(", ")
+        )));
     }
     let config:Option<(bool,i32,bool,bool)>=sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument=$3").bind(user).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await?;
     let strategy_active = activation_state(&state, user).await?;
@@ -5800,14 +5793,22 @@ mod tests {
     }
 
     #[test]
-    fn selects_each_supported_gold_contract_independently() {
+    fn selects_each_supported_futures_contract_independently() {
         let items = vec![
-            contract_for("GOLD", "31AUG2026", 1),
             contract_for("GOLDM", "31AUG2026", 100),
             contract_for("GOLDTEN", "31AUG2026", 10),
+            contract_for("SILVERM", "31AUG2026", 5),
+            contract_for("SILVERMIC", "31AUG2026", 1),
+            contract_for("NATGASMINI", "31AUG2026", 250),
         ];
         let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
-        for (instrument, lot_size) in [("GOLD", 1), ("GOLDM", 100), ("GOLDTEN", 10)] {
+        for (instrument, lot_size) in [
+            ("GOLDTEN", 10),
+            ("GOLDM", 100),
+            ("SILVERM", 5),
+            ("SILVERMIC", 1),
+            ("NATGASMINI", 250),
+        ] {
             let selected = select_contract(&items, instrument, date).unwrap();
             assert_eq!(selected.0.name, instrument);
             assert_eq!(parse_lot_size(&selected.0.lotsize), Some(lot_size));
@@ -5943,10 +5944,12 @@ mod tests {
     }
 
     #[test]
-    fn gold_runtime_pnl_uses_each_contract_point_value() {
-        assert_eq!(runtime_pnl_units("GOLD", 4, Some(1)), 400.0);
+    fn futures_runtime_pnl_uses_each_contract_point_value() {
         assert_eq!(runtime_pnl_units("GOLDM", 400, Some(100)), 40.0);
         assert_eq!(runtime_pnl_units("GOLDTEN", 40, Some(10)), 4.0);
+        assert_eq!(runtime_pnl_units("SILVERM", 20, Some(5)), 20.0);
+        assert_eq!(runtime_pnl_units("SILVERMIC", 4, Some(1)), 4.0);
+        assert_eq!(runtime_pnl_units("NATGASMINI", 1_000, Some(250)), 1_000.0);
         assert_eq!(
             trade_pnl(
                 "BUY",

@@ -293,9 +293,13 @@ export default function BacktestingPage() {
                 <option value="SENSEX">SENSEX</option>
               ) : (
                 <>
-                  <option value="GOLDTEN">GOLDTEN</option>
+                  <option value="GOLDTEN">GOLDTEN · Gold Ten</option>
                   <option value="GOLDM">GOLDM · Gold Mini</option>
-                  <option value="GOLD">GOLD · Gold</option>
+                  <option value="SILVERM">SILVERM · Silver Mini</option>
+                  <option value="SILVERMIC">SILVERMIC · Silver Micro</option>
+                  <option value="NATGASMINI">
+                    NATGASMINI · Natural Gas Mini
+                  </option>
                 </>
               )}
             </select>

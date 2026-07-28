@@ -5,6 +5,7 @@ mod audit;
 mod auth;
 mod backtesting;
 mod config;
+mod contract_master;
 mod credentials;
 mod error;
 mod home;

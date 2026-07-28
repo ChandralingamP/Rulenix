@@ -53,6 +53,93 @@ fn validate(query: &PnlQuery) -> AppResult<(i64, i64, String)> {
     Ok((page, page_size, mode))
 }
 
+const TRADE_ROWS_SQL: &str = r#"
+    SELECT
+        id,
+        execution_mode,
+        status,
+        direction,
+        quantity,
+        entry_price::float8 AS entry_price,
+        exit_price::float8 AS exit_price,
+        last_price::float8 AS last_price,
+        pnl::float8 AS pnl,
+        CASE
+            WHEN status='open' AND entry_price IS NOT NULL THEN
+                pnl::float8
+                + (
+                    CASE
+                        WHEN direction='BUY'
+                            THEN COALESCE(last_price,entry_price)-entry_price
+                        ELSE entry_price-COALESCE(last_price,entry_price)
+                    END
+                ) * (
+                    CASE
+                        WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
+                            THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
+                        WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
+                            THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                        WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERM'
+                            THEN COALESCE(NULLIF(remaining_lots,0)::float8*5.0,quantity::float8)
+                        WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERMIC'
+                            THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8)
+                        WHEN strategy_key='futures_breakout_v3' AND instrument_label='NATGASMINI'
+                            THEN COALESCE(NULLIF(remaining_lots,0)::float8*250.0,quantity::float8)
+                        ELSE quantity::float8
+                    END
+                )
+            ELSE pnl::float8
+        END AS pnl_realtime,
+        entry_datetime,
+        exit_datetime,
+        instrument_label,
+        contract_symbol,
+        notes
+    FROM trades
+    WHERE user_id=$1
+      AND status IN ('open','closed')
+      AND ($2='all' OR execution_mode=$2)
+    ORDER BY exit_datetime DESC NULLS FIRST,entry_datetime DESC NULLS LAST
+    LIMIT $3 OFFSET $4
+"#;
+
+const TRADE_TOTAL_SQL: &str = r#"
+    SELECT
+        COUNT(*)::bigint,
+        COALESCE(SUM(
+            CASE
+                WHEN status='open' AND entry_price IS NOT NULL THEN
+                    pnl::float8
+                    + (
+                        CASE
+                            WHEN direction='BUY'
+                                THEN COALESCE(last_price,entry_price)-entry_price
+                            ELSE entry_price-COALESCE(last_price,entry_price)
+                        END
+                    ) * (
+                        CASE
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*5.0,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERMIC'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='NATGASMINI'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*250.0,quantity::float8)
+                            ELSE quantity::float8
+                        END
+                    )
+                ELSE pnl::float8
+            END
+        ),0)::float8
+    FROM trades
+    WHERE user_id=$1
+      AND status IN ('open','closed')
+      AND ($2='all' OR execution_mode=$2)
+"#;
+
 async fn rows(
     state: &AppState,
     user_id: Uuid,
@@ -60,8 +147,13 @@ async fn rows(
     limit: i64,
     offset: i64,
 ) -> AppResult<Vec<TradeRow>> {
-    Ok(sqlx::query_as("SELECT id,execution_mode,status,direction,quantity,entry_price::float8 AS entry_price,exit_price::float8 AS exit_price,last_price::float8 AS last_price,pnl::float8 AS pnl,CASE WHEN status='open' AND entry_price IS NOT NULL THEN pnl::float8+(CASE WHEN direction='BUY' THEN COALESCE(last_price,entry_price)-entry_price ELSE entry_price-COALESCE(last_price,entry_price) END)*(CASE WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD' THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0) WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM' THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0) WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN' THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0) ELSE quantity::float8 END) ELSE pnl::float8 END AS pnl_realtime,entry_datetime,exit_datetime,instrument_label,contract_symbol,notes FROM trades WHERE user_id=$1 AND status IN ('open','closed') AND ($2='all' OR execution_mode=$2) ORDER BY exit_datetime DESC NULLS FIRST,entry_datetime DESC NULLS LAST LIMIT $3 OFFSET $4")
-        .bind(user_id).bind(mode).bind(limit).bind(offset).fetch_all(&state.db).await?)
+    Ok(sqlx::query_as(TRADE_ROWS_SQL)
+        .bind(user_id)
+        .bind(mode)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?)
 }
 
 pub async fn list(
@@ -71,8 +163,11 @@ pub async fn list(
 ) -> AppResult<Json<Value>> {
     let user_id = user.id;
     let (page, page_size, mode) = validate(&query)?;
-    let (count, total): (i64, f64) = sqlx::query_as("SELECT COUNT(*)::bigint,COALESCE(SUM(CASE WHEN status='open' AND entry_price IS NOT NULL THEN pnl::float8+(CASE WHEN direction='BUY' THEN COALESCE(last_price,entry_price)-entry_price ELSE entry_price-COALESCE(last_price,entry_price) END)*(CASE WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD' THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0) WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM' THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0) WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN' THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0) ELSE quantity::float8 END) ELSE pnl::float8 END),0)::float8 FROM trades WHERE user_id=$1 AND status IN ('open','closed') AND ($2='all' OR execution_mode=$2)")
-        .bind(user_id).bind(&mode).fetch_one(&state.db).await?;
+    let (count, total): (i64, f64) = sqlx::query_as(TRADE_TOTAL_SQL)
+        .bind(user_id)
+        .bind(&mode)
+        .fetch_one(&state.db)
+        .await?;
     let records = rows(&state, user_id, &mode, page_size, (page - 1) * page_size).await?;
     let total_pages = ((count + page_size - 1) / page_size).max(1);
     Ok(Json(

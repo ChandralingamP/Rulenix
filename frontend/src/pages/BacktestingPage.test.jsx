@@ -29,17 +29,23 @@ describe("BacktestingPage", () => {
     vi.clearAllMocks();
   });
 
-  it("offers all supported gold futures breakout instruments", async () => {
+  it("offers all supported futures breakout instruments", async () => {
     apiClient.get.mockResolvedValue({ data: { runs: [] } });
     const user = userEvent.setup();
     render(<BacktestingPage />);
 
     await user.selectOptions(screen.getByLabelText("Strategy"), "futures_breakout_v3");
     expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDTEN");
+    expect(screen.getByRole("option", { name: "GOLDTEN · Gold Ten" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "GOLDM · Gold Mini" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "GOLD · Gold" })).toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("Instrument"), "GOLDM");
-    expect(screen.getByLabelText("Instrument")).toHaveValue("GOLDM");
+    expect(screen.getByRole("option", { name: "SILVERM · Silver Mini" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "SILVERMIC · Silver Micro" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "NATGASMINI · Natural Gas Mini" })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "GOLD · Gold" })).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Instrument"), "NATGASMINI");
+    expect(screen.getByLabelText("Instrument")).toHaveValue("NATGASMINI");
     expect(screen.queryByLabelText("Stop loss %")).not.toBeInTheDocument();
   });
 
@@ -100,7 +106,7 @@ describe("BacktestingPage", () => {
     }
   });
 
-  it("shows SL2 reversal entries and each GOLD exit event", async () => {
+  it("shows SL2 reversal entries and each futures exit event", async () => {
     apiClient.get.mockResolvedValue({ data: { runs: [] } });
     apiClient.post.mockResolvedValue({
       data: {

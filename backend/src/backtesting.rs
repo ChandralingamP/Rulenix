@@ -1,6 +1,7 @@
 use crate::{
     angel,
     auth::AuthUser,
+    contract_master::{self, MasterContract},
     error::{AppError, AppResult},
     instruments::{
         FUTURES_BREAKOUT_INSTRUMENTS, futures_pnl_multiplier_per_lot,
@@ -23,14 +24,15 @@ use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday,
 };
 use rust_xlsxwriter::Workbook;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::FromRow;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use uuid::Uuid;
 
-const MASTER_URL: &str =
-    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json";
 const OPTION_SUPPORTED_INSTRUMENT: &str = "SENSEX";
 const SENSEX_INDEX_TOKEN: &str = "99919000";
 const OPTION_INTERVAL: &str = "FIVE_MINUTE";
@@ -45,26 +47,6 @@ const KELTNER_MULTIPLIER: f64 = 2.0;
 const TSI_LONG_PERIOD: usize = 25;
 const TSI_SHORT_PERIOD: usize = 13;
 const TRADING_DAY_BLOCK_MESSAGE: &str = "Backtesting is disabled for the entire Indian trading day to reserve Angel One API capacity for live market data and order execution. Try again on a weekend or full market holiday.";
-
-#[derive(Debug, Clone, Deserialize)]
-struct MasterContract {
-    #[serde(deserialize_with = "string_from_any")]
-    token: String,
-    #[serde(deserialize_with = "string_from_any")]
-    symbol: String,
-    #[serde(deserialize_with = "string_from_any")]
-    name: String,
-    #[serde(deserialize_with = "string_from_any")]
-    expiry: String,
-    #[serde(default, deserialize_with = "string_from_any")]
-    strike: String,
-    #[serde(deserialize_with = "string_from_any")]
-    lotsize: String,
-    #[serde(deserialize_with = "string_from_any")]
-    instrumenttype: String,
-    #[serde(deserialize_with = "string_from_any")]
-    exch_seg: String,
-}
 
 #[derive(Debug, Clone, Copy)]
 struct Levels {
@@ -372,20 +354,6 @@ fn ist_offset() -> FixedOffset {
     FixedOffset::east_opt(19_800).expect("valid IST offset")
 }
 
-fn string_from_any<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(match value {
-        Value::String(text) => text,
-        Value::Number(number) => number.to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    })
-}
-
 fn normalize_interval(value: Option<String>) -> AppResult<String> {
     let interval = value
         .unwrap_or_else(|| "FIFTEEN_MINUTE".into())
@@ -535,27 +503,8 @@ fn option_backtest_candidates(
     candidates
 }
 
-async fn load_contract_master(state: &AppState) -> AppResult<Vec<MasterContract>> {
-    state
-        .http
-        .get(MASTER_URL)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!(
-                "Unable to download Angel One contract master: {error}"
-            ))
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            AppError::BadRequest(format!("Angel One contract master failed: {error}"))
-        })?
-        .json()
-        .await
-        .map_err(|error| {
-            AppError::BadRequest(format!("Invalid Angel One contract master: {error}"))
-        })
+async fn load_contract_master(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>> {
+    contract_master::load(state).await
 }
 
 pub(crate) async fn current_contract(
@@ -1760,7 +1709,7 @@ fn simulate(
             trade.levels.get("entry_reason").and_then(Value::as_str) == Some("SL2_REVERSAL")
         }).count(),
         "pnl_multiplier_per_lot": pnl_multiplier,
-        "pnl_model": "gold_price_points_x_contract_value_x_lots",
+        "pnl_model": "futures_price_points_x_contract_value_x_lots",
         "entry_frequency": "one_breakout_per_session_plus_sl2_reversals",
         "gap_entry_rule": "gap_direction_only; jumped_entries_use_completed_09:00_09:15_range_with_0.12_percent_buffer",
         "margin_requirement_percent": margin_requirement_percent,
@@ -3451,12 +3400,22 @@ mod tests {
 
     #[test]
     fn futures_backtest_uses_contract_specific_point_values() {
-        assert_eq!(pnl_multiplier_per_lot("GOLD"), 100.0);
         assert_eq!(pnl_multiplier_per_lot("GOLDM"), 10.0);
         assert_eq!(pnl_multiplier_per_lot("GOLDTEN"), 1.0);
-        assert_eq!(futures_margin_per_lot(100_000.0, "GOLD", 10.0), 1_000_000.0);
+        assert_eq!(pnl_multiplier_per_lot("SILVERM"), 5.0);
+        assert_eq!(pnl_multiplier_per_lot("SILVERMIC"), 1.0);
+        assert_eq!(pnl_multiplier_per_lot("NATGASMINI"), 250.0);
         assert_eq!(futures_margin_per_lot(100_000.0, "GOLDM", 10.0), 100_000.0);
         assert_eq!(futures_margin_per_lot(100_000.0, "GOLDTEN", 10.0), 10_000.0);
+        assert_eq!(futures_margin_per_lot(100_000.0, "SILVERM", 10.0), 50_000.0);
+        assert_eq!(
+            futures_margin_per_lot(100_000.0, "SILVERMIC", 10.0),
+            10_000.0
+        );
+        assert_eq!(
+            futures_margin_per_lot(100_000.0, "NATGASMINI", 10.0),
+            2_500_000.0
+        );
     }
 
     #[test]
@@ -3594,7 +3553,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_uses_gold_lots_for_pnl_not_contract_quantity() {
+    fn simulator_uses_configured_lots_and_contract_point_value_for_pnl() {
         let daily = vec![
             candle(1, 95.0, 100.0, 90.0, 96.0),
             candle(2, 96.0, 101.0, 91.0, 97.0),
@@ -3632,7 +3591,7 @@ mod tests {
         assert_eq!(summary["pnl_multiplier_per_lot"], 1.0);
         assert_eq!(
             summary["pnl_model"],
-            "gold_price_points_x_contract_value_x_lots"
+            "futures_price_points_x_contract_value_x_lots"
         );
         assert_eq!(trades[0].levels["contract_lot_size"], 10);
         assert_eq!(trades[0].levels["partial_exit_quantity"], 10);

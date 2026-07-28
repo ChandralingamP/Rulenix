@@ -25,7 +25,7 @@ const instrument = {
     status: "ready",
     contract_symbol: "GOLDTEN05AUG26FUT",
     contract_expiry: "2026-08-05",
-    lot_size: 1,
+    lot_size: 10,
   },
 };
 
@@ -152,7 +152,7 @@ describe("StrategiesPage", () => {
     expect(screen.queryByText("Older broker issue")).not.toBeInTheDocument();
   });
 
-  it("renders Gold, Gold Mini, and Gold Ten as independent instruments", async () => {
+  it("renders each supported futures contract as an independent instrument", async () => {
     setAuthUsername("TRADER01");
     apiClient.get.mockResolvedValue({
       data: {
@@ -174,12 +174,32 @@ describe("StrategiesPage", () => {
               },
               {
                 ...instrument,
-                instrument: "GOLD",
-                label: "Gold",
+                instrument: "SILVERM",
+                label: "Silver Mini",
                 snapshot: {
                   ...instrument.snapshot,
-                  contract_symbol: "GOLD05OCT26FUT",
+                  contract_symbol: "SILVERM30NOV26FUT",
+                  lot_size: 5,
+                },
+              },
+              {
+                ...instrument,
+                instrument: "SILVERMIC",
+                label: "Silver Micro",
+                snapshot: {
+                  ...instrument.snapshot,
+                  contract_symbol: "SILVERMIC30NOV26FUT",
                   lot_size: 1,
+                },
+              },
+              {
+                ...instrument,
+                instrument: "NATGASMINI",
+                label: "Natural Gas Mini",
+                snapshot: {
+                  ...instrument.snapshot,
+                  contract_symbol: "NATGASMINI24NOV26FUT",
+                  lot_size: 250,
                 },
               },
             ],
@@ -197,10 +217,15 @@ describe("StrategiesPage", () => {
 
     expect(await screen.findByText("Gold Ten")).toBeInTheDocument();
     expect(screen.getByText("Gold Mini")).toBeInTheDocument();
-    expect(screen.getByText("Gold")).toBeInTheDocument();
+    expect(screen.getByText("Silver Mini")).toBeInTheDocument();
+    expect(screen.getByText("Silver Micro")).toBeInTheDocument();
+    expect(screen.getByText("Natural Gas Mini")).toBeInTheDocument();
     expect(screen.getByLabelText("GOLDTEN trade lots")).toBeInTheDocument();
     expect(screen.getByLabelText("GOLDM trade lots")).toBeInTheDocument();
-    expect(screen.getByLabelText("GOLD trade lots")).toBeInTheDocument();
+    expect(screen.getByLabelText("SILVERM trade lots")).toBeInTheDocument();
+    expect(screen.getByLabelText("SILVERMIC trade lots")).toBeInTheDocument();
+    expect(screen.getByLabelText("NATGASMINI trade lots")).toBeInTheDocument();
+    expect(screen.queryByLabelText("GOLD trade lots")).not.toBeInTheDocument();
   });
 
 });

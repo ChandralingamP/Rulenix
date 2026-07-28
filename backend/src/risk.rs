@@ -265,12 +265,16 @@ pub async fn assess_and_reserve(
                     COALESCE(SUM(o.quantity), 0)::bigint quantity,
                     COALESCE(SUM(
                         o.price * CASE
-                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLD'
-                                THEN o.lots::float8 * 100.0
                             WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLDM'
                                 THEN o.lots::float8 * 10.0
                             WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='GOLDTEN'
                                 THEN o.lots::float8
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='SILVERM'
+                                THEN o.lots::float8 * 5.0
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='SILVERMIC'
+                                THEN o.lots::float8
+                            WHEN s.strategy_key='futures_breakout_v3' AND s.instrument='NATGASMINI'
+                                THEN o.lots::float8 * 250.0
                             ELSE o.quantity::float8
                         END
                     ), 0)::float8 notional,
@@ -290,12 +294,16 @@ pub async fn assess_and_reserve(
                     COALESCE(SUM(quantity), 0)::bigint quantity,
                     COALESCE(SUM(
                         COALESCE(last_price,entry_price) * CASE
-                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD'
-                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0)
                             WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
                                 THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
                             WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
                                 THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*5.0,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERMIC'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='NATGASMINI'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*250.0,quantity::float8)
                             ELSE quantity::float8
                         END
                     ), 0)::float8 notional,
@@ -307,12 +315,16 @@ pub async fn assess_and_reserve(
                                 ELSE entry_price-COALESCE(last_price,entry_price)
                             END
                         ) * CASE
-                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLD'
-                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*100.0,quantity::float8*100.0)
                             WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
                                 THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
                             WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
                                 THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERM'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*5.0,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERMIC'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8)
+                            WHEN strategy_key='futures_breakout_v3' AND instrument_label='NATGASMINI'
+                                THEN COALESCE(NULLIF(remaining_lots,0)::float8*250.0,quantity::float8)
                             ELSE quantity::float8
                         END
                     ), 0)::float8 unrealized
