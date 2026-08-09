@@ -22,7 +22,7 @@ Use `scripts/staging-soak-report.ps1` as a starting point.
 - `FRONTEND_ORIGINS` matches the production HTTPS origin.
 - PostgreSQL backups encrypted and restore verification passed.
 - Alert webhook configured and tested.
-- `/api/health/ready` and `/api/metrics` monitored.
+- `/api/health/ready` monitored publicly and `/api/metrics` monitored through an authenticated administrator session or an internal-only path.
 - Risk limits reviewed.
 - Global kill switch tested in demo.
 - Admin and live-trading permissions reviewed.

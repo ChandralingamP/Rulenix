@@ -52,6 +52,8 @@ export const saveStrategyInstrument = createAsyncThunk(
       lots,
       runDaySession = true,
       runEveningSession = true,
+      targetPoints,
+      stopLossPoints,
     },
     thunkAPI
   ) => {
@@ -65,6 +67,8 @@ export const saveStrategyInstrument = createAsyncThunk(
         lots,
         run_day_session: runDaySession,
         run_evening_session: runEveningSession,
+        target_points: targetPoints,
+        stop_loss_points: stopLossPoints,
       });
       const response = await apiClient.get("/strategies");
       return response.data?.strategies || [];

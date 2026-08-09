@@ -144,7 +144,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn cookie_headers(state: &AppState, session: &str, csrf: &str) -> AppResult<HeaderMap> {
-    let secure = if state.config.app_env.eq_ignore_ascii_case("production") {
+    let secure = if state.config.requires_secure_transport_headers() {
         "; Secure"
     } else {
         ""
@@ -169,7 +169,7 @@ fn cookie_headers(state: &AppState, session: &str, csrf: &str) -> AppResult<Head
 }
 
 fn clear_cookie_headers(state: &AppState) -> HeaderMap {
-    let secure = if state.config.app_env.eq_ignore_ascii_case("production") {
+    let secure = if state.config.requires_secure_transport_headers() {
         "; Secure"
     } else {
         ""

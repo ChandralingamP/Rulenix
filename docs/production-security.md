@@ -28,6 +28,10 @@ Preferred sources:
 
 Never inject MPINs, TOTPs, broker tokens, SMTP passwords, or encryption keys through command-line arguments because they can appear in process listings.
 
+## Operational Data
+
+Runtime market logs are written under `RULENIX_LOG_DIR` and should be backed by a writable service-owned volume when the backend root filesystem is read-only. Keep this directory out of source control and do not place credential files in it.
+
 ## OTPs
 
 API responses do not return OTP values. In development, missing SMTP causes OTP delivery to be logged for local testing. Production validation requires SMTP so OTP values are not logged as a fallback.

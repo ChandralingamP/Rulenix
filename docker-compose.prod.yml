@@ -22,8 +22,11 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env.production
+    environment:
+      RULENIX_LOG_DIR: /var/log/rulenix
     volumes:
       - ./secrets/postgres_ca.crt:/run/secrets/postgres_ca.crt:ro
+      - backend_logs:/var/log/rulenix
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,6 +63,7 @@ services:
 
 volumes:
   postgres_data:
+  backend_logs:
 
 secrets:
   postgres_password:

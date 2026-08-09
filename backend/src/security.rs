@@ -225,7 +225,7 @@ pub async fn security_headers(
             "camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()",
         ),
     );
-    if state.config.is_production() {
+    if state.config.requires_secure_transport_headers() {
         headers.insert(
             header::STRICT_TRANSPORT_SECURITY,
             HeaderValue::from_static("max-age=31536000; includeSubDomains"),

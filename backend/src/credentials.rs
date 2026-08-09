@@ -252,6 +252,7 @@ impl CredentialStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn clear_tokens(&self, user_id: Uuid) -> AppResult<()> {
         self.put(
             user_id,

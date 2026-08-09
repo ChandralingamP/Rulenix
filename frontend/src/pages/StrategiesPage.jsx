@@ -28,6 +28,10 @@ const draftFromInstrument = (instrument) => ({
   lots: instrument.lots || 1,
   runDaySession: instrument.run_day_session ?? true,
   runEveningSession: instrument.run_evening_session ?? true,
+  targetPoints:
+    instrument.target_points ?? instrument.parameters?.target_points ?? "",
+  stopLossPoints:
+    instrument.stop_loss_points ?? instrument.parameters?.stop_loss_points ?? "",
 });
 
 const instrumentBadge = (instrument) => {
@@ -105,6 +109,8 @@ export default function StrategiesPage() {
     const draft = { ...drafts[key], ...changes };
     const lots = Number(draft?.lots);
     if (!Number.isInteger(lots) || lots <= 0) return;
+    const targetPoints = Number(draft?.targetPoints);
+    const stopLossPoints = Number(draft?.stopLossPoints);
     dispatch(
       saveStrategyInstrument({
         strategyKey: strategy.key,
@@ -113,6 +119,14 @@ export default function StrategiesPage() {
         lots,
         runDaySession: Boolean(draft.runDaySession),
         runEveningSession: Boolean(draft.runEveningSession),
+        targetPoints:
+          strategy.key === "supertrend_index_options_v1"
+            ? targetPoints
+            : undefined,
+        stopLossPoints:
+          strategy.key === "supertrend_index_options_v1"
+            ? stopLossPoints
+            : undefined,
       })
     );
   };
@@ -241,9 +255,7 @@ export default function StrategiesPage() {
                               : "border-amber-500/30 bg-amber-500/10 text-amber-200"
                           }`}
                         >
-                          {alert.code === "risk_rejected" && alert.message
-                            ? alert.message
-                            : TRADING_PAUSED_MESSAGE}
+                          {alert.message || TRADING_PAUSED_MESSAGE}
                         </div>
                       ))}
                     </div>
@@ -283,7 +295,7 @@ export default function StrategiesPage() {
                   </div>
 
                   <div className="overflow-x-auto rounded-xl border border-slate-800">
-                    <table className="w-full min-w-[820px] text-left text-sm">
+                    <table className="w-full min-w-[980px] text-left text-sm">
                       <thead className="bg-slate-900/90 text-[11px] uppercase tracking-wider text-slate-500">
                         <tr>
                           <th className="px-4 py-3 font-semibold">Instrument</th>
@@ -291,6 +303,8 @@ export default function StrategiesPage() {
                           <th className="px-4 py-3 font-semibold">Expiry</th>
                           <th className="px-4 py-3 font-semibold">Contract lot</th>
                           <th className="px-4 py-3 font-semibold">Trade lots</th>
+                          <th className="px-4 py-3 font-semibold">TP points</th>
+                          <th className="px-4 py-3 font-semibold">SL points</th>
                           <th className="px-4 py-3 text-center font-semibold">Use</th>
                           <th className="px-4 py-3" />
                         </tr>
@@ -302,8 +316,18 @@ export default function StrategiesPage() {
                             drafts[key] || draftFromInstrument(instrument);
                           const lots = Number(draft.lots);
                           const lotsValid = Number.isInteger(lots) && lots > 0;
-                          const parametersValid = true;
+                          const usesPointExits =
+                            strategy.key === "supertrend_index_options_v1";
+                          const targetPoints = Number(draft.targetPoints);
+                          const stopLossPoints = Number(draft.stopLossPoints);
+                          const parametersValid =
+                            !usesPointExits ||
+                            (Number.isFinite(targetPoints) &&
+                              targetPoints > 0 &&
+                              Number.isFinite(stopLossPoints) &&
+                              stopLossPoints > 0);
                           const snapshot = instrument.snapshot;
+                          const marketData = snapshot?.market_data;
                           const isContractPreview =
                             snapshot?.execution_key === "catalog-preview";
                           return (
@@ -339,6 +363,17 @@ export default function StrategiesPage() {
                                     Contract details unavailable
                                   </p>
                                 ) : null}
+                                {marketData ? (
+                                  <p
+                                    className={`mt-1 text-xs ${
+                                      marketData.status === "connected"
+                                        ? "text-emerald-300"
+                                        : "text-rose-300"
+                                    }`}
+                                  >
+                                    {marketData.message}
+                                  </p>
+                                ) : null}
                               </td>
                               <td className="px-4 py-4 text-slate-300">
                                 {formatDate(snapshot?.contract_expiry)}
@@ -362,6 +397,54 @@ export default function StrategiesPage() {
                                       : "border-rose-500 focus:ring-rose-500/20"
                                   }`}
                                 />
+                              </td>
+                              <td className="px-4 py-4">
+                                {usesPointExits ? (
+                                  <input
+                                    aria-label={`${instrument.instrument} target points`}
+                                    type="number"
+                                    min="0.05"
+                                    step="0.05"
+                                    value={draft.targetPoints}
+                                    onChange={(event) =>
+                                      updateDraft(key, {
+                                        targetPoints: event.target.value,
+                                      })
+                                    }
+                                    className={`h-9 w-24 rounded-lg border bg-slate-900 px-3 text-white outline-none focus:ring ${
+                                      Number.isFinite(targetPoints) &&
+                                      targetPoints > 0
+                                        ? "border-slate-700 focus:border-brand-400 focus:ring-brand-500/20"
+                                        : "border-rose-500 focus:ring-rose-500/20"
+                                    }`}
+                                  />
+                                ) : (
+                                  <span className="text-slate-500">—</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-4">
+                                {usesPointExits ? (
+                                  <input
+                                    aria-label={`${instrument.instrument} stop loss points`}
+                                    type="number"
+                                    min="0.05"
+                                    step="0.05"
+                                    value={draft.stopLossPoints}
+                                    onChange={(event) =>
+                                      updateDraft(key, {
+                                        stopLossPoints: event.target.value,
+                                      })
+                                    }
+                                    className={`h-9 w-24 rounded-lg border bg-slate-900 px-3 text-white outline-none focus:ring ${
+                                      Number.isFinite(stopLossPoints) &&
+                                      stopLossPoints > 0
+                                        ? "border-slate-700 focus:border-brand-400 focus:ring-brand-500/20"
+                                        : "border-rose-500 focus:ring-rose-500/20"
+                                    }`}
+                                  />
+                                ) : (
+                                  <span className="text-slate-500">—</span>
+                                )}
                               </td>
                               <td className="px-4 py-4 text-center">
                                 <Toggle

@@ -193,8 +193,10 @@ async fn main() -> Result<()> {
         config: config.clone(),
         strategy_events,
         strategy_feeds: Default::default(),
+        strategy_feed_tokens: Default::default(),
         session_checks: Default::default(),
         angel_api_cooldowns: Default::default(),
+        shared_market_cursor: Default::default(),
         credentials: credential_store,
         abuse_prevention: Default::default(),
     };
@@ -216,7 +218,6 @@ async fn main() -> Result<()> {
         .route("/health", get(ops::liveness))
         .route("/health/live", get(ops::liveness))
         .route("/health/ready", get(ops::readiness))
-        .route("/metrics", get(ops::metrics))
         .route("/auth/request-otp/", post(auth::request_otp))
         .route("/auth/signup/", post(auth::signup))
         .route("/auth/login/", post(auth::login))
@@ -224,6 +225,7 @@ async fn main() -> Result<()> {
         .route("/auth/password/verify-otp/", post(auth::verify_reset))
         .route("/auth/password/reset/", post(auth::reset_password));
     let protected_api = Router::new()
+        .route("/metrics", get(ops::metrics))
         .route("/auth/access/", get(auth::access_status))
         .route("/auth/logout/", post(auth::logout))
         .route(
@@ -341,6 +343,35 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Ctrl+C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler");
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
+}
+
 #[cfg(test)]
 mod tests {
     use super::configured_initial_admin;
@@ -385,33 +416,4 @@ mod tests {
         assert_eq!(value.1, "admin@rulenix.in");
         assert_eq!(value.2, "strong secret");
     }
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "failed to install Ctrl+C handler");
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to install SIGTERM handler");
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    tracing::info!("shutdown signal received");
 }

@@ -1,8 +1,13 @@
 use crate::{
+    auth::{AuthUser, require_admin_permission},
     error::{AppError, AppResult},
     state::AppState,
 };
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Extension, State},
+    http::StatusCode,
+};
 use serde_json::{Value, json};
 
 pub async fn liveness() -> (StatusCode, Json<Value>) {
@@ -23,7 +28,11 @@ pub async fn readiness(State(state): State<AppState>) -> AppResult<Json<Value>> 
     })))
 }
 
-pub async fn metrics(State(state): State<AppState>) -> AppResult<Json<Value>> {
+pub async fn metrics(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+) -> AppResult<Json<Value>> {
+    require_admin_permission(&admin)?;
     let active_sessions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM user_sessions WHERE revoked_at IS NULL AND idle_expires_at>NOW() AND absolute_expires_at>NOW()",
     )

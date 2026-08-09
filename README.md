@@ -1,10 +1,10 @@
 # Rulenix
 
 Rulenix is a Rust and React trading operations platform derived from the
-QuantStrike user experience. It intentionally excludes the Instruments page,
-Strategy Alpha, configuration, and backtesting. The retained application
-includes account signup/login and OTP reset, Angel One session management,
-trade P&L reporting/export, user-scoped logs, and staff administration.
+QuantStrike user experience. It includes account signup/login and OTP reset,
+Angel One session management, demo/live strategy execution, backtesting, trade
+P&L reporting/export, user-scoped logs, risk controls, and staff
+administration.
 
 ## Stack
 
@@ -351,6 +351,10 @@ npm run build
 
 ## Production operations
 
+- Current project workflow: [project-workflow.md](docs/project-workflow.md)
+- Futures Breakout v3 strategy: [strategy-futures-breakout-v3.md](docs/strategy-futures-breakout-v3.md)
+- Option Entry Strategy V1.0: [strategy-option-entry-v1.md](docs/strategy-option-entry-v1.md)
+- SuperTrend Index Options v1: [strategy-supertrend-index-options-v1.md](docs/strategy-supertrend-index-options-v1.md)
 - Deployment and rollback: [deployment.md](docs/deployment.md)
 - TLS and secret injection: [production-security.md](docs/production-security.md)
 - Observability and audit trail: [observability.md](docs/observability.md)

@@ -50,12 +50,22 @@ function tradeSymbolLabel(trade, fallback) {
 function tradeEntryReason(trade, strategyKey) {
   const reason = trade?.levels?.entry_reason;
   if (reason === "SL2_REVERSAL") return "SL2 reversal";
+  if (strategyKey === "option_entry_v1") {
+    const assumedSide = trade?.levels?.assumed_option_side;
+    const optionType = trade?.levels?.assumed_option_type || trade?.levels?.option_type;
+    if (assumedSide && optionType) {
+      return `Option signal: ${assumedSide} / ${optionType}`;
+    }
+    if (optionType === "CE") return "Option signal: CALL / CE";
+    if (optionType === "PE") return "Option signal: PUT / PE";
+    return "Option signal";
+  }
   if (trade?.levels?.entry_source === "OPENING_RANGE") {
     return "15 min gap breakout";
   }
   if (trade?.levels?.gap_direction === "UP") return "Gap-up breakout";
   if (trade?.levels?.gap_direction === "DOWN") return "Gap-down breakout";
-  return strategyKey === "option_entry_v1" ? "Option signal" : "Breakout";
+  return "Breakout";
 }
 
 function tradeExitEvents(trade) {
@@ -170,8 +180,7 @@ export default function BacktestingPage() {
 
   const latestRun = result?.run || history[0] || null;
   const latestSummary = latestRun?.summary || null;
-  const selectedStrategyLabel =
-    form.strategy_key === "option_entry_v1" ? "SENSEX options" : `${form.instrument} futures`;
+  const selectedStrategyLabel = `${form.instrument} futures`;
   const backtestingAllowed = availability?.allowed !== false;
   const parametersValid = true;
   const recentTrades = useMemo(
@@ -184,12 +193,11 @@ export default function BacktestingPage() {
   };
 
   const updateStrategy = (strategyKey) => {
-    const optionStrategy = strategyKey === "option_entry_v1";
     setForm((current) => ({
       ...current,
       strategy_key: strategyKey,
-      instrument: optionStrategy ? "SENSEX" : "GOLDTEN",
-      interval: optionStrategy ? "FIVE_MINUTE" : current.interval,
+      instrument: "GOLDTEN",
+      interval: current.interval,
     }));
   };
 
@@ -275,7 +283,6 @@ export default function BacktestingPage() {
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
               <option value="futures_breakout_v3">Futures Breakout v3</option>
-              <option value="option_entry_v1">Option Entry Strategy V1.0</option>
             </select>
             <p className="mt-2 text-xs text-slate-500">
               {form.strategy_key} · backtesting only
@@ -289,19 +296,13 @@ export default function BacktestingPage() {
               onChange={(event) => update("instrument", event.target.value)}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
-              {form.strategy_key === "option_entry_v1" ? (
-                <option value="SENSEX">SENSEX</option>
-              ) : (
-                <>
-                  <option value="GOLDTEN">GOLDTEN · Gold Ten</option>
-                  <option value="GOLDM">GOLDM · Gold Mini</option>
-                  <option value="SILVERM">SILVERM · Silver Mini</option>
-                  <option value="SILVERMIC">SILVERMIC · Silver Micro</option>
-                  <option value="NATGASMINI">
-                    NATGASMINI · Natural Gas Mini
-                  </option>
-                </>
-              )}
+              <option value="GOLDTEN">GOLDTEN · Gold Ten</option>
+              <option value="GOLDM">GOLDM · Gold Mini</option>
+              <option value="SILVERM">SILVERM · Silver Mini</option>
+              <option value="SILVERMIC">SILVERMIC · Silver Micro</option>
+              <option value="NATGASMINI">
+                NATGASMINI · Natural Gas Mini
+              </option>
             </select>
           </label>
 
@@ -310,7 +311,6 @@ export default function BacktestingPage() {
             <select
               value={form.interval}
               onChange={(event) => update("interval", event.target.value)}
-              disabled={form.strategy_key === "option_entry_v1"}
               className="mt-2 h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm normal-case tracking-normal text-white"
             >
               {intervals.map(([value, label]) => (

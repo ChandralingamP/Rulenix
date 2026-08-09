@@ -67,14 +67,6 @@ fn connected_for_today(profile: &BrokerageProfile, credentials: &BrokerCredentia
     connected_for_today_at(profile, credentials, &Utc::now())
 }
 
-async fn profile_by_id(state: &AppState, user_id: Uuid) -> AppResult<BrokerageProfile> {
-    sqlx::query_as("SELECT * FROM user_profiles WHERE user_id=$1")
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(Into::into)
-}
-
 fn details(p: &BrokerageProfile, credentials: &BrokerCredentials) -> Value {
     let connected_today = connected_for_today(p, credentials);
     let connection_state = match (

@@ -142,11 +142,13 @@ describe("StrategiesPage", () => {
 
     expect(
       await screen.findByText(
-        "Trading paused: Market data is temporarily unavailable. No trades will be placed until it recovers"
+        "Invalid Angel One response: error decoding response body"
       )
     ).toBeInTheDocument();
     expect(
-      screen.queryByText(/Invalid Angel One response/i)
+      screen.queryByText(
+        "Trading paused: Market data is temporarily unavailable. No trades will be placed until it recovers"
+      )
     ).not.toBeInTheDocument();
     expect(screen.queryByText(/3\/7\/2026/)).not.toBeInTheDocument();
     expect(screen.queryByText("Older broker issue")).not.toBeInTheDocument();

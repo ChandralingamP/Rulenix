@@ -36,16 +36,30 @@ use uuid::Uuid;
 
 pub const STRATEGY_KEY: &str = "futures_breakout_v3";
 pub const OPTION_ENTRY_STRATEGY_KEY: &str = "option_entry_v1";
+pub const SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY: &str = "supertrend_index_options_v1";
 const SENSEX_INDEX_TOKEN: &str = "99919000";
+const NIFTY_INDEX_TOKEN: &str = "99926000";
 const OPTION_INTERVAL: &str = "FIVE_MINUTE";
 const OPTION_MIN_PREMIUM: f64 = 220.0;
-const OPTION_MAX_PREMIUM: f64 = 300.0;
+const OPTION_MAX_PREMIUM: f64 = 290.0;
 const OPTION_TARGET_PREMIUM: f64 = 260.0;
+const OPTION_PRODUCT_TYPE: &str = "INTRADAY";
+const OPTION_ENTRY_START_MINUTE: u32 = 9 * 60 + 20;
+const OPTION_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
+const OPTION_SCHEDULER_END_MINUTE: u32 = 15 * 60 + 30;
+const SHARED_MARKET_CREDENTIAL_LIMIT: i64 = 8;
 const KELTNER_EMA_PERIOD: usize = 20;
 const KELTNER_ATR_PERIOD: usize = 10;
 const KELTNER_MULTIPLIER: f64 = 2.0;
 const TSI_LONG_PERIOD: usize = 25;
 const TSI_SHORT_PERIOD: usize = 13;
+const OPTION_TSI_ENTRY_THRESHOLD: f64 = 0.5;
+const SUPERTREND_ATR_PERIOD: usize = 10;
+const SUPERTREND_FACTOR: f64 = 3.0;
+const SUPERTREND_SENSEX_DEFAULT_TARGET_POINTS: f64 = 40.0;
+const SUPERTREND_SENSEX_DEFAULT_STOP_POINTS: f64 = 25.0;
+const SUPERTREND_NIFTY_DEFAULT_TARGET_POINTS: f64 = 25.0;
+const SUPERTREND_NIFTY_DEFAULT_STOP_POINTS: f64 = 15.0;
 #[derive(Debug, Clone)]
 struct OptionContract {
     token: String,
@@ -104,16 +118,125 @@ impl OptionSide {
     }
 
     fn entry_side(self) -> &'static str {
-        match self {
-            Self::Call => "BUY",
-            Self::Put => "SELL",
-        }
+        "BUY"
     }
 
     fn exit_side(self) -> &'static str {
+        "SELL"
+    }
+
+    fn from_instrument(instrument: &str) -> Option<Self> {
+        match instrument {
+            "SENSEX_CE" => Some(Self::Call),
+            "SENSEX_PE" => Some(Self::Put),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexOptionSide {
+    Call,
+    Put,
+}
+
+impl IndexOptionSide {
+    fn option_type(self) -> &'static str {
         match self {
-            Self::Call => "SELL",
-            Self::Put => "BUY",
+            Self::Call => "CE",
+            Self::Put => "PE",
+        }
+    }
+
+    fn entry_role(self) -> &'static str {
+        match self {
+            Self::Call => "BUY_ENTRY",
+            Self::Put => "SELL_ENTRY",
+        }
+    }
+
+    fn entry_side(self) -> &'static str {
+        "BUY"
+    }
+
+    fn exit_side(self) -> &'static str {
+        "SELL"
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexOptionConfig {
+    instrument: &'static str,
+    index_exchange: &'static str,
+    index_token: &'static str,
+    option_exchange: &'static str,
+    option_name: &'static str,
+    label: &'static str,
+    default_target_points: f64,
+    default_stop_loss_points: f64,
+}
+
+impl IndexOptionConfig {
+    fn option_instrument(self, side: IndexOptionSide) -> String {
+        format!("{}_{}", self.instrument, side.option_type())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperTrendDirection {
+    Up,
+    Down,
+}
+
+impl SuperTrendDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SuperTrendPoint {
+    candle: IntradayCandle,
+    value: f64,
+    direction: SuperTrendDirection,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SuperTrendSignal {
+    side: IndexOptionSide,
+    signal_at: NaiveDateTime,
+    index_close: f64,
+    supertrend: f64,
+    previous_direction: SuperTrendDirection,
+    direction: SuperTrendDirection,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SuperTrendRunner {
+    user_id: Uuid,
+    username: String,
+    instrument: String,
+    lots: i32,
+    run_day_session: bool,
+    run_evening_session: bool,
+    trading_mode: String,
+    target_points: f64,
+    stop_loss_points: f64,
+}
+
+impl From<SuperTrendRunner> for Runner {
+    fn from(value: SuperTrendRunner) -> Self {
+        Self {
+            user_id: value.user_id,
+            username: value.username,
+            instrument: value.instrument,
+            lots: value.lots,
+            run_day_session: value.run_day_session,
+            run_evening_session: value.run_evening_session,
+            trading_mode: value.trading_mode,
         }
     }
 }
@@ -124,9 +247,45 @@ struct OptionSignal {
     entry_price: f64,
     stop_loss: f64,
     target_band: f64,
+    entry_tsi: f64,
     confirmation_at: NaiveDateTime,
     signal_at: NaiveDateTime,
 }
+
+type OpenOptionTradeRow = (
+    Uuid,
+    Uuid,
+    String,
+    i32,
+    i32,
+    Option<Uuid>,
+    f64,
+    Option<DateTime<Utc>>,
+);
+type ResidualProtectionTradeRow = (
+    Uuid,
+    Uuid,
+    String,
+    String,
+    String,
+    i32,
+    i32,
+    Option<f64>,
+    Option<f64>,
+    bool,
+);
+type ExitFillTradeRow = (
+    String,
+    i32,
+    i32,
+    i32,
+    f64,
+    f64,
+    f64,
+    Option<f64>,
+    Option<f64>,
+    String,
+);
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Snapshot {
@@ -422,6 +581,117 @@ fn true_ranges(candles: &[IntradayCandle]) -> Vec<f64> {
         .collect()
 }
 
+fn rma(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut result = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return result;
+    }
+    let seed = values[..period].iter().sum::<f64>() / period as f64;
+    result[period - 1] = Some(seed);
+    let mut previous = seed;
+    for (index, value) in values.iter().enumerate().skip(period) {
+        previous = (previous * (period as f64 - 1.0) + *value) / period as f64;
+        result[index] = Some(previous);
+    }
+    result
+}
+
+fn supertrend_points(
+    candles: &[IntradayCandle],
+    atr_period: usize,
+    factor: f64,
+) -> Vec<SuperTrendPoint> {
+    if atr_period == 0 || !factor.is_finite() || factor <= 0.0 {
+        return Vec::new();
+    }
+    let atr = rma(&true_ranges(candles), atr_period);
+    let mut points = Vec::new();
+    let mut previous_upper = None;
+    let mut previous_lower = None;
+    let mut previous_direction = None;
+    for (index, candle) in candles.iter().enumerate() {
+        let Some(atr_value) = atr[index] else {
+            continue;
+        };
+        let hl2 = (candle.high + candle.low) / 2.0;
+        let basic_upper = hl2 + factor * atr_value;
+        let basic_lower = hl2 - factor * atr_value;
+        let (final_upper, final_lower, direction) = if !points.is_empty() {
+            let previous_close = candles[index.saturating_sub(1)].close;
+            let previous_upper = previous_upper.unwrap_or(basic_upper);
+            let previous_lower = previous_lower.unwrap_or(basic_lower);
+            let final_upper = if basic_upper < previous_upper || previous_close > previous_upper {
+                basic_upper
+            } else {
+                previous_upper
+            };
+            let final_lower = if basic_lower > previous_lower || previous_close < previous_lower {
+                basic_lower
+            } else {
+                previous_lower
+            };
+            let direction = match previous_direction.unwrap_or(SuperTrendDirection::Down) {
+                SuperTrendDirection::Down => {
+                    if candle.close > final_upper {
+                        SuperTrendDirection::Up
+                    } else {
+                        SuperTrendDirection::Down
+                    }
+                }
+                SuperTrendDirection::Up => {
+                    if candle.close < final_lower {
+                        SuperTrendDirection::Down
+                    } else {
+                        SuperTrendDirection::Up
+                    }
+                }
+            };
+            (final_upper, final_lower, direction)
+        } else {
+            let direction = if candle.close >= hl2 {
+                SuperTrendDirection::Up
+            } else {
+                SuperTrendDirection::Down
+            };
+            (basic_upper, basic_lower, direction)
+        };
+        let value = match direction {
+            SuperTrendDirection::Up => final_lower,
+            SuperTrendDirection::Down => final_upper,
+        };
+        previous_upper = Some(final_upper);
+        previous_lower = Some(final_lower);
+        previous_direction = Some(direction);
+        points.push(SuperTrendPoint {
+            candle: *candle,
+            value,
+            direction,
+        });
+    }
+    points
+}
+
+fn supertrend_signal(points: &[SuperTrendPoint]) -> Option<SuperTrendSignal> {
+    let previous = points.get(points.len().checked_sub(2)?)?;
+    let latest = points.last()?;
+    if previous.direction == latest.direction {
+        return None;
+    }
+    let side = match (previous.direction, latest.direction) {
+        (SuperTrendDirection::Down, SuperTrendDirection::Up) => IndexOptionSide::Call,
+        (SuperTrendDirection::Up, SuperTrendDirection::Down) => IndexOptionSide::Put,
+        _ => return None,
+    };
+    Some(SuperTrendSignal {
+        side,
+        signal_at: latest.candle.at,
+        index_close: latest.candle.close,
+        supertrend: latest.value,
+        previous_direction: previous.direction,
+        direction: latest.direction,
+    })
+}
+
 fn tsi_values(candles: &[IntradayCandle]) -> Vec<Option<f64>> {
     if candles.len() < TSI_LONG_PERIOD + TSI_SHORT_PERIOD {
         return vec![None; candles.len()];
@@ -483,13 +753,19 @@ fn option_signal(candles: &[IndicatorCandle], side: OptionSide) -> Option<Option
         AwaitBreak {
             high: f64,
             low: f64,
-            at: NaiveDateTime,
+            target_band: f64,
+            confirmation_at: NaiveDateTime,
         },
     }
     let mut setup = Setup::Idle;
+    let mut active_date = None;
     let mut signal = None;
     for item in candles {
         let candle = item.candle;
+        if active_date != Some(candle.at.date()) {
+            active_date = Some(candle.at.date());
+            setup = Setup::Idle;
+        }
         match side {
             OptionSide::Call => match setup {
                 Setup::Idle => {
@@ -510,21 +786,33 @@ fn option_signal(candles: &[IndicatorCandle], side: OptionSide) -> Option<Option
                         setup = Setup::AwaitBreak {
                             high: candle.high,
                             low: candle.low,
-                            at: candle.at,
+                            target_band: item.upper,
+                            confirmation_at: candle.at,
                         };
                     }
                 }
-                Setup::AwaitBreak { high, low, at } => {
-                    if candle.close > high && item.tsi > 0.0 {
-                        signal = Some(OptionSignal {
-                            side,
-                            entry_price: candle.close,
-                            stop_loss: low,
-                            target_band: item.upper,
-                            confirmation_at: at,
-                            signal_at: candle.at,
-                        });
-                    } else if candle.low < item.middle {
+                Setup::AwaitBreak {
+                    high,
+                    low,
+                    target_band,
+                    confirmation_at,
+                } => {
+                    if candle.close > high {
+                        setup = Setup::AwaitRetrace;
+                        if item.tsi > OPTION_TSI_ENTRY_THRESHOLD
+                            && option_signal_has_min_rr(side, candle.close, low, target_band)
+                        {
+                            signal = Some(OptionSignal {
+                                side,
+                                entry_price: candle.close,
+                                stop_loss: low,
+                                target_band,
+                                entry_tsi: item.tsi,
+                                confirmation_at,
+                                signal_at: candle.at,
+                            });
+                        }
+                    } else if candle.close < item.middle {
                         setup = Setup::AwaitConfirmation;
                     }
                 }
@@ -548,21 +836,33 @@ fn option_signal(candles: &[IndicatorCandle], side: OptionSide) -> Option<Option
                         setup = Setup::AwaitBreak {
                             high: candle.high,
                             low: candle.low,
-                            at: candle.at,
+                            target_band: item.lower,
+                            confirmation_at: candle.at,
                         };
                     }
                 }
-                Setup::AwaitBreak { high, low, at } => {
-                    if candle.close < low && item.tsi < 0.0 {
-                        signal = Some(OptionSignal {
-                            side,
-                            entry_price: candle.close,
-                            stop_loss: high,
-                            target_band: item.lower,
-                            confirmation_at: at,
-                            signal_at: candle.at,
-                        });
-                    } else if candle.high > item.middle {
+                Setup::AwaitBreak {
+                    high,
+                    low,
+                    target_band,
+                    confirmation_at,
+                } => {
+                    if candle.close < low {
+                        setup = Setup::AwaitRetrace;
+                        if item.tsi < -OPTION_TSI_ENTRY_THRESHOLD
+                            && option_signal_has_min_rr(side, candle.close, high, target_band)
+                        {
+                            signal = Some(OptionSignal {
+                                side,
+                                entry_price: candle.close,
+                                stop_loss: high,
+                                target_band,
+                                entry_tsi: item.tsi,
+                                confirmation_at,
+                                signal_at: candle.at,
+                            });
+                        }
+                    } else if candle.close > item.middle {
                         setup = Setup::AwaitConfirmation;
                     }
                 }
@@ -570,6 +870,74 @@ fn option_signal(candles: &[IndicatorCandle], side: OptionSide) -> Option<Option
         }
     }
     signal
+}
+
+fn option_signal_risk_reward(
+    side: OptionSide,
+    entry: f64,
+    stop: f64,
+    target: f64,
+) -> Option<(f64, f64, f64)> {
+    if [entry, stop, target]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    let (risk, reward) = match side {
+        OptionSide::Call => (entry - stop, target - entry),
+        OptionSide::Put => (stop - entry, entry - target),
+    };
+    (risk > 0.0 && reward > 0.0).then_some((risk, reward, reward / risk))
+}
+
+fn option_signal_has_min_rr(side: OptionSide, entry: f64, stop: f64, target: f64) -> bool {
+    option_signal_risk_reward(side, entry, stop, target)
+        .is_some_and(|(_risk, _reward, ratio)| ratio >= 1.0)
+}
+
+fn option_levels(snapshot: &Snapshot, side: OptionSide) -> Option<(f64, f64)> {
+    match side {
+        OptionSide::Call => Some((snapshot.buy_target?, snapshot.buy_sl1?)),
+        OptionSide::Put => Some((snapshot.sell_target?, snapshot.sell_sl1?)),
+    }
+}
+
+fn supertrend_snapshot_underlying(instrument: &str) -> Option<&str> {
+    instrument
+        .strip_suffix("_CE")
+        .or_else(|| instrument.strip_suffix("_PE"))
+        .filter(|underlying| is_supertrend_index_option_instrument(underlying))
+}
+
+fn supertrend_snapshot_side(instrument: &str) -> Option<IndexOptionSide> {
+    if instrument.ends_with("_CE") {
+        Some(IndexOptionSide::Call)
+    } else if instrument.ends_with("_PE") {
+        Some(IndexOptionSide::Put)
+    } else {
+        None
+    }
+}
+
+fn supertrend_config_points(snapshot: &Snapshot) -> Option<(f64, f64)> {
+    match supertrend_snapshot_side(&snapshot.instrument)? {
+        IndexOptionSide::Call => Some((snapshot.buy_target?, snapshot.buy_sl1?)),
+        IndexOptionSide::Put => Some((snapshot.sell_target?, snapshot.sell_sl1?)),
+    }
+}
+
+fn option_minute_of_day(now: DateTime<FixedOffset>) -> u32 {
+    now.hour() * 60 + now.minute()
+}
+
+fn option_entry_allowed(now: DateTime<FixedOffset>) -> bool {
+    let minute = option_minute_of_day(now);
+    (OPTION_ENTRY_START_MINUTE..OPTION_SQUARE_OFF_MINUTE).contains(&minute)
+}
+
+fn option_square_off_due(now: DateTime<FixedOffset>) -> bool {
+    option_minute_of_day(now) >= OPTION_SQUARE_OFF_MINUTE
 }
 
 fn option_exit(
@@ -597,6 +965,23 @@ fn option_exit(
             }
         }
     }
+}
+
+fn option_exit_since(
+    indicators: &[IndicatorCandle],
+    side: OptionSide,
+    stop_loss: f64,
+    entry_time: Option<DateTime<Utc>>,
+) -> Option<(&'static str, f64, NaiveDateTime)> {
+    let offset = FixedOffset::east_opt(19_800).expect("valid IST offset");
+    let entry_at = entry_time.map(|value| value.with_timezone(&offset).naive_local());
+    indicators.iter().find_map(|item| {
+        if entry_at.is_some_and(|entry_at| item.candle.at <= entry_at) {
+            return None;
+        }
+        option_exit(*item, side, stop_loss)
+            .map(|(role, index_price)| (role, index_price, item.candle.at))
+    })
 }
 
 fn parse_expiry(value: &str) -> Option<NaiveDate> {
@@ -677,6 +1062,109 @@ fn sensex_option_candidates(
     };
     candidates.retain(|contract| contract.expiry == nearest_expiry);
     candidates
+}
+
+fn sensex_option_expiry_preview(
+    contracts: &[MasterContract],
+    date: NaiveDate,
+) -> Option<(NaiveDate, i32)> {
+    ["CE", "PE"]
+        .into_iter()
+        .flat_map(|option_type| sensex_option_candidates(contracts, date, option_type))
+        .min_by_key(|contract| contract.expiry)
+        .map(|contract| (contract.expiry, contract.lot_size))
+}
+
+fn index_option_config(instrument: &str) -> Option<IndexOptionConfig> {
+    match instrument {
+        "SENSEX" => Some(IndexOptionConfig {
+            instrument: "SENSEX",
+            index_exchange: "BSE",
+            index_token: SENSEX_INDEX_TOKEN,
+            option_exchange: "BFO",
+            option_name: "SENSEX",
+            label: "SENSEX ATM Options",
+            default_target_points: SUPERTREND_SENSEX_DEFAULT_TARGET_POINTS,
+            default_stop_loss_points: SUPERTREND_SENSEX_DEFAULT_STOP_POINTS,
+        }),
+        "NIFTY" => Some(IndexOptionConfig {
+            instrument: "NIFTY",
+            index_exchange: "NSE",
+            index_token: NIFTY_INDEX_TOKEN,
+            option_exchange: "NFO",
+            option_name: "NIFTY",
+            label: "NIFTY ATM Options",
+            default_target_points: SUPERTREND_NIFTY_DEFAULT_TARGET_POINTS,
+            default_stop_loss_points: SUPERTREND_NIFTY_DEFAULT_STOP_POINTS,
+        }),
+        _ => None,
+    }
+}
+
+fn is_supertrend_index_option_instrument(instrument: &str) -> bool {
+    index_option_config(instrument).is_some()
+}
+
+fn supertrend_option_candidates(
+    contracts: &[MasterContract],
+    config: IndexOptionConfig,
+    date: NaiveDate,
+    side: IndexOptionSide,
+) -> Vec<OptionContract> {
+    let option_type = side.option_type();
+    let mut candidates: Vec<OptionContract> = contracts
+        .iter()
+        .filter(|item| {
+            item.exch_seg == config.option_exchange
+                && item.name.eq_ignore_ascii_case(config.option_name)
+                && item.instrumenttype == "OPTIDX"
+                && item.symbol.ends_with(option_type)
+        })
+        .filter_map(|item| {
+            let expiry = parse_expiry(&item.expiry)?;
+            let lot_size = parse_lot_size(&item.lotsize)?;
+            let strike = parse_option_strike(&item.strike)?;
+            (expiry >= date).then_some(OptionContract {
+                token: item.token.clone(),
+                symbol: item.symbol.clone(),
+                expiry,
+                lot_size,
+                strike,
+                option_type,
+                premium: 0.0,
+            })
+        })
+        .collect();
+    let Some(nearest_expiry) = candidates.iter().map(|contract| contract.expiry).min() else {
+        return Vec::new();
+    };
+    candidates.retain(|contract| contract.expiry == nearest_expiry);
+    candidates
+}
+
+fn supertrend_option_expiry_preview(
+    contracts: &[MasterContract],
+    config: IndexOptionConfig,
+    date: NaiveDate,
+) -> Option<(NaiveDate, i32)> {
+    [IndexOptionSide::Call, IndexOptionSide::Put]
+        .into_iter()
+        .flat_map(|side| supertrend_option_candidates(contracts, config, date, side))
+        .min_by_key(|contract| contract.expiry)
+        .map(|contract| (contract.expiry, contract.lot_size))
+}
+
+fn choose_atm_contract(
+    candidates: &[OptionContract],
+    underlying_ltp: f64,
+) -> Option<OptionContract> {
+    candidates.iter().cloned().min_by(|left, right| {
+        (left.strike - underlying_ltp)
+            .abs()
+            .total_cmp(&(right.strike - underlying_ltp).abs())
+            .then_with(|| left.expiry.cmp(&right.expiry))
+            .then_with(|| left.strike.total_cmp(&right.strike))
+    })
 }
 
 fn choose_premium_contract(
@@ -804,7 +1292,6 @@ fn extract_quote_opens(value: &Value) -> HashMap<String, f64> {
 
 async fn select_sensex_option_contract(
     state: &AppState,
-    credentials: &BrokerCredentials,
     contracts: &[MasterContract],
     date: NaiveDate,
     option_type: &'static str,
@@ -826,14 +1313,7 @@ async fn select_sensex_option_contract(
             .iter()
             .map(|contract| contract.token.clone())
             .collect();
-        let quote = angel::market_quote(
-            state,
-            &credentials.api_key,
-            &credentials.jwt_token,
-            "LTP",
-            json!({"BFO":tokens}),
-        )
-        .await?;
+        let quote = shared_market_quote(state, "LTP", json!({"BFO":tokens})).await?;
         premiums.extend(extract_quote_ltps(&quote));
     }
 
@@ -1022,13 +1502,6 @@ async fn create_snapshot(
         return Ok(snapshot);
     }
     let contract_snapshot = ensure_contract_metadata(state, instrument, date).await?;
-    let profile_id: Uuid = sqlx::query_scalar(
-        "SELECT p.user_id FROM user_profiles p WHERE EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='api_key') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token') ORDER BY CASE WHEN p.last_token_status='success' THEN 0 WHEN p.last_token_status='refreshed' THEN 1 ELSE 2 END,p.token_received_at DESC NULLS LAST LIMIT 1",
-    )
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::BadRequest("No connected Angel One session is available for the shared market snapshot.".into()))?;
-    let credentials = state.credentials.load(profile_id).await?;
     let token = contract_snapshot
         .contract_token
         .as_deref()
@@ -1045,29 +1518,15 @@ async fn create_snapshot(
         .ok_or_else(|| AppError::BadRequest("Selected contract lot size is missing.".into()))?;
     let from = date - Duration::days(20);
     let to = date - Duration::days(1);
-    let raw = angel::get_candles(
+    let raw = shared_market_candles(
         state,
-        &credentials.api_key,
-        &credentials.jwt_token,
+        "MCX",
         token,
+        "ONE_DAY",
         &format!("{} 00:00", from.format("%Y-%m-%d")),
         &format!("{} 23:59", to.format("%Y-%m-%d")),
     )
-    .await;
-    let raw = match raw {
-        Ok(value) => value,
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-    };
+    .await?;
     let mut candles: Vec<(NaiveDate, f64, f64, f64)> = raw
         .as_array()
         .into_iter()
@@ -1138,57 +1597,208 @@ async fn create_snapshot(
     Ok(snapshot)
 }
 
-async fn connected_market_credentials(state: &AppState) -> AppResult<(Uuid, BrokerCredentials)> {
-    let profile_id: Uuid = sqlx::query_scalar(
-        "SELECT p.user_id FROM user_profiles p WHERE EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='api_key') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token') ORDER BY CASE WHEN p.last_token_status='success' THEN 0 WHEN p.last_token_status='refreshed' THEN 1 ELSE 2 END,p.token_received_at DESC NULLS LAST LIMIT 1",
-    )
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| {
-        AppError::BadRequest(
-            "No connected Angel One session is available for shared market data.".into(),
-        )
-    })?;
-    let credentials = state.credentials.load(profile_id).await?;
-    Ok((profile_id, credentials))
+struct MarketCredential {
+    profile_id: Uuid,
+    credentials: BrokerCredentials,
 }
 
-async fn first_session_open(
+async fn shared_market_session_count(state: &AppState) -> AppResult<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_profiles p JOIN users u ON u.id=p.user_id WHERE u.is_active=TRUE AND p.last_token_status IN ('success','refreshed') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='api_key') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token')",
+    )
+    .fetch_one(&state.db)
+    .await?)
+}
+
+async fn shared_market_credentials(state: &AppState) -> AppResult<Vec<MarketCredential>> {
+    let profile_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT p.user_id FROM user_profiles p JOIN users u ON u.id=p.user_id WHERE u.is_active=TRUE AND p.last_token_status IN ('success','refreshed') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='api_key') AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token') ORDER BY CASE WHEN EXISTS (SELECT 1 FROM user_strategy_activations a WHERE a.user_id=p.user_id AND a.is_active=TRUE) THEN 0 ELSE 1 END,p.token_received_at DESC NULLS LAST LIMIT $1",
+    )
+    .bind(SHARED_MARKET_CREDENTIAL_LIMIT)
+    .fetch_all(&state.db)
+    .await?;
+    if profile_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "No connected Angel One session is available for shared market data.".into(),
+        ));
+    }
+    let mut credentials = Vec::new();
+    for profile_id in profile_ids {
+        match state.credentials.load(profile_id).await {
+            Ok(profile_credentials)
+                if !profile_credentials.api_key.is_empty()
+                    && !profile_credentials.jwt_token.is_empty() =>
+            {
+                credentials.push(MarketCredential {
+                    profile_id,
+                    credentials: profile_credentials,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %profile_id,
+                %error,
+                "could not load shared market-data credentials"
+            ),
+        }
+    }
+    if credentials.is_empty() {
+        return Err(AppError::BadRequest(
+            "No usable Angel One session is available for shared market data.".into(),
+        ));
+    }
+    let start = {
+        let mut cursor = state.shared_market_cursor.lock().await;
+        let start = *cursor % credentials.len();
+        *cursor = cursor.wrapping_add(1);
+        start
+    };
+    credentials.rotate_left(start);
+    Ok(credentials)
+}
+
+async fn handle_shared_market_error(
     state: &AppState,
     profile_id: Uuid,
-    credentials: &BrokerCredentials,
-    snapshot: &Snapshot,
-) -> AppResult<f64> {
+    error: AppError,
+) -> AppResult<(String, bool)> {
+    let message = error.to_string();
+    if angel::is_invalid_api_key_error(&message) {
+        crate::home::mark_invalid(
+            state,
+            profile_id,
+            "Angel One API token is invalid. Please establish the broker connection again.",
+        )
+        .await?;
+        return Ok((message, true));
+    }
+    Ok((message.clone(), angel::is_rate_limit_error(&message)))
+}
+
+async fn shared_market_quote(
+    state: &AppState,
+    mode: &str,
+    exchange_tokens: Value,
+) -> AppResult<Value> {
+    let credentials = shared_market_credentials(state).await?;
+    let total = credentials.len();
+    let mut last_error = None;
+    for (attempt, credential) in credentials.into_iter().enumerate() {
+        match angel::market_quote(
+            state,
+            &credential.credentials.api_key,
+            &credential.credentials.jwt_token,
+            mode,
+            exchange_tokens.clone(),
+        )
+        .await
+        {
+            Ok(value) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        total,
+                        "shared market quote recovered with alternate Angel One session"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(error) => {
+                let (message, try_next) =
+                    handle_shared_market_error(state, credential.profile_id, error).await?;
+                tracing::warn!(
+                    profile_id = %credential.profile_id,
+                    attempt = attempt + 1,
+                    total,
+                    error = %message,
+                    "shared market quote failed"
+                );
+                last_error = Some(message);
+                if !try_next {
+                    break;
+                }
+            }
+        }
+    }
+    Err(AppError::BadRequest(format!(
+        "All shared Angel One market-data sessions are unavailable. Last error: {}",
+        last_error.unwrap_or_else(|| "unknown market-data failure".into())
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn shared_market_candles(
+    state: &AppState,
+    exchange: &str,
+    token: &str,
+    interval: &str,
+    from_date: &str,
+    to_date: &str,
+) -> AppResult<Value> {
+    let credentials = shared_market_credentials(state).await?;
+    let total = credentials.len();
+    let mut last_error = None;
+    for (attempt, credential) in credentials.into_iter().enumerate() {
+        match angel::get_candles_with_exchange_interval(
+            state,
+            &credential.credentials.api_key,
+            &credential.credentials.jwt_token,
+            exchange,
+            token,
+            interval,
+            from_date,
+            to_date,
+        )
+        .await
+        {
+            Ok(value) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        total,
+                        "shared market candles recovered with alternate Angel One session"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(error) => {
+                let (message, try_next) =
+                    handle_shared_market_error(state, credential.profile_id, error).await?;
+                tracing::warn!(
+                    profile_id = %credential.profile_id,
+                    attempt = attempt + 1,
+                    total,
+                    error = %message,
+                    "shared market candles failed"
+                );
+                last_error = Some(message);
+                if !try_next {
+                    break;
+                }
+            }
+        }
+    }
+    Err(AppError::BadRequest(format!(
+        "All shared Angel One historical-data sessions are unavailable. Last error: {}",
+        last_error.unwrap_or_else(|| "unknown historical-data failure".into())
+    )))
+}
+
+async fn first_session_open(state: &AppState, snapshot: &Snapshot) -> AppResult<f64> {
     let token = snapshot
         .contract_token
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Selected contract token is missing.".into()))?;
     let date = snapshot.trade_date;
-    let raw = angel::get_candles_with_exchange_interval(
+    let raw = shared_market_candles(
         state,
-        &credentials.api_key,
-        &credentials.jwt_token,
         &snapshot.exchange_segment,
         token,
         "ONE_MINUTE",
         &format!("{} 09:00", date.format("%Y-%m-%d")),
         &format!("{} 09:02", date.format("%Y-%m-%d")),
     )
-    .await;
-    let raw = match raw {
-        Ok(value) => value,
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-    };
+    .await?;
     parse_intraday_candles(&raw)
         .into_iter()
         .find(|candle| {
@@ -1241,7 +1851,6 @@ async fn ensure_futures_gap_plans(
         return Ok(());
     }
 
-    let (profile_id, credentials) = connected_market_credentials(state).await?;
     let tokens: Vec<String> = pending
         .iter()
         .filter_map(|snapshot| snapshot.contract_token.clone())
@@ -1251,28 +1860,7 @@ async fn ensure_futures_gap_plans(
             "No selected futures contract tokens are available for the gap plan.".into(),
         ));
     }
-    let quote = angel::market_quote(
-        state,
-        &credentials.api_key,
-        &credentials.jwt_token,
-        "FULL",
-        json!({"MCX":tokens}),
-    )
-    .await;
-    let quote = match quote {
-        Ok(value) => value,
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-    };
+    let quote = shared_market_quote(state, "FULL", json!({"MCX":tokens})).await?;
     let market_opens = extract_quote_opens(&quote);
     let mut planned = Vec::new();
     let mut errors = HashMap::new();
@@ -1283,7 +1871,7 @@ async fn ensure_futures_gap_plans(
             })?;
             let market_open = match market_opens.get(token).copied() {
                 Some(value) => value,
-                None => first_session_open(state, profile_id, &credentials, &snapshot).await?,
+                None => first_session_open(state, &snapshot).await?,
             };
             let previous_close = required_exit_level(snapshot.previous_close, "previous close")?;
             let buy_entry = required_exit_level(snapshot.buy_entry, "buy entry")?;
@@ -1402,37 +1990,20 @@ async fn resolve_futures_opening_range_plan(
             snapshot.instrument
         )));
     }
-    let (profile_id, credentials) = connected_market_credentials(state).await?;
     let token = snapshot
         .contract_token
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Selected contract token is missing.".into()))?;
     let date = snapshot.trade_date;
-    let raw = angel::get_candles_with_exchange_interval(
+    let raw = shared_market_candles(
         state,
-        &credentials.api_key,
-        &credentials.jwt_token,
         &snapshot.exchange_segment,
         token,
         "FIFTEEN_MINUTE",
         &format!("{} 09:00", date.format("%Y-%m-%d")),
         &format!("{} 09:15", date.format("%Y-%m-%d")),
     )
-    .await;
-    let raw = match raw {
-        Ok(value) => value,
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-    };
+    .await?;
     let start = NaiveTime::from_hms_opt(9, 0, 0).expect("valid opening range");
     let end = NaiveTime::from_hms_opt(9, 15, 0).expect("valid opening range");
     let opening: Vec<IntradayCandle> = parse_intraday_candles(&raw)
@@ -1525,48 +2096,179 @@ async fn load_contract_master(state: &AppState) -> AppResult<Arc<Vec<MasterContr
     contract_master::load(state).await
 }
 
-async fn sensex_ltp(
+async fn ensure_sensex_option_contract_metadata(
     state: &AppState,
-    profile_id: Uuid,
-    credentials: &BrokerCredentials,
-) -> AppResult<f64> {
-    let quote = angel::market_quote(
+    date: NaiveDate,
+) -> AppResult<()> {
+    let contracts = load_contract_master(state).await?;
+    let Some((expiry, lot_size)) = sensex_option_expiry_preview(&contracts, date) else {
+        return Err(AppError::BadRequest(format!(
+            "No current BFO SENSEX option expiry is available in Angel One contract master for {date}."
+        )));
+    };
+    tracing::debug!(
+        %date,
+        %expiry,
+        lot_size,
+        "SENSEX option contract metadata warmed"
+    );
+    Ok(())
+}
+
+async fn sensex_ltp(state: &AppState) -> AppResult<f64> {
+    let quote = shared_market_quote(state, "LTP", json!({"BSE":[SENSEX_INDEX_TOKEN]})).await?;
+    find_quote_ltp(&quote)
+        .ok_or_else(|| AppError::BadRequest("Angel One SENSEX quote did not include LTP.".into()))
+}
+
+async fn index_ltp(state: &AppState, config: IndexOptionConfig) -> AppResult<f64> {
+    let quote = shared_market_quote(
         state,
-        &credentials.api_key,
-        &credentials.jwt_token,
         "LTP",
-        json!({"BSE":[SENSEX_INDEX_TOKEN]}),
+        json!({config.index_exchange:[config.index_token]}),
+    )
+    .await?;
+    find_quote_ltp(&quote).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Angel One {} quote did not include LTP.",
+            config.instrument
+        ))
+    })
+}
+
+async fn select_supertrend_atm_option_contract(
+    state: &AppState,
+    contracts: &[MasterContract],
+    config: IndexOptionConfig,
+    date: NaiveDate,
+    side: IndexOptionSide,
+    underlying_ltp: f64,
+) -> AppResult<Option<OptionContract>> {
+    let candidates = supertrend_option_candidates(contracts, config, date, side);
+    let Some(mut selected) = choose_atm_contract(&candidates, underlying_ltp) else {
+        return Ok(None);
+    };
+    let quote = shared_market_quote(
+        state,
+        "LTP",
+        json!({config.option_exchange:[selected.token.clone()]}),
+    )
+    .await?;
+    selected.premium = find_quote_ltp(&quote).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Angel One {} {} ATM option quote did not include LTP.",
+            config.instrument,
+            side.option_type()
+        ))
+    })?;
+    Ok(Some(selected))
+}
+
+async fn supertrend_option_snapshot_for_signal(
+    state: &AppState,
+    config: IndexOptionConfig,
+    side: IndexOptionSide,
+    date: NaiveDate,
+    signal_at: NaiveDateTime,
+    user_id: Uuid,
+    target_points: f64,
+    stop_loss_points: f64,
+) -> AppResult<(Snapshot, f64, f64)> {
+    let underlying = index_ltp(state, config).await?;
+    let contracts = load_contract_master(state).await?;
+    let contract =
+        select_supertrend_atm_option_contract(state, &contracts, config, date, side, underlying)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "No {} {} ATM option contract is available for {date}.",
+                    config.instrument,
+                    side.option_type(),
+                ))
+            })?;
+    risk::record_tick(
+        state,
+        config.option_exchange,
+        &contract.token,
+        contract.premium,
+    )
+    .await?;
+    let id = Uuid::new_v4();
+    let option_instrument = config.option_instrument(side);
+    let execution_key = format!(
+        "{}-{}-{}",
+        signal_at.format("%Y%m%d%H%M"),
+        contract.symbol,
+        user_id.simple()
+    );
+    let now = Utc::now();
+    let (buy_target, buy_sl1, sell_target, sell_sl1) = match side {
+        IndexOptionSide::Call => (
+            Some(target_points),
+            Some(stop_loss_points),
+            None::<f64>,
+            None::<f64>,
+        ),
+        IndexOptionSide::Put => (
+            None::<f64>,
+            None::<f64>,
+            Some(target_points),
+            Some(stop_loss_points),
+        ),
+    };
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,buy_target,buy_sl1,sell_target,sell_sl1,previous_close,fetched_at) VALUES ($1,$2,$3,$4,'ready','',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error='',contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment=EXCLUDED.exchange_segment,product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,previous_close=EXCLUDED.previous_close,fetched_at=NOW()")
+        .bind(id)
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .bind(&option_instrument)
+        .bind(date)
+        .bind(&contract.token)
+        .bind(&contract.symbol)
+        .bind(contract.expiry)
+        .bind(contract.lot_size)
+        .bind(config.option_exchange)
+        .bind(OPTION_PRODUCT_TYPE)
+        .bind(&execution_key)
+        .bind(config.index_token)
+        .bind(buy_target)
+        .bind(buy_sl1)
+        .bind(sell_target)
+        .bind(sell_sl1)
+        .bind(underlying)
+        .execute(&state.db)
+        .await?;
+    let query = format!(
+        "{} WHERE strategy_key=$1 AND instrument=$2 AND trade_date=$3 AND execution_key=$4",
+        snapshot_select()
+    );
+    let mut snapshot: Snapshot = sqlx::query_as(&query)
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .bind(&option_instrument)
+        .bind(date)
+        .bind(&execution_key)
+        .fetch_one(&state.db)
+        .await?;
+    snapshot.fetched_at = now;
+    emit_for(
+        state,
+        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+        None,
+        config.instrument,
+        "supertrend_atm_contract_selected",
+        json!({"symbol":contract.symbol,"token":contract.token,"expiry":contract.expiry,"strike":contract.strike,"option_type":contract.option_type,"premium":contract.premium,"underlying_ltp":underlying,"signal_at":signal_at}),
     )
     .await;
-    match quote {
-        Ok(value) => find_quote_ltp(&value).ok_or_else(|| {
-            AppError::BadRequest("Angel One SENSEX quote did not include LTP.".into())
-        }),
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            Err(error)
-        }
-    }
+    Ok((snapshot, contract.premium, underlying))
 }
 
 async fn option_snapshot_for_signal(
     state: &AppState,
     side: OptionSide,
     date: NaiveDate,
-) -> AppResult<Snapshot> {
-    let (profile_id, credentials) = connected_market_credentials(state).await?;
-    let underlying = sensex_ltp(state, profile_id, &credentials).await?;
+) -> AppResult<(Snapshot, f64)> {
+    let underlying = sensex_ltp(state).await?;
     let contracts = load_contract_master(state).await?;
     let contract = select_sensex_option_contract(
         state,
-        &credentials,
         &contracts,
         date,
         side.option_type(),
@@ -1579,10 +2281,11 @@ async fn option_snapshot_for_signal(
                 side.option_type(),
             ))
         })?;
+    risk::record_tick(state, "BFO", &contract.token, contract.premium).await?;
     let id = Uuid::new_v4();
     let instrument = side.instrument();
     let now = Utc::now();
-    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,fetched_at) VALUES ($1,$2,$3,$4,'ready','',$5,$6,$7,$8,'BFO','CARRYFORWARD',$9,$10,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error='',contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment='BFO',product_type='CARRYFORWARD',underlying_token=EXCLUDED.underlying_token,fetched_at=NOW()")
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,fetched_at) VALUES ($1,$2,$3,$4,'ready','',$5,$6,$7,$8,'BFO',$11,$9,$10,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error='',contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment='BFO',product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,fetched_at=NOW()")
         .bind(id)
         .bind(OPTION_ENTRY_STRATEGY_KEY)
         .bind(instrument)
@@ -1593,6 +2296,7 @@ async fn option_snapshot_for_signal(
         .bind(contract.lot_size)
         .bind(&contract.symbol)
         .bind(SENSEX_INDEX_TOKEN)
+        .bind(OPTION_PRODUCT_TYPE)
         .execute(&state.db)
         .await?;
     let query = format!(
@@ -1616,46 +2320,367 @@ async fn option_snapshot_for_signal(
         json!({"symbol":contract.symbol,"token":contract.token,"expiry":contract.expiry,"strike":contract.strike,"option_type":contract.option_type,"premium":contract.premium,"premium_min":OPTION_MIN_PREMIUM,"premium_max":OPTION_MAX_PREMIUM,"underlying_ltp":underlying}),
     )
     .await;
-    Ok(snapshot)
+    Ok((snapshot, contract.premium))
 }
 
-async fn option_candles(
+async fn sensex_index_candles(
     state: &AppState,
-    snapshot: &Snapshot,
     lookback: Duration,
     to: DateTime<FixedOffset>,
 ) -> AppResult<Vec<IntradayCandle>> {
-    let (profile_id, credentials) = connected_market_credentials(state).await?;
+    let to_candle = option_latest_completed_candle_time(to);
+    let from_candle = to_candle - lookback;
+    cached_sensex_index_candles(state, from_candle, to_candle).await
+}
+
+async fn index_candles(
+    state: &AppState,
+    config: IndexOptionConfig,
+    lookback: Duration,
+    to: DateTime<FixedOffset>,
+) -> AppResult<Vec<IntradayCandle>> {
+    let to_candle = option_latest_completed_candle_time(to);
+    let from_candle = to_candle - lookback;
+    cached_index_candles(state, config, from_candle, to_candle).await
+}
+
+fn option_latest_completed_candle_time(now: DateTime<FixedOffset>) -> NaiveDateTime {
+    let minute = now.hour() * 60 + now.minute();
+    let rounded = minute - (minute % 5);
+    let latest_minute = rounded.saturating_sub(5);
+    now.date_naive()
+        .and_hms_opt(latest_minute / 60, latest_minute % 60, 0)
+        .expect("valid option candle time")
+}
+
+fn ist_naive_to_utc(value: NaiveDateTime) -> AppResult<DateTime<Utc>> {
+    FixedOffset::east_opt(19_800)
+        .expect("valid IST offset")
+        .from_local_datetime(&value)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| AppError::BadRequest("Invalid IST candle timestamp.".into()))
+}
+
+async fn load_cached_index_candles(
+    state: &AppState,
+    config: IndexOptionConfig,
+    from_utc: DateTime<Utc>,
+    to_utc: DateTime<Utc>,
+) -> AppResult<Vec<IntradayCandle>> {
+    let rows: Vec<(DateTime<Utc>, f64, f64, f64, f64)> = sqlx::query_as(
+        "SELECT candle_time,open_price,high_price,low_price,close_price
+         FROM backtest_market_candles
+         WHERE exchange=$1 AND symbol_token=$2 AND interval_key=$3
+           AND candle_time BETWEEN $4 AND $5
+         ORDER BY candle_time",
+    )
+    .bind(config.index_exchange)
+    .bind(config.index_token)
+    .bind(OPTION_INTERVAL)
+    .bind(from_utc)
+    .bind(to_utc)
+    .fetch_all(&state.db)
+    .await?;
+    let offset = FixedOffset::east_opt(19_800).expect("valid IST offset");
+    Ok(rows
+        .into_iter()
+        .map(|(at, open, high, low, close)| IntradayCandle {
+            at: at.with_timezone(&offset).naive_local(),
+            open,
+            high,
+            low,
+            close,
+        })
+        .collect())
+}
+
+async fn cache_index_candles(
+    state: &AppState,
+    config: IndexOptionConfig,
+    candles: &[IntradayCandle],
+) -> AppResult<()> {
+    for candle in candles {
+        let candle_time = ist_naive_to_utc(candle.at)?;
+        sqlx::query(
+            "INSERT INTO backtest_market_candles
+             (id,exchange,instrument,symbol_token,trading_symbol,interval_key,candle_time,open_price,high_price,low_price,close_price,volume)
+             VALUES ($1,$2,$3,$4,$3,$5,$6,$7,$8,$9,$10,0)
+             ON CONFLICT (exchange,symbol_token,interval_key,candle_time)
+             DO UPDATE SET instrument=EXCLUDED.instrument,trading_symbol=EXCLUDED.trading_symbol,
+                open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,
+                low_price=EXCLUDED.low_price,close_price=EXCLUDED.close_price,fetched_at=NOW()",
+        )
+        .bind(Uuid::new_v4())
+        .bind(config.index_exchange)
+        .bind(config.instrument)
+        .bind(config.index_token)
+        .bind(OPTION_INTERVAL)
+        .bind(candle_time)
+        .bind(candle.open)
+        .bind(candle.high)
+        .bind(candle.low)
+        .bind(candle.close)
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn cached_index_candles(
+    state: &AppState,
+    config: IndexOptionConfig,
+    from_candle: NaiveDateTime,
+    to_candle: NaiveDateTime,
+) -> AppResult<Vec<IntradayCandle>> {
+    let from_utc = ist_naive_to_utc(from_candle)?;
+    let to_utc = ist_naive_to_utc(to_candle)?;
+    let max_cached: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MAX(candle_time)
+         FROM backtest_market_candles
+         WHERE exchange=$1 AND symbol_token=$2 AND interval_key=$3
+           AND candle_time BETWEEN $4 AND $5",
+    )
+    .bind(config.index_exchange)
+    .bind(config.index_token)
+    .bind(OPTION_INTERVAL)
+    .bind(from_utc)
+    .bind(to_utc)
+    .fetch_one(&state.db)
+    .await?;
+
+    let fetch_from = max_cached
+        .filter(|cached| *cached >= from_utc)
+        .map(|cached| {
+            cached
+                .with_timezone(&FixedOffset::east_opt(19_800).expect("valid IST offset"))
+                .naive_local()
+                + Duration::minutes(5)
+        })
+        .unwrap_or(from_candle);
+
+    if fetch_from <= to_candle {
+        let fetched = shared_market_candles(
+            state,
+            config.index_exchange,
+            config.index_token,
+            OPTION_INTERVAL,
+            &format!("{}", fetch_from.format("%Y-%m-%d %H:%M")),
+            &format!("{}", to_candle.format("%Y-%m-%d %H:%M")),
+        )
+        .await;
+        match fetched {
+            Ok(raw) => {
+                let candles = parse_intraday_candles(&raw);
+                cache_index_candles(state, config, &candles).await?;
+            }
+            Err(error) => {
+                let fresh_enough =
+                    max_cached.is_some_and(|cached| cached >= to_utc - Duration::minutes(10));
+                if !fresh_enough {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    instrument = config.instrument,
+                    %error,
+                    "using recent cached index candles after Angel historical fetch failed"
+                );
+            }
+        }
+    }
+
+    let candles = load_cached_index_candles(state, config, from_utc, to_utc).await?;
+    if candles.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "No cached or broker-returned {} candles are available for SuperTrend.",
+            config.instrument
+        )));
+    }
+    Ok(candles)
+}
+
+async fn load_cached_sensex_index_candles(
+    state: &AppState,
+    from_utc: DateTime<Utc>,
+    to_utc: DateTime<Utc>,
+) -> AppResult<Vec<IntradayCandle>> {
+    let rows: Vec<(DateTime<Utc>, f64, f64, f64, f64)> = sqlx::query_as(
+        "SELECT candle_time,open_price,high_price,low_price,close_price
+         FROM backtest_market_candles
+         WHERE exchange='BSE' AND symbol_token=$1 AND interval_key=$2
+           AND candle_time BETWEEN $3 AND $4
+         ORDER BY candle_time",
+    )
+    .bind(SENSEX_INDEX_TOKEN)
+    .bind(OPTION_INTERVAL)
+    .bind(from_utc)
+    .bind(to_utc)
+    .fetch_all(&state.db)
+    .await?;
+    let offset = FixedOffset::east_opt(19_800).expect("valid IST offset");
+    Ok(rows
+        .into_iter()
+        .map(|(at, open, high, low, close)| IntradayCandle {
+            at: at.with_timezone(&offset).naive_local(),
+            open,
+            high,
+            low,
+            close,
+        })
+        .collect())
+}
+
+async fn cache_sensex_index_candles(state: &AppState, candles: &[IntradayCandle]) -> AppResult<()> {
+    for candle in candles {
+        let candle_time = ist_naive_to_utc(candle.at)?;
+        sqlx::query(
+            "INSERT INTO backtest_market_candles
+             (id,exchange,instrument,symbol_token,trading_symbol,interval_key,candle_time,open_price,high_price,low_price,close_price,volume)
+             VALUES ($1,'BSE','SENSEX',$2,'SENSEX',$3,$4,$5,$6,$7,$8,0)
+             ON CONFLICT (exchange,symbol_token,interval_key,candle_time)
+             DO UPDATE SET instrument=EXCLUDED.instrument,trading_symbol=EXCLUDED.trading_symbol,
+                open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,
+                low_price=EXCLUDED.low_price,close_price=EXCLUDED.close_price,fetched_at=NOW()",
+        )
+        .bind(Uuid::new_v4())
+        .bind(SENSEX_INDEX_TOKEN)
+        .bind(OPTION_INTERVAL)
+        .bind(candle_time)
+        .bind(candle.open)
+        .bind(candle.high)
+        .bind(candle.low)
+        .bind(candle.close)
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn cached_sensex_index_candles(
+    state: &AppState,
+    from_candle: NaiveDateTime,
+    to_candle: NaiveDateTime,
+) -> AppResult<Vec<IntradayCandle>> {
+    let from_utc = ist_naive_to_utc(from_candle)?;
+    let to_utc = ist_naive_to_utc(to_candle)?;
+    let max_cached: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MAX(candle_time)
+         FROM backtest_market_candles
+         WHERE exchange='BSE' AND symbol_token=$1 AND interval_key=$2
+           AND candle_time BETWEEN $3 AND $4",
+    )
+    .bind(SENSEX_INDEX_TOKEN)
+    .bind(OPTION_INTERVAL)
+    .bind(from_utc)
+    .bind(to_utc)
+    .fetch_one(&state.db)
+    .await?;
+
+    let fetch_from = max_cached
+        .filter(|cached| *cached >= from_utc)
+        .map(|cached| {
+            cached
+                .with_timezone(&FixedOffset::east_opt(19_800).expect("valid IST offset"))
+                .naive_local()
+                + Duration::minutes(5)
+        })
+        .unwrap_or(from_candle);
+
+    if fetch_from <= to_candle {
+        let fetched = shared_market_candles(
+            state,
+            "BSE",
+            SENSEX_INDEX_TOKEN,
+            OPTION_INTERVAL,
+            &format!("{}", fetch_from.format("%Y-%m-%d %H:%M")),
+            &format!("{}", to_candle.format("%Y-%m-%d %H:%M")),
+        )
+        .await;
+        match fetched {
+            Ok(raw) => {
+                let candles = parse_intraday_candles(&raw);
+                cache_sensex_index_candles(state, &candles).await?;
+            }
+            Err(error) => {
+                let fresh_enough =
+                    max_cached.is_some_and(|cached| cached >= to_utc - Duration::minutes(10));
+                if !fresh_enough {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    %error,
+                    "using recent cached SENSEX candles after Angel historical fetch failed"
+                );
+            }
+        }
+    }
+
+    let candles = load_cached_sensex_index_candles(state, from_utc, to_utc).await?;
+    if candles.is_empty() {
+        return Err(AppError::BadRequest(
+            "No cached or broker-returned SENSEX candles are available for Option Entry.".into(),
+        ));
+    }
+    Ok(candles)
+}
+
+async fn ensure_option_indicators(
+    state: &AppState,
+    now: DateTime<FixedOffset>,
+    indicators: &mut Option<Vec<IndicatorCandle>>,
+) -> AppResult<()> {
+    if indicators.is_none() {
+        let candles = sensex_index_candles(state, Duration::days(7), now).await?;
+        *indicators = Some(indicator_candles(&candles));
+    }
+    Ok(())
+}
+
+async fn option_execution_ltp(state: &AppState, snapshot: &Snapshot) -> AppResult<f64> {
     let token = snapshot
         .contract_token
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Option snapshot has no contract token.".into()))?;
-    let from = to - lookback;
-    let raw = angel::get_candles_with_exchange_interval(
-        state,
-        &credentials.api_key,
-        &credentials.jwt_token,
-        &snapshot.exchange_segment,
-        token,
-        OPTION_INTERVAL,
-        &format!("{}", from.format("%Y-%m-%d %H:%M")),
-        &format!("{}", to.format("%Y-%m-%d %H:%M")),
+    let mut token_map = serde_json::Map::new();
+    token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
+    let quote = shared_market_quote(state, "LTP", Value::Object(token_map)).await?;
+    let ltp = find_quote_ltp(&quote).ok_or_else(|| {
+        AppError::BadRequest("Angel One option quote did not include LTP.".into())
+    })?;
+    risk::record_tick(state, &snapshot.exchange_segment, token, ltp).await?;
+    Ok(ltp)
+}
+
+async fn refresh_snapshot_market_tick(state: &AppState, snapshot: &Snapshot) -> AppResult<()> {
+    let token = snapshot
+        .contract_token
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Snapshot has no contract token.".into()))?;
+    let has_recent_tick: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM market_price_ticks WHERE exchange_segment=$1 AND contract_token=$2 AND received_at>NOW()-INTERVAL '5 seconds')",
     )
-    .await;
-    match raw {
-        Ok(value) => Ok(parse_intraday_candles(&value)),
-        Err(error) => {
-            if angel::is_invalid_api_key_error(&error.to_string()) {
-                crate::home::mark_invalid(
-                    state,
-                    profile_id,
-                    "Angel One API token is invalid. Please establish the broker connection again.",
-                )
-                .await?;
-            }
-            Err(error)
-        }
+    .bind(&snapshot.exchange_segment)
+    .bind(token)
+    .fetch_one(&state.db)
+    .await?;
+    if has_recent_tick {
+        return Ok(());
     }
+
+    let mut token_map = serde_json::Map::new();
+    token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
+    let quote = shared_market_quote(state, "LTP", Value::Object(token_map)).await?;
+    let ltp = find_quote_ltp(&quote).ok_or_else(|| {
+        let contract = snapshot
+            .contract_symbol
+            .as_deref()
+            .unwrap_or(&snapshot.instrument);
+        AppError::BadRequest(format!(
+            "Angel One quote for {contract} did not include LTP."
+        ))
+    })?;
+    risk::record_tick(state, &snapshot.exchange_segment, token, ltp).await?;
+    Ok(())
 }
 
 async fn record_snapshot_failure(state: &AppState, instrument: &str, date: NaiveDate, error: &str) {
@@ -1791,6 +2816,26 @@ pub(crate) async fn place_strategy_order(
             .checked_mul(order.lots)
             .ok_or_else(|| AppError::BadRequest("Order quantity overflow.".into()))?,
     );
+    if snapshot.strategy_key == STRATEGY_KEY
+        && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY")
+        && order.trade_id.is_none()
+    {
+        let expected_quantity = lot_size
+            .checked_mul(order.lots)
+            .ok_or_else(|| AppError::BadRequest("Order quantity overflow.".into()))?;
+        if quantity != expected_quantity {
+            return Err(AppError::BadRequest(format!(
+                "Futures Breakout quantity mismatch: {order_lots} lots × contract lot {lot_size} must be {expected_quantity}, got {quantity}.",
+                order_lots = order.lots
+            )));
+        }
+        if user_has_breakout_open_position(state, runner.user_id, &snapshot.instrument).await? {
+            return Err(AppError::BadRequest(format!(
+                "{} entry skipped because an open Futures Breakout position already exists for {}.",
+                order.role, snapshot.instrument
+            )));
+        }
+    }
     let key = format!(
         "{}:{}:{}:{}:{}",
         runner.user_id,
@@ -1856,6 +2901,25 @@ pub(crate) async fn place_strategy_order(
             live_margin = value.get("available_balance").and_then(Value::as_f64);
         }
     }
+    let price_refresh_error = if !protective {
+        match refresh_snapshot_market_tick(state, snapshot).await {
+            Ok(()) => None,
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    user_id = %runner.user_id,
+                    instrument = %runner.instrument,
+                    exchange = %snapshot.exchange_segment,
+                    token,
+                    error = %message,
+                    "could not refresh strategy market price before risk check"
+                );
+                Some(message)
+            }
+        }
+    } else {
+        None
+    };
     let active_id = match risk::assess_and_reserve(
         state,
         &risk::OrderRisk {
@@ -1885,7 +2949,12 @@ pub(crate) async fn place_strategy_order(
     {
         Ok(value) => value,
         Err(error) => {
-            let message = error.to_string();
+            let mut message = error.to_string();
+            if message.contains("no fresh valid market price")
+                && let Some(refresh_error) = price_refresh_error.as_ref()
+            {
+                message = format!("{message} Last quote refresh failed: {refresh_error}");
+            }
             operational_alert_for(
                 state,
                 &snapshot.strategy_key,
@@ -2121,6 +3190,34 @@ async fn place_entries(
             snapshot.instrument
         )));
     }
+    if user_has_breakout_open_position(state, runner.user_id, &snapshot.instrument).await? {
+        emit(
+            state,
+            Some(runner.user_id),
+            &snapshot.instrument,
+            "entry_skipped",
+            json!({
+                "reason":"OPEN_POSITION_EXISTS",
+                "message":"Futures Breakout entry skipped because an open position already exists for this instrument."
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+    if user_has_active_breakout_entry_order(state, runner.user_id, &snapshot.instrument).await? {
+        emit(
+            state,
+            Some(runner.user_id),
+            &snapshot.instrument,
+            "entry_skipped",
+            json!({
+                "reason":"ACTIVE_ENTRY_ORDER_EXISTS",
+                "message":"Futures Breakout entry skipped because an entry order is already active for this instrument."
+            }),
+        )
+        .await;
+        return Ok(());
+    }
     let orders = match snapshot.entry_direction.as_deref() {
         Some("BUY") => vec![(
             "BUY_ENTRY",
@@ -2179,6 +3276,53 @@ async fn place_entries(
         .await?;
     }
     Ok(())
+}
+
+async fn user_has_breakout_open_position(
+    state: &AppState,
+    user_id: Uuid,
+    instrument: &str,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM trades
+            WHERE user_id=$1
+              AND strategy_key=$2
+              AND instrument_label=$3
+              AND status='open'
+              AND remaining_lots>0
+        )",
+    )
+    .bind(user_id)
+    .bind(STRATEGY_KEY)
+    .bind(instrument)
+    .fetch_one(&state.db)
+    .await?)
+}
+
+async fn user_has_active_breakout_entry_order(
+    state: &AppState,
+    user_id: Uuid,
+    instrument: &str,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM strategy_orders o
+            JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+            WHERE o.user_id=$1
+              AND s.strategy_key=$2
+              AND s.instrument=$3
+              AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+              AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+        )",
+    )
+    .bind(user_id)
+    .bind(STRATEGY_KEY)
+    .bind(instrument)
+    .fetch_one(&state.db)
+    .await?)
 }
 
 async fn run_entries(
@@ -2252,14 +3396,28 @@ async fn run_entries(
         });
     }
     let mut errors = Vec::new();
+    let mut successes = 0_usize;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => successes += 1,
             Ok(Err(error)) => errors.push(error.to_string()),
             Err(error) => errors.push(error.to_string()),
         }
     }
-    if errors.is_empty() {
+    // A batch is shared by all configured users. One user's margin or broker
+    // rejection must not make already successful users retry their orders or
+    // age the whole action into a misleading "skipped" state.
+    if errors.is_empty() || successes > 0 {
+        if !errors.is_empty() {
+            tracing::warn!(
+                instrument = %instrument,
+                session,
+                successes,
+                failures = errors.len(),
+                errors = ?errors,
+                "entry batch completed with per-user failures"
+            );
+        }
         Ok(())
     } else {
         Err(AppError::BadRequest(errors.join("; ")))
@@ -2274,23 +3432,60 @@ async fn option_runners(state: &AppState, instrument: &str) -> AppResult<Vec<Run
         .await?)
 }
 
-async fn user_has_option_exposure(
+async fn supertrend_runners(
+    state: &AppState,
+    config: IndexOptionConfig,
+) -> AppResult<Vec<SuperTrendRunner>> {
+    Ok(sqlx::query_as(
+        "SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode,
+                CASE WHEN c.target_points>0 THEN c.target_points ELSE $3 END AS target_points,
+                CASE WHEN c.stop_loss_points>0 THEN c.stop_loss_points ELSE $4 END AS stop_loss_points
+         FROM user_strategy_configs c
+         JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key
+         JOIN users u ON u.id=c.user_id
+         JOIN user_profiles p ON p.user_id=c.user_id
+         WHERE c.enabled=TRUE
+           AND a.is_active=TRUE
+           AND c.strategy_key=$1
+           AND c.instrument=$2
+           AND u.is_active=TRUE
+           AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))",
+    )
+    .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+    .bind(config.instrument)
+    .bind(config.default_target_points)
+    .bind(config.default_stop_loss_points)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+async fn user_has_supertrend_exposure(
     state: &AppState,
     user_id: Uuid,
-    instrument: &str,
+    underlying: &str,
 ) -> AppResult<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND snapshot_id IN (SELECT id FROM strategy_market_snapshots WHERE strategy_key=$2 AND instrument=$3))")
+    let call = format!("{underlying}_CE");
+    let put = format!("{underlying}_PE");
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label IN ($3,$4) AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND s.strategy_key=$2 AND s.instrument IN ($3,$4) AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
         .bind(user_id)
-        .bind(OPTION_ENTRY_STRATEGY_KEY)
-        .bind(instrument)
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .bind(call)
+        .bind(put)
         .fetch_one(&state.db)
         .await?)
 }
 
-async fn has_active_option_exit(state: &AppState, trade_id: Uuid, role: &str) -> AppResult<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role=$2 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+async fn user_has_any_option_exposure(state: &AppState, user_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND snapshot_id IN (SELECT id FROM strategy_market_snapshots WHERE strategy_key=$2))")
+        .bind(user_id)
+        .bind(OPTION_ENTRY_STRATEGY_KEY)
+        .fetch_one(&state.db)
+        .await?)
+}
+
+async fn has_any_active_option_exit(state: &AppState, trade_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
         .bind(trade_id)
-        .bind(role)
         .fetch_one(&state.db)
         .await?)
 }
@@ -2334,6 +3529,7 @@ async fn place_option_entries_for_signal(
     runners: &[Runner],
     mut snapshot: Snapshot,
     signal: OptionSignal,
+    execution_price: f64,
 ) -> AppResult<()> {
     update_option_snapshot_levels(state, &mut snapshot, signal).await?;
     if let Some(token) = snapshot.contract_token.clone() {
@@ -2350,18 +3546,38 @@ async fn place_option_entries_for_signal(
         signal.signal_at.format("%H%M"),
         signal.side.option_type()
     );
+    let rr = option_signal_risk_reward(
+        signal.side,
+        signal.entry_price,
+        signal.stop_loss,
+        signal.target_band,
+    );
     emit_for(
         state,
         OPTION_ENTRY_STRATEGY_KEY,
         None,
         signal.side.instrument(),
         "option_entry_signal",
-        json!({"side":signal.side.option_type(),"signal_at":signal.signal_at,"confirmation_at":signal.confirmation_at,"entry_price":signal.entry_price,"stop_loss":signal.stop_loss,"target_band":signal.target_band}),
+        json!({
+            "side":signal.side.option_type(),
+            "signal_at":signal.signal_at,
+            "confirmation_at":signal.confirmation_at,
+            "index_entry_price":signal.entry_price,
+            "option_execution_price":execution_price,
+            "stop_loss":signal.stop_loss,
+            "target_band":signal.target_band,
+            "entry_tsi":signal.entry_tsi,
+            "minimum_abs_tsi_required":OPTION_TSI_ENTRY_THRESHOLD,
+            "risk_points":rr.map(|value| value.0),
+            "reward_points":rr.map(|value| value.1),
+            "reward_risk_ratio":rr.map(|value| value.2),
+            "minimum_reward_risk_required":1.0
+        }),
     )
     .await;
     let mut errors = Vec::new();
     for runner in runners {
-        if user_has_option_exposure(state, runner.user_id, signal.side.instrument()).await? {
+        if user_has_any_option_exposure(state, runner.user_id).await? {
             continue;
         }
         if let Err(error) = place_strategy_order(
@@ -2374,7 +3590,7 @@ async fn place_option_entries_for_signal(
                 side: signal.side.entry_side(),
                 order_type: "MARKET",
                 lots: runner.lots,
-                price: signal.entry_price,
+                price: execution_price,
                 trigger: None,
                 trade_id: None,
                 quantity: None,
@@ -2396,33 +3612,56 @@ async fn process_option_entry_side(
     state: &AppState,
     side: OptionSide,
     now: DateTime<FixedOffset>,
+    indicators: &[IndicatorCandle],
 ) -> AppResult<()> {
     let runners = option_runners(state, "SENSEX").await?;
     if runners.is_empty() {
         return Ok(());
     }
     let date = now.date_naive();
-    let snapshot = option_snapshot_for_signal(state, side, date).await?;
-    let candles = option_candles(state, &snapshot, Duration::days(2), now).await?;
-    let indicators = indicator_candles(&candles);
-    if let Some(signal) = option_signal(&indicators, side)
+    if let Some(signal) = option_signal(indicators, side)
         && signal.signal_at.date() == date
         && indicators
             .last()
             .is_some_and(|latest| latest.candle.at == signal.signal_at)
     {
-        place_option_entries_for_signal(state, &runners, snapshot, signal).await?;
+        let mut eligible = Vec::new();
+        for runner in runners {
+            if !user_has_any_option_exposure(state, runner.user_id).await? {
+                eligible.push(runner);
+            }
+        }
+        if eligible.is_empty() {
+            return Ok(());
+        }
+        let (snapshot, execution_price) = option_snapshot_for_signal(state, side, date).await?;
+        place_option_entries_for_signal(state, &eligible, snapshot, signal, execution_price)
+            .await?;
     }
     Ok(())
 }
 
-async fn process_option_exits(state: &AppState, now: DateTime<FixedOffset>) -> AppResult<()> {
-    let trades: Vec<(Uuid, Uuid, String, i32, i32, Option<Uuid>, f64)> = sqlx::query_as("SELECT id,user_id,instrument_label,quantity,remaining_lots,strategy_snapshot_id,sl1_price FROM trades WHERE strategy_key=$1 AND status='open' AND strategy_snapshot_id IS NOT NULL")
+async fn process_option_exits(
+    state: &AppState,
+    now: DateTime<FixedOffset>,
+    indicators: &mut Option<Vec<IndicatorCandle>>,
+) -> AppResult<()> {
+    let trades: Vec<OpenOptionTradeRow> = sqlx::query_as("SELECT id,user_id,instrument_label,quantity,remaining_lots,strategy_snapshot_id,sl1_price,entry_datetime FROM trades WHERE strategy_key=$1 AND status='open' AND remaining_lots>0 AND strategy_snapshot_id IS NOT NULL")
         .bind(OPTION_ENTRY_STRATEGY_KEY)
         .fetch_all(&state.db)
         .await?;
     let mut errors = Vec::new();
-    for (trade_id, user_id, instrument, quantity, remaining_lots, snapshot_id, stop_loss) in trades
+    let mut eligible = Vec::new();
+    for (
+        trade_id,
+        user_id,
+        instrument,
+        quantity,
+        remaining_lots,
+        snapshot_id,
+        stop_loss,
+        entry_time,
+    ) in trades
     {
         let Some(snapshot_id) = snapshot_id else {
             continue;
@@ -2432,27 +3671,79 @@ async fn process_option_exits(state: &AppState, now: DateTime<FixedOffset>) -> A
             .bind(snapshot_id)
             .fetch_one(&state.db)
             .await?;
-        let side = if instrument == OptionSide::Put.instrument() {
-            OptionSide::Put
-        } else {
-            OptionSide::Call
-        };
-        let candles = option_candles(state, &snapshot, Duration::days(2), now).await?;
-        let Some(latest) = indicator_candles(&candles).last().copied() else {
-            continue;
-        };
-        let Some((role, price)) = option_exit(latest, side, stop_loss) else {
-            continue;
-        };
-        if has_active_option_exit(state, trade_id, role).await? {
+        if snapshot
+            .contract_expiry
+            .is_some_and(|expiry| expiry < now.date_naive())
+        {
+            tracing::warn!(
+                %trade_id,
+                user_id=%user_id,
+                instrument=%instrument,
+                contract=?snapshot.contract_symbol,
+                expiry=?snapshot.contract_expiry,
+                "skipping expired option entry trade during exit scan"
+            );
             continue;
         }
+        let Some(side) = OptionSide::from_instrument(&instrument) else {
+            continue;
+        };
+        eligible.push((
+            trade_id,
+            user_id,
+            instrument,
+            quantity,
+            remaining_lots,
+            snapshot,
+            side,
+            stop_loss,
+            entry_time,
+        ));
+    }
+    if eligible.is_empty() {
+        return Ok(());
+    }
+    ensure_option_indicators(state, now, indicators).await?;
+    let indicators = indicators.as_deref().unwrap_or(&[]);
+    for (
+        trade_id,
+        user_id,
+        instrument,
+        quantity,
+        remaining_lots,
+        snapshot,
+        side,
+        stop_loss,
+        entry_time,
+    ) in eligible
+    {
+        let Some((role, index_price, trigger_at)) =
+            option_exit_since(indicators, side, stop_loss, entry_time)
+        else {
+            continue;
+        };
+        if has_any_active_option_exit(state, trade_id).await? {
+            continue;
+        }
+        let price = match option_execution_ltp(state, &snapshot).await {
+            Ok(price) => price,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
         let runner =
-            runner_for_strategy(state, user_id, OPTION_ENTRY_STRATEGY_KEY, "SENSEX").await?;
+            match runner_for_strategy(state, user_id, OPTION_ENTRY_STRATEGY_KEY, "SENSEX").await {
+                Ok(runner) => runner,
+                Err(error) => {
+                    errors.push(format!("{instrument} {trade_id}: {error}"));
+                    continue;
+                }
+            };
         let session = format!(
             "optx-{}-{}-{}",
-            latest.candle.at.format("%Y%m%d"),
-            latest.candle.at.format("%H%M"),
+            trigger_at.format("%Y%m%d"),
+            trigger_at.format("%H%M"),
             role
         );
         if let Err(error) = place_strategy_order(
@@ -2474,6 +3765,246 @@ async fn process_option_exits(state: &AppState, now: DateTime<FixedOffset>) -> A
         .await
         {
             errors.push(error.to_string());
+        } else {
+            emit_for(
+                state,
+                OPTION_ENTRY_STRATEGY_KEY,
+                Some(user_id),
+                &instrument,
+                "option_exit_signal",
+                json!({"trade_id":trade_id,"role":role,"trigger_at":trigger_at,"index_trigger_price":index_price,"option_execution_price":price}),
+            )
+            .await;
+        }
+    }
+    if !errors.is_empty() {
+        let message = format!(
+            "Option Entry exit scan had {} non-fatal error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        );
+        tracing::warn!(error=%message, "option entry exit scan continued after non-fatal errors");
+        operational_alert_for(
+            state,
+            OPTION_ENTRY_STRATEGY_KEY,
+            None,
+            "SENSEX",
+            "option_exit_scan_warning",
+            "warning",
+            &message,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn process_option_square_off(state: &AppState, now: DateTime<FixedOffset>) -> AppResult<()> {
+    let trades: Vec<(Uuid, Uuid, String, i32, i32, Option<Uuid>)> = sqlx::query_as("SELECT id,user_id,instrument_label,quantity,remaining_lots,strategy_snapshot_id FROM trades WHERE strategy_key=$1 AND status='open' AND remaining_lots>0 AND strategy_snapshot_id IS NOT NULL")
+        .bind(OPTION_ENTRY_STRATEGY_KEY)
+        .fetch_all(&state.db)
+        .await?;
+    let mut errors = Vec::new();
+    for (trade_id, user_id, instrument, quantity, remaining_lots, snapshot_id) in trades {
+        let Some(snapshot_id) = snapshot_id else {
+            continue;
+        };
+        if has_any_active_option_exit(state, trade_id).await? {
+            continue;
+        }
+        let Some(side) = OptionSide::from_instrument(&instrument) else {
+            continue;
+        };
+        let query = format!("{} WHERE id=$1", snapshot_select());
+        let snapshot: Snapshot = sqlx::query_as(&query)
+            .bind(snapshot_id)
+            .fetch_one(&state.db)
+            .await?;
+        if snapshot
+            .contract_expiry
+            .is_some_and(|expiry| expiry < now.date_naive())
+        {
+            tracing::warn!(
+                %trade_id,
+                user_id=%user_id,
+                instrument=%instrument,
+                contract=?snapshot.contract_symbol,
+                expiry=?snapshot.contract_expiry,
+                "skipping expired option entry trade during square-off scan"
+            );
+            continue;
+        }
+        let price = match option_execution_ltp(state, &snapshot).await {
+            Ok(price) => price,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
+        let runner =
+            match runner_for_strategy(state, user_id, OPTION_ENTRY_STRATEGY_KEY, "SENSEX").await {
+                Ok(runner) => runner,
+                Err(error) => {
+                    errors.push(format!("{instrument} {trade_id}: {error}"));
+                    continue;
+                }
+            };
+        let session = format!("optsq-{}-{}", now.format("%Y%m%d"), now.format("%H%M"));
+        if let Err(error) = place_strategy_order(
+            state,
+            &runner,
+            &snapshot,
+            &session,
+            NewOrder {
+                role: "SL1",
+                side: side.exit_side(),
+                order_type: "MARKET",
+                lots: remaining_lots.max(1),
+                price,
+                trigger: None,
+                trade_id: Some(trade_id),
+                quantity: Some(quantity.max(1)),
+            },
+        )
+        .await
+        {
+            errors.push(error.to_string());
+        } else {
+            emit_for(
+                state,
+                OPTION_ENTRY_STRATEGY_KEY,
+                Some(user_id),
+                &instrument,
+                "option_intraday_square_off",
+                json!({"trade_id":trade_id,"square_off_at":now,"option_execution_price":price}),
+            )
+            .await;
+            append_user_log(
+                state,
+                user_id,
+                &format!(
+                    "OPTION INTRADAY SQUARE-OFF {} @ {:.2} [15:20 IST]",
+                    contract_log_label(&instrument, snapshot.contract_symbol.as_deref()),
+                    price
+                ),
+            )
+            .await;
+        }
+    }
+    if !errors.is_empty() {
+        let message = format!(
+            "Option Entry square-off scan had {} non-fatal error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        );
+        tracing::warn!(error=%message, "option entry square-off continued after non-fatal errors");
+        operational_alert_for(
+            state,
+            OPTION_ENTRY_STRATEGY_KEY,
+            None,
+            "SENSEX",
+            "option_square_off_warning",
+            "warning",
+            &message,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn place_supertrend_entries_for_signal(
+    state: &AppState,
+    config: IndexOptionConfig,
+    runners: &[SuperTrendRunner],
+    signal: SuperTrendSignal,
+) -> AppResult<()> {
+    let mut errors = Vec::new();
+    for runner in runners {
+        if runner.target_points <= 0.0 || runner.stop_loss_points <= 0.0 {
+            errors.push(format!(
+                "{}: TP and SL points must be positive.",
+                runner.username
+            ));
+            continue;
+        }
+        if user_has_supertrend_exposure(state, runner.user_id, config.instrument).await? {
+            continue;
+        }
+        let (snapshot, execution_price, underlying_ltp) =
+            match supertrend_option_snapshot_for_signal(
+                state,
+                config,
+                signal.side,
+                signal.signal_at.date(),
+                signal.signal_at,
+                runner.user_id,
+                runner.target_points,
+                runner.stop_loss_points,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", runner.username));
+                    continue;
+                }
+            };
+        if let Some(token) = snapshot.contract_token.clone() {
+            crate::market_ws::ensure_strategy_feed(
+                state.clone(),
+                snapshot.exchange_segment.clone(),
+                token,
+            )
+            .await;
+        }
+        let session = format!(
+            "st-{}-{}-{}-{}",
+            config.instrument,
+            signal.signal_at.format("%Y%m%d"),
+            signal.signal_at.format("%H%M"),
+            signal.side.option_type()
+        );
+        emit_for(
+            state,
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            Some(runner.user_id),
+            config.instrument,
+            "supertrend_signal",
+            json!({
+                "side":signal.side.option_type(),
+                "signal_at":signal.signal_at,
+                "index_close":signal.index_close,
+                "index_ltp":underlying_ltp,
+                "supertrend":signal.supertrend,
+                "previous_direction":signal.previous_direction.as_str(),
+                "direction":signal.direction.as_str(),
+                "option_execution_price":execution_price,
+                "target_points":runner.target_points,
+                "stop_loss_points":runner.stop_loss_points,
+                "atr_period":SUPERTREND_ATR_PERIOD,
+                "factor":SUPERTREND_FACTOR,
+            }),
+        )
+        .await;
+        let base_runner = Runner::from(runner.clone());
+        if let Err(error) = place_strategy_order(
+            state,
+            &base_runner,
+            &snapshot,
+            &session,
+            NewOrder {
+                role: signal.side.entry_role(),
+                side: signal.side.entry_side(),
+                order_type: "MARKET",
+                lots: runner.lots,
+                price: execution_price,
+                trigger: None,
+                trade_id: None,
+                quantity: None,
+            },
+        )
+        .await
+        {
+            errors.push(format!("{}: {error}", runner.username));
         }
     }
     if errors.is_empty() {
@@ -2481,6 +4012,170 @@ async fn process_option_exits(state: &AppState, now: DateTime<FixedOffset>) -> A
     } else {
         Err(AppError::BadRequest(errors.join("; ")))
     }
+}
+
+async fn process_supertrend_instrument(
+    state: &AppState,
+    config: IndexOptionConfig,
+    now: DateTime<FixedOffset>,
+) -> AppResult<()> {
+    let runners = supertrend_runners(state, config).await?;
+    if runners.is_empty() {
+        return Ok(());
+    }
+    let candles = index_candles(state, config, Duration::days(7), now).await?;
+    let points = supertrend_points(&candles, SUPERTREND_ATR_PERIOD, SUPERTREND_FACTOR);
+    let Some(signal) = supertrend_signal(&points) else {
+        return Ok(());
+    };
+    let date = now.date_naive();
+    if signal.signal_at.date() != date
+        || candles
+            .last()
+            .is_none_or(|latest| latest.at != signal.signal_at)
+    {
+        return Ok(());
+    }
+    let mut eligible = Vec::new();
+    for runner in runners {
+        if !user_has_supertrend_exposure(state, runner.user_id, config.instrument).await? {
+            eligible.push(runner);
+        }
+    }
+    if eligible.is_empty() {
+        return Ok(());
+    }
+    place_supertrend_entries_for_signal(state, config, &eligible, signal).await
+}
+
+async fn process_supertrend_square_off(
+    state: &AppState,
+    now: DateTime<FixedOffset>,
+) -> AppResult<()> {
+    let trades: Vec<(Uuid, Uuid, String, i32, i32, Option<Uuid>)> = sqlx::query_as("SELECT id,user_id,instrument_label,quantity,remaining_lots,strategy_snapshot_id FROM trades WHERE strategy_key=$1 AND status='open' AND remaining_lots>0 AND strategy_snapshot_id IS NOT NULL")
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .fetch_all(&state.db)
+        .await?;
+    let mut errors = Vec::new();
+    for (trade_id, user_id, instrument, quantity, remaining_lots, snapshot_id) in trades {
+        let Some(snapshot_id) = snapshot_id else {
+            continue;
+        };
+        let Some(underlying) = supertrend_snapshot_underlying(&instrument) else {
+            continue;
+        };
+        if has_any_active_option_exit(state, trade_id).await? {
+            if let Err(error) = cancel_active_exits(state, user_id, trade_id).await {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+            if has_any_active_option_exit(state, trade_id).await? {
+                continue;
+            }
+        }
+        let query = format!("{} WHERE id=$1", snapshot_select());
+        let snapshot: Snapshot = sqlx::query_as(&query)
+            .bind(snapshot_id)
+            .fetch_one(&state.db)
+            .await?;
+        let price = match option_execution_ltp(state, &snapshot).await {
+            Ok(price) => price,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
+        let runner = match runner_for_strategy(
+            state,
+            user_id,
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            underlying,
+        )
+        .await
+        {
+            Ok(runner) => runner,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
+        let session = format!(
+            "stsq-{}-{}-{}",
+            underlying,
+            now.format("%Y%m%d"),
+            now.format("%H%M")
+        );
+        if let Err(error) = place_strategy_order(
+            state,
+            &runner,
+            &snapshot,
+            &session,
+            NewOrder {
+                role: "SL1",
+                side: "SELL",
+                order_type: "MARKET",
+                lots: remaining_lots.max(1),
+                price,
+                trigger: None,
+                trade_id: Some(trade_id),
+                quantity: Some(quantity.max(1)),
+            },
+        )
+        .await
+        {
+            errors.push(error.to_string());
+        } else {
+            emit_for(
+                state,
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                Some(user_id),
+                underlying,
+                "supertrend_intraday_square_off",
+                json!({"trade_id":trade_id,"square_off_at":now,"option_execution_price":price}),
+            )
+            .await;
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "SuperTrend square-off had {} non-fatal error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )))
+    }
+}
+
+async fn run_supertrend_cycle(state: &AppState, now: DateTime<FixedOffset>) -> AppResult<()> {
+    let (open, reason) = session_is_open(state, now.date_naive(), "day").await?;
+    if !open {
+        operational_alert_for(
+            state,
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            None,
+            "",
+            "session_skipped",
+            "warning",
+            &format!("SuperTrend strategy skipped: {reason}"),
+        )
+        .await;
+        return Ok(());
+    }
+    if option_square_off_due(now) {
+        process_supertrend_square_off(state, now).await?;
+        return Ok(());
+    }
+    if !option_entry_allowed(now) {
+        return Ok(());
+    }
+    for instrument in ["SENSEX", "NIFTY"] {
+        let Some(config) = index_option_config(instrument) else {
+            continue;
+        };
+        process_supertrend_instrument(state, config, now).await?;
+    }
+    Ok(())
 }
 
 async fn run_option_entry_cycle(state: &AppState, now: DateTime<FixedOffset>) -> AppResult<()> {
@@ -2498,9 +4193,19 @@ async fn run_option_entry_cycle(state: &AppState, now: DateTime<FixedOffset>) ->
         .await;
         return Ok(());
     }
-    process_option_exits(state, now).await?;
-    process_option_entry_side(state, OptionSide::Call, now).await?;
-    process_option_entry_side(state, OptionSide::Put, now).await
+    if option_square_off_due(now) {
+        process_option_square_off(state, now).await?;
+        return Ok(());
+    }
+    let mut indicators = None;
+    process_option_exits(state, now, &mut indicators).await?;
+    if !option_entry_allowed(now) {
+        return Ok(());
+    }
+    ensure_option_indicators(state, now, &mut indicators).await?;
+    let indicators = indicators.as_deref().unwrap_or(&[]);
+    process_option_entry_side(state, OptionSide::Call, now, indicators).await?;
+    process_option_entry_side(state, OptionSide::Put, now, indicators).await
 }
 
 async fn runner_for(state: &AppState, user_id: Uuid, instrument: &str) -> AppResult<Runner> {
@@ -2793,17 +4498,37 @@ async fn run_scheduled_action(
         }
         Err(error) => {
             let message = error.to_string();
-            sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW()+INTERVAL '30 seconds',last_error=$2,updated_at=NOW() WHERE id=$1")
-                .bind(run_id).bind(&message).execute(&state.db).await?;
-            operational_alert(
-                state,
-                None,
-                instrument,
-                "scheduler_retry",
-                "error",
-                &format!("{session} {action} failed; retrying: {message}"),
-            )
-            .await;
+            if is_terminal_scheduler_error(&message) {
+                sqlx::query("UPDATE strategy_scheduler_runs SET status='skipped',completed_at=NOW(),last_error=$2,updated_at=NOW() WHERE id=$1")
+                    .bind(run_id)
+                    .bind(&message)
+                    .execute(&state.db)
+                    .await?;
+                operational_alert(
+                    state,
+                    None,
+                    instrument,
+                    "session_skipped",
+                    "warning",
+                    &format!("{session} {action} skipped: {message}"),
+                )
+                .await;
+            } else {
+                sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW()+INTERVAL '30 seconds',last_error=$2,updated_at=NOW() WHERE id=$1")
+                    .bind(run_id)
+                    .bind(&message)
+                    .execute(&state.db)
+                    .await?;
+                operational_alert(
+                    state,
+                    None,
+                    instrument,
+                    "scheduler_retry",
+                    "error",
+                    &format!("{session} {action} failed; retrying: {message}"),
+                )
+                .await;
+            }
         }
     }
     Ok(())
@@ -2867,6 +4592,13 @@ fn within_catchup_window(current_minute: u32, due_minute: u32) -> bool {
     current_minute >= due_minute && current_minute <= due_minute + 15
 }
 
+fn is_terminal_scheduler_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower
+        .split("; ")
+        .all(|part| part.contains("demo balance is insufficient for the required margin"))
+}
+
 pub fn start(state: AppState) {
     tokio::spawn(async move {
         let _leader_connection = loop {
@@ -2926,6 +4658,19 @@ pub fn start(state: AppState) {
                 .await;
             }
         }
+        if let Err(error) = ensure_sensex_option_contract_metadata(&state, startup_date).await {
+            tracing::warn!(%error, "startup SENSEX option contract metadata failed");
+            operational_alert_for(
+                &state,
+                OPTION_ENTRY_STRATEGY_KEY,
+                None,
+                "SENSEX",
+                "option_contract_metadata_failed",
+                "error",
+                &format!("SENSEX option contract metadata refresh failed and will retry: {error}"),
+            )
+            .await;
+        }
         let mut timer = interval(std::time::Duration::from_secs(5));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut dispatched = HashSet::new();
@@ -2970,6 +4715,31 @@ pub fn start(state: AppState) {
                             )
                             .await;
                         }
+                    }
+                });
+            }
+            if dispatched.insert(format!(
+                "{date}:sensex-option-contracts:{}:{}",
+                now.hour(),
+                now.minute() / 5
+            )) {
+                let cloned = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = ensure_sensex_option_contract_metadata(&cloned, date).await
+                    {
+                        tracing::warn!(%error, "daily SENSEX option contract metadata failed");
+                        operational_alert_for(
+                            &cloned,
+                            OPTION_ENTRY_STRATEGY_KEY,
+                            None,
+                            "SENSEX",
+                            "option_contract_metadata_failed",
+                            "error",
+                            &format!(
+                                "SENSEX option contract metadata refresh failed and will retry: {error}"
+                            ),
+                        )
+                        .await;
                     }
                 });
             }
@@ -3033,9 +4803,8 @@ pub fn start(state: AppState) {
                 }
             }
             let minute_of_day = now.hour() * 60 + now.minute();
-            if minute_of_day >= 9 * 60 + 20
-                && minute_of_day <= 15 * 60 + 30
-                && minute_of_day % 5 == 0
+            if (OPTION_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE).contains(&minute_of_day)
+                && minute_of_day.is_multiple_of(5)
                 && dispatched.insert(format!("{date}:option-entry:{}", now.format("%H%M")))
             {
                 let cloned = state.clone();
@@ -3050,6 +4819,27 @@ pub fn start(state: AppState) {
                             "option_cycle_failed",
                             "error",
                             &format!("Option Entry Strategy V1.0 cycle failed: {error}"),
+                        )
+                        .await;
+                    }
+                });
+            }
+            if (OPTION_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE).contains(&minute_of_day)
+                && minute_of_day.is_multiple_of(5)
+                && dispatched.insert(format!("{date}:supertrend-options:{}", now.format("%H%M")))
+            {
+                let cloned = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = run_supertrend_cycle(&cloned, now).await {
+                        tracing::warn!(%error, "supertrend index options cycle failed");
+                        operational_alert_for(
+                            &cloned,
+                            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                            None,
+                            "",
+                            "supertrend_cycle_failed",
+                            "error",
+                            &format!("SuperTrend Index Options v1 cycle failed: {error}"),
                         )
                         .await;
                     }
@@ -3202,10 +4992,6 @@ fn residual_protection_session(trade_id: Uuid, exit_processed: i32) -> String {
     )
 }
 
-fn bounded_exit_quantity(requested: i32, open_quantity: i32) -> i32 {
-    requested.max(0).min(open_quantity.max(0))
-}
-
 /// Re-protection is deliberately driven from durable broker reconciliation,
 /// not directly from a partial-fill handler. A cancelling sibling is still a
 /// live broker order and therefore blocks replacement. Once every sibling is
@@ -3223,18 +5009,7 @@ async fn recover_residual_protective_orders(state: &AppState) -> AppResult<()> {
             .bind(&lock_key)
             .execute(&mut *tx)
             .await?;
-        let trade: Option<(
-            Uuid,
-            Uuid,
-            String,
-            String,
-            String,
-            i32,
-            i32,
-            Option<f64>,
-            Option<f64>,
-            bool,
-        )> =
+        let trade: Option<ResidualProtectionTradeRow> =
             sqlx::query_as("SELECT trade.user_id,trade.strategy_snapshot_id,trade.strategy_key,trade.instrument_label,trade.direction,trade.quantity,trade.remaining_lots,trade.sl1_price::float8,trade.sl2_price::float8,EXISTS(SELECT 1 FROM strategy_orders target_order WHERE target_order.trade_id=trade.id AND target_order.role='TARGET' AND target_order.processed_quantity>0) AS target_done FROM trades trade WHERE trade.id=$1 AND trade.execution_mode='live' AND trade.status='open' FOR UPDATE")
                 .bind(trade_id)
                 .fetch_optional(&mut *tx)
@@ -4135,6 +5910,99 @@ async fn clear_entry_orders_for_sl2_reversal(
     Ok(!active)
 }
 
+async fn cancel_active_breakout_entry_orders(
+    state: &AppState,
+    user_id: Uuid,
+    instrument: &str,
+    exclude_order_id: Uuid,
+    reason: &str,
+) -> AppResult<()> {
+    let orders: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT o.id,o.broker_order_id,o.execution_mode,o.order_type,o.status
+         FROM strategy_orders o
+         JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+         WHERE o.user_id=$1
+           AND s.strategy_key=$2
+           AND s.instrument=$3
+           AND o.id<>$4
+           AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+           AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+         ORDER BY o.created_at",
+    )
+    .bind(user_id)
+    .bind(STRATEGY_KEY)
+    .bind(instrument)
+    .bind(exclude_order_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    if orders.is_empty() {
+        return Ok(());
+    }
+
+    let credentials = if orders.iter().any(|(_, _, execution_mode, _, status)| {
+        execution_mode == "live" && matches!(status.as_str(), "submitted" | "partially_filled")
+    }) {
+        Some(state.credentials.load(user_id).await?)
+    } else {
+        None
+    };
+
+    for (id, broker_id, execution_mode, order_type, status) in orders {
+        if execution_mode == "demo" || (status == "pending" && broker_id.is_empty()) {
+            sqlx::query(
+                "UPDATE strategy_orders
+                 SET status='cancelled',
+                     broker_status=$2,
+                     state_version=state_version+1,
+                     updated_at=NOW()
+                 WHERE id=$1
+                   AND status IN ('pending','submitted','partially_filled','submitting','ambiguous','processing','cancelling')",
+            )
+            .bind(id)
+            .bind(reason)
+            .execute(&state.db)
+            .await?;
+            continue;
+        }
+        if !matches!(status.as_str(), "submitted" | "partially_filled") || broker_id.is_empty() {
+            continue;
+        }
+        if execution_mode == "live" {
+            let Some(credentials) = credentials.as_ref() else {
+                continue;
+            };
+            angel::cancel_order(
+                state,
+                &credentials.api_key,
+                &credentials.jwt_token,
+                &broker_id,
+                if order_type.starts_with("STOPLOSS") {
+                    "STOPLOSS"
+                } else {
+                    "NORMAL"
+                },
+            )
+            .await
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            sqlx::query(
+                "UPDATE strategy_orders
+                 SET status='cancelling',
+                     broker_status=$2,
+                     state_version=state_version+1,
+                     updated_at=NOW()
+                 WHERE id=$1
+                   AND status IN ('submitted','partially_filled')",
+            )
+            .bind(id)
+            .bind(reason)
+            .execute(&state.db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn attempt_claimed_sl2_reversal(
     state: &AppState,
     intent: &Sl2ReversalIntent,
@@ -4596,23 +6464,41 @@ async fn complete_option_entry_order(
     fill: f64,
     cumulative_fill: i32,
 ) -> AppResult<bool> {
-    if snapshot.strategy_key != OPTION_ENTRY_STRATEGY_KEY
-        || !matches!(order.role.as_str(), "BUY_ENTRY" | "SELL_ENTRY")
-    {
+    if !matches!(order.role.as_str(), "BUY_ENTRY" | "SELL_ENTRY") {
         return Ok(false);
     }
-    let target = if order.side == "BUY" {
-        snapshot.buy_target
+    let (strategy_key, notes, target, stop, exit_side, should_place_protection) = if snapshot
+        .strategy_key
+        == OPTION_ENTRY_STRATEGY_KEY
+    {
+        let side = OptionSide::from_instrument(&snapshot.instrument)
+            .ok_or_else(|| AppError::BadRequest("Option side is missing.".into()))?;
+        let (target, stop) = option_levels(snapshot, side)
+            .ok_or_else(|| AppError::BadRequest("Option exit levels are missing.".into()))?;
+        (
+            OPTION_ENTRY_STRATEGY_KEY,
+            "Option Entry Strategy V1.0",
+            target,
+            stop,
+            side.exit_side(),
+            false,
+        )
+    } else if snapshot.strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY {
+        let (target_points, stop_points) = supertrend_config_points(snapshot)
+            .ok_or_else(|| AppError::BadRequest("SuperTrend TP/SL points are missing.".into()))?;
+        let side = supertrend_snapshot_side(&snapshot.instrument)
+            .ok_or_else(|| AppError::BadRequest("SuperTrend option side is missing.".into()))?;
+        (
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            "SuperTrend Index Options v1",
+            fill + target_points,
+            (fill - stop_points).max(0.05),
+            side.exit_side(),
+            true,
+        )
     } else {
-        snapshot.sell_target
-    }
-    .ok_or_else(|| AppError::BadRequest("Option target band is missing.".into()))?;
-    let stop = if order.side == "BUY" {
-        snapshot.buy_sl1
-    } else {
-        snapshot.sell_sl1
-    }
-    .ok_or_else(|| AppError::BadRequest("Option stop loss is missing.".into()))?;
+        return Ok(false);
+    };
     let trade_id = Uuid::new_v4();
     let mut fill_tx = state.db.begin().await?;
     if order.execution_mode == "demo" {
@@ -4622,7 +6508,7 @@ async fn complete_option_entry_order(
             .execute(&mut *fill_tx)
             .await?;
     }
-    sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,margin_required) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,'Option Entry Strategy V1.0',$8,$9,$10,$10,$11,$12,$14 FROM strategy_orders WHERE id=$13")
+    sqlx::query("INSERT INTO trades (id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,margin_required) SELECT $1,$2,execution_mode,'open',$3,$4,($5::float8)::numeric,($5::float8)::numeric,0,NOW(),$6,$7,broker_order_id,$8,$9,$10,$11,$11,$12,$13,$15 FROM strategy_orders WHERE id=$14")
         .bind(trade_id)
         .bind(order.user_id)
         .bind(&order.side)
@@ -4630,7 +6516,8 @@ async fn complete_option_entry_order(
         .bind(fill)
         .bind(&snapshot.instrument)
         .bind(snapshot.contract_symbol.as_deref().unwrap_or(""))
-        .bind(OPTION_ENTRY_STRATEGY_KEY)
+        .bind(notes)
+        .bind(strategy_key)
         .bind(snapshot.id)
         .bind(order.lots.max(1))
         .bind(target)
@@ -4648,11 +6535,15 @@ async fn complete_option_entry_order(
     fill_tx.commit().await?;
     emit_for(
         state,
-        OPTION_ENTRY_STRATEGY_KEY,
+        strategy_key,
         Some(order.user_id),
         &snapshot.instrument,
-        "option_position_opened",
-        json!({"trade_id":trade_id,"side":order.side,"fill_price":fill,"target_band":target,"stop_loss":stop,"lots":order.lots}),
+        if should_place_protection {
+            "supertrend_position_opened"
+        } else {
+            "option_position_opened"
+        },
+        json!({"trade_id":trade_id,"side":order.side,"fill_price":fill,"target":target,"stop_loss":stop,"lots":order.lots}),
     )
     .await;
     let contract_label =
@@ -4672,6 +6563,53 @@ async fn complete_option_entry_order(
         ),
     )
     .await;
+    if should_place_protection {
+        let underlying = supertrend_snapshot_underlying(&snapshot.instrument).ok_or_else(|| {
+            AppError::BadRequest("SuperTrend underlying instrument is missing.".into())
+        })?;
+        let runner = runner_for_strategy(
+            state,
+            order.user_id,
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            underlying,
+        )
+        .await?;
+        let protection_session = format!("{}:protect", order.session_key);
+        place_strategy_order(
+            state,
+            &runner,
+            snapshot,
+            &protection_session,
+            NewOrder {
+                role: "TARGET",
+                side: exit_side,
+                order_type: "LIMIT",
+                lots: order.lots.max(1),
+                price: target,
+                trigger: None,
+                trade_id: Some(trade_id),
+                quantity: Some(order.quantity.max(1)),
+            },
+        )
+        .await?;
+        place_strategy_order(
+            state,
+            &runner,
+            snapshot,
+            &protection_session,
+            NewOrder {
+                role: "SL1",
+                side: exit_side,
+                order_type: "STOPLOSS_LIMIT",
+                lots: order.lots.max(1),
+                price: stop,
+                trigger: Some(stop),
+                trade_id: Some(trade_id),
+                quantity: Some(order.quantity.max(1)),
+            },
+        )
+        .await?;
+    }
     Ok(true)
 }
 
@@ -4716,6 +6654,30 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
             let sl2 = exit_levels.sl2;
             if let Some(existing)=sqlx::query_as::<_,(Uuid,String,i32,f64,i32,i32,f64,String,Option<f64>)>("SELECT id,direction,quantity,entry_price::float8,total_lots,remaining_lots,margin_required,COALESCE(contract_symbol,''),target_price::float8 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' ORDER BY entry_datetime DESC LIMIT 1")
                 .bind(order.user_id).bind(STRATEGY_KEY).bind(&instrument).fetch_optional(&state.db).await? {
+                if reversal_source_trade_id.is_none() {
+                    let message = format!(
+                        "{} {} fill ignored because an open Futures Breakout {} position already exists for {}.",
+                        order.role, direction, existing.1, instrument
+                    );
+                    sqlx::query("UPDATE strategy_orders SET status=CASE WHEN execution_mode='live' THEN 'filled' ELSE 'cancelled' END,broker_status=$2,processed_quantity=GREATEST(processed_quantity,$3),filled_quantity=GREATEST(filled_quantity,$3),updated_at=NOW() WHERE id=$1")
+                        .bind(order.id)
+                        .bind(&message)
+                        .bind(cumulative_fill)
+                        .execute(&state.db)
+                        .await?;
+                    operational_alert_for(
+                        state,
+                        STRATEGY_KEY,
+                        Some(order.user_id),
+                        &instrument,
+                        "entry_blocked_open_position",
+                        if order.execution_mode == "live" { "error" } else { "warning" },
+                        &message,
+                    )
+                    .await;
+                    append_user_log(state, order.user_id, &message).await;
+                    return Ok(());
+                }
                 if existing.1!=direction {
                     cancel_active_exits(state,order.user_id,existing.0).await?;
                     let pnl=trade_pnl(&existing.1,existing.3,fill,runtime_pnl_units(&instrument, existing.2, snapshot.lot_size));
@@ -4833,6 +6795,28 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     .await?;
             }
             fill_tx.commit().await?;
+            if let Err(error) = cancel_active_breakout_entry_orders(
+                state,
+                order.user_id,
+                &instrument,
+                order.id,
+                "Cancelled because a Futures Breakout position is already open for this instrument.",
+            )
+            .await
+            {
+                operational_alert_for(
+                    state,
+                    STRATEGY_KEY,
+                    Some(order.user_id),
+                    &instrument,
+                    "entry_cleanup_failed",
+                    "error",
+                    &format!(
+                        "A breakout position opened, but leftover entry-order cancellation failed: {error}"
+                    ),
+                )
+                .await;
+            }
             let runner = runner_for(state, order.user_id, &instrument).await?;
             let close_lots = target_exit_lots(order.lots);
             let exit_side = if direction == "BUY" { "SELL" } else { "BUY" };
@@ -4963,7 +6947,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,i32,f64,f64,f64,Option<f64>,Option<f64>,String)=sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,sl1_price::float8,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade: ExitFillTradeRow = sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,sl1_price::float8,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
@@ -5304,6 +7288,8 @@ pub struct StrategyUpdate {
     pub lots: i32,
     pub run_day_session: Option<bool>,
     pub run_evening_session: Option<bool>,
+    pub target_points: Option<f64>,
+    pub stop_loss_points: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -5336,13 +7322,36 @@ pub async fn catalog(
     Extension(user): Extension<AuthUser>,
 ) -> AppResult<Json<Value>> {
     let user = user.id;
+    let today = ist_now().date_naive();
     let active = activation_state(&state, user).await?;
     let option_active = activation_state_for(&state, user, OPTION_ENTRY_STRATEGY_KEY).await?;
+    let supertrend_active =
+        activation_state_for(&state, user, SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY).await?;
     let configs: Vec<(String, bool, i32, bool, bool)> = sqlx::query_as("SELECT instrument,enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2")
         .bind(user).bind(STRATEGY_KEY).fetch_all(&state.db).await?;
     let option_config: Option<(bool, i32, bool, bool)> = sqlx::query_as("SELECT enabled,lots,run_day_session,run_evening_session FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2 AND instrument='SENSEX'")
         .bind(user).bind(OPTION_ENTRY_STRATEGY_KEY).fetch_optional(&state.db).await?;
-    let snapshots = ensure_supported_contract_metadata(&state, ist_now().date_naive()).await?;
+    let supertrend_configs: Vec<(String, bool, i32, bool, bool, f64, f64)> = sqlx::query_as("SELECT instrument,enabled,lots,run_day_session,run_evening_session,target_points,stop_loss_points FROM user_strategy_configs WHERE user_id=$1 AND strategy_key=$2")
+        .bind(user).bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY).fetch_all(&state.db).await?;
+    let snapshots = ensure_supported_contract_metadata(&state, today).await?;
+    let option_contracts = load_contract_master(&state).await.ok();
+    let option_expiry_preview = option_contracts
+        .as_ref()
+        .and_then(|contracts| sensex_option_expiry_preview(contracts, today));
+    let shared_sessions = shared_market_session_count(&state).await.unwrap_or(0);
+    let option_market_data = if shared_sessions > 0 {
+        json!({
+            "status":"connected",
+            "connected_sessions":shared_sessions,
+            "message":"Angel One market-data session is connected."
+        })
+    } else {
+        json!({
+            "status":"disconnected",
+            "connected_sessions":0,
+            "message":"Angel One market-data session is disconnected. Reconnect Angel One before Option Entry can fetch SENSEX candles/options LTP or place live/demo entries."
+        })
+    };
     // The strategy card is a current-status surface, not an incident log. Keep the
     // complete event history in strategy_events/logs and return only the newest
     // recent alert here so resolved retries do not clutter the trading controls.
@@ -5404,7 +7413,7 @@ pub async fn catalog(
     let option_strategy = json!({
         "key":OPTION_ENTRY_STRATEGY_KEY,
         "name":"Option Entry Strategy V1.0",
-        "description":"5-minute SENSEX option entries using Keltner Channel retracement confirmation, TSI zero-line filter, and Rs. 220-300 option premium selection.",
+        "description":"Intraday 5-minute SENSEX index signals using Keltner Channel retracement confirmation, TSI zero-line filter, and Rs. 220-290 current-week option premium selection.",
         "active":option_active,
         "operational_alerts":option_alerts,
         "scheduler_runs":[],
@@ -5421,12 +7430,79 @@ pub async fn catalog(
                 "status":"ready",
                 "execution_key":"catalog-preview",
                 "exchange_segment":"BFO",
-                "product_type":"CARRYFORWARD",
-                "underlying_token":SENSEX_INDEX_TOKEN
+                "product_type":OPTION_PRODUCT_TYPE,
+                "underlying_token":SENSEX_INDEX_TOKEN,
+                "contract_expiry":option_expiry_preview.map(|preview| preview.0),
+                "lot_size":option_expiry_preview.map(|preview| preview.1),
+                "market_data":option_market_data
             }
         }]
     });
-    Ok(Json(json!({"strategies":[breakout,option_strategy]})))
+    let supertrend_alerts: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key=$1 AND event_type='operational_alert' AND (user_id=$2 OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1")
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY).bind(user).fetch_all(&state.db).await?;
+    let supertrend_instruments: Vec<Value> = ["SENSEX", "NIFTY"]
+        .into_iter()
+        .filter_map(|instrument| {
+            let config = index_option_config(instrument)?;
+            let user_config = supertrend_configs
+                .iter()
+                .find(|item| item.0 == instrument)
+                .map(|item| (item.1, item.2, item.3, item.4, item.5, item.6))
+                .unwrap_or((
+                    false,
+                    1,
+                    true,
+                    false,
+                    config.default_target_points,
+                    config.default_stop_loss_points,
+                ));
+            let preview = option_contracts
+                .as_ref()
+                .and_then(|contracts| supertrend_option_expiry_preview(contracts, config, today));
+            Some(json!({
+                "instrument":instrument,
+                "label":config.label,
+                "enabled":user_config.0,
+                "lots":user_config.1,
+                "run_day_session":user_config.2,
+                "run_evening_session":user_config.3,
+                "target_points": if user_config.4 > 0.0 { user_config.4 } else { config.default_target_points },
+                "stop_loss_points": if user_config.5 > 0.0 { user_config.5 } else { config.default_stop_loss_points },
+                "parameters":{
+                    "target_points": if user_config.4 > 0.0 { user_config.4 } else { config.default_target_points },
+                    "stop_loss_points": if user_config.5 > 0.0 { user_config.5 } else { config.default_stop_loss_points },
+                    "atr_period":SUPERTREND_ATR_PERIOD,
+                    "factor":SUPERTREND_FACTOR,
+                    "interval":OPTION_INTERVAL,
+                    "contract_selection":"ATM"
+                },
+                "snapshot":{
+                    "strategy_key":SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                    "instrument":instrument,
+                    "status":"ready",
+                    "execution_key":"catalog-preview",
+                    "exchange_segment":config.option_exchange,
+                    "product_type":OPTION_PRODUCT_TYPE,
+                    "underlying_token":config.index_token,
+                    "contract_expiry":preview.map(|value| value.0),
+                    "lot_size":preview.map(|value| value.1),
+                    "market_data":option_market_data
+                }
+            }))
+        })
+        .collect();
+    let supertrend_strategy = json!({
+        "key":SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+        "name":"SuperTrend Index Options v1",
+        "description":"Intraday 5-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.",
+        "active":supertrend_active,
+        "operational_alerts":supertrend_alerts,
+        "scheduler_runs":[],
+        "instruments":supertrend_instruments
+    });
+    Ok(Json(
+        json!({"strategies":[breakout,option_strategy,supertrend_strategy]}),
+    ))
 }
 
 async fn cancel_pending_entries(state: &AppState, user: Uuid, strategy_key: &str) -> AppResult<()> {
@@ -5467,7 +7543,7 @@ pub async fn update_activation(
 ) -> AppResult<Json<Value>> {
     if !matches!(
         strategy_key.as_str(),
-        STRATEGY_KEY | OPTION_ENTRY_STRATEGY_KEY
+        STRATEGY_KEY | OPTION_ENTRY_STRATEGY_KEY | SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
     ) {
         return Err(AppError::NotFound("Strategy not found.".into()));
     }
@@ -5530,7 +7606,7 @@ pub async fn update(
         .to_string();
     if !matches!(
         strategy_key.as_str(),
-        STRATEGY_KEY | OPTION_ENTRY_STRATEGY_KEY
+        STRATEGY_KEY | OPTION_ENTRY_STRATEGY_KEY | SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
     ) {
         return Err(AppError::NotFound("Strategy not found.".into()));
     }
@@ -5538,6 +7614,8 @@ pub async fn update(
         .instrument
         .unwrap_or_else(|| {
             if strategy_key == OPTION_ENTRY_STRATEGY_KEY {
+                "SENSEX".into()
+            } else if strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY {
                 "SENSEX".into()
             } else {
                 "GOLDTEN".into()
@@ -5556,20 +7634,46 @@ pub async fn update(
             "Option Entry Strategy V1.0 supports only SENSEX.".into(),
         ));
     }
+    if strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+        && !is_supertrend_index_option_instrument(&instrument)
+    {
+        return Err(AppError::BadRequest(
+            "SuperTrend Index Options supports SENSEX and NIFTY.".into(),
+        ));
+    }
+    let default_points = index_option_config(&instrument);
+    let target_points = input
+        .target_points
+        .or_else(|| default_points.map(|config| config.default_target_points))
+        .unwrap_or(0.0);
+    let stop_loss_points = input
+        .stop_loss_points
+        .or_else(|| default_points.map(|config| config.default_stop_loss_points))
+        .unwrap_or(0.0);
+    if strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+        && (!target_points.is_finite()
+            || target_points <= 0.0
+            || !stop_loss_points.is_finite()
+            || stop_loss_points <= 0.0)
+    {
+        return Err(AppError::BadRequest(
+            "TP and SL points must be positive numbers.".into(),
+        ));
+    }
     if input.enabled && !activation_state_for(&state, user, &strategy_key).await? {
         return Err(AppError::BadRequest(
             "Activate the strategy before enabling an instrument.".into(),
         ));
     }
-    sqlx::query("INSERT INTO user_strategy_configs (user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (user_id,strategy_key,instrument) DO UPDATE SET enabled=EXCLUDED.enabled,lots=EXCLUDED.lots,run_day_session=EXCLUDED.run_day_session,run_evening_session=EXCLUDED.run_evening_session,updated_at=NOW()")
-        .bind(user).bind(&strategy_key).bind(&instrument).bind(input.enabled).bind(input.lots).bind(input.run_day_session.unwrap_or(true)).bind(input.run_evening_session.unwrap_or(strategy_key != OPTION_ENTRY_STRATEGY_KEY)).execute(&state.db).await?;
+    sqlx::query("INSERT INTO user_strategy_configs (user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session,target_points,stop_loss_points) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_id,strategy_key,instrument) DO UPDATE SET enabled=EXCLUDED.enabled,lots=EXCLUDED.lots,run_day_session=EXCLUDED.run_day_session,run_evening_session=EXCLUDED.run_evening_session,target_points=EXCLUDED.target_points,stop_loss_points=EXCLUDED.stop_loss_points,updated_at=NOW()")
+        .bind(user).bind(&strategy_key).bind(&instrument).bind(input.enabled).bind(input.lots).bind(input.run_day_session.unwrap_or(true)).bind(input.run_evening_session.unwrap_or(strategy_key != OPTION_ENTRY_STRATEGY_KEY && strategy_key != SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)).bind(target_points).bind(stop_loss_points).execute(&state.db).await?;
     emit_for(
         &state,
         &strategy_key,
         Some(user),
         &instrument,
         "configuration_updated",
-        json!({"enabled":input.enabled,"lots":input.lots}),
+        json!({"enabled":input.enabled,"lots":input.lots,"target_points":target_points,"stop_loss_points":stop_loss_points}),
     )
     .await;
     let request_context = crate::audit::optional_context(context);
@@ -5582,7 +7686,7 @@ pub async fn update(
             actor_user_id: Some(user),
             target_user_id: Some(user),
             summary: "User changed strategy configuration",
-            metadata: json!({"strategy_key":&strategy_key,"instrument":&instrument,"enabled":input.enabled,"lots":input.lots}),
+            metadata: json!({"strategy_key":&strategy_key,"instrument":&instrument,"enabled":input.enabled,"lots":input.lots,"target_points":target_points,"stop_loss_points":stop_loss_points}),
         },
     )
     .await
@@ -5664,6 +7768,93 @@ mod tests {
     fn contract(expiry: &str) -> MasterContract {
         contract_for("GOLDTEN", expiry, 10)
     }
+
+    fn option_master(
+        exchange: &str,
+        name: &str,
+        expiry: &str,
+        strike: f64,
+        option_type: &str,
+        lot_size: i32,
+        token: &str,
+    ) -> MasterContract {
+        MasterContract {
+            token: token.into(),
+            symbol: format!("{name}{expiry}{}{}", strike as i32, option_type),
+            name: name.into(),
+            expiry: expiry.into(),
+            strike: format!("{}", (strike * 100.0) as i64),
+            lotsize: lot_size.to_string(),
+            instrumenttype: "OPTIDX".into(),
+            exch_seg: exchange.into(),
+        }
+    }
+
+    fn st_candle(index: i64, close: f64) -> IntradayCandle {
+        let at = NaiveDate::from_ymd_opt(2026, 8, 3)
+            .unwrap()
+            .and_hms_opt(9, 15, 0)
+            .unwrap()
+            + Duration::minutes(index * 5);
+        IntradayCandle {
+            at,
+            open: close,
+            high: close + 2.0,
+            low: close - 2.0,
+            close,
+        }
+    }
+
+    #[test]
+    fn supertrend_uses_wilder_rma_seed_and_update() {
+        let values = rma(&[1.0, 2.0, 3.0, 4.0], 3);
+        assert_eq!(values[0], None);
+        assert_eq!(values[1], None);
+        assert!((values[2].unwrap() - 2.0).abs() < 1e-12);
+        assert!((values[3].unwrap() - (2.0 * 2.0 + 4.0) / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn supertrend_signal_detects_closed_candle_flip_to_call() {
+        let closes = [
+            100.0, 99.0, 98.0, 97.0, 96.0, 95.0, 94.0, 93.0, 92.0, 91.0, 90.0, 91.0, 92.0, 93.0,
+            108.0,
+        ];
+        let candles: Vec<_> = closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| st_candle(index as i64, *close))
+            .collect();
+        let points = supertrend_points(&candles, 3, 1.0);
+        let signal = supertrend_signal(&points).unwrap();
+        assert_eq!(signal.side, IndexOptionSide::Call);
+        assert_eq!(signal.direction, SuperTrendDirection::Up);
+        assert_eq!(signal.signal_at, candles.last().unwrap().at);
+    }
+
+    #[test]
+    fn supertrend_selects_nearest_expiry_atm_option() {
+        let config = index_option_config("NIFTY").unwrap();
+        let contracts = vec![
+            option_master("NFO", "NIFTY", "27AUG2026", 25000.0, "CE", 75, "far"),
+            option_master("NFO", "NIFTY", "20AUG2026", 24950.0, "CE", 75, "low"),
+            option_master("NFO", "NIFTY", "20AUG2026", 25050.0, "CE", 75, "atm"),
+            option_master("NFO", "NIFTY", "20AUG2026", 25150.0, "PE", 75, "put"),
+        ];
+        let candidates = supertrend_option_candidates(
+            &contracts,
+            config,
+            NaiveDate::from_ymd_opt(2026, 8, 9).unwrap(),
+            IndexOptionSide::Call,
+        );
+        let selected = choose_atm_contract(&candidates, 25060.0).unwrap();
+        assert_eq!(selected.token, "atm");
+        assert_eq!(
+            selected.expiry,
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap()
+        );
+    }
+
     #[test]
     fn formulas_match_v3() {
         let v = calculate(&[100.0, 110.0, 105.0, 108.0], &[90.0, 92.0, 94.0, 93.0]).unwrap();
@@ -5673,6 +7864,7 @@ mod tests {
         assert!((v.sell_entry - 89.892).abs() < 1e-9);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ic(
         minute: u32,
         open: f64,
@@ -5702,31 +7894,90 @@ mod tests {
         }
     }
 
+    fn ic_at(
+        day: u32,
+        hour: u32,
+        minute: u32,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        middle: f64,
+        upper: f64,
+        lower: f64,
+        tsi: f64,
+    ) -> IndicatorCandle {
+        IndicatorCandle {
+            candle: IntradayCandle {
+                at: NaiveDate::from_ymd_opt(2026, 8, day)
+                    .unwrap()
+                    .and_hms_opt(hour, minute, 0)
+                    .unwrap(),
+                open,
+                high,
+                low,
+                close,
+            },
+            middle,
+            upper,
+            lower,
+            tsi,
+        }
+    }
+
     #[test]
-    fn option_call_signal_follows_retrace_confirmation_break() {
+    fn tsi_values_use_tradingview_percent_scale() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 24)
+            .unwrap()
+            .and_hms_opt(9, 15, 0)
+            .unwrap();
+        let candles: Vec<IntradayCandle> = (0..80)
+            .map(|index| {
+                let close = 100.0 + index as f64;
+                IntradayCandle {
+                    at: start + Duration::minutes(index),
+                    open: close - 0.5,
+                    high: close + 1.0,
+                    low: close - 1.0,
+                    close,
+                }
+            })
+            .collect();
+
+        let last = tsi_values(&candles)
+            .into_iter()
+            .flatten()
+            .last()
+            .expect("TSI should be available after warmup");
+        assert!(last <= 100.0);
+        assert!(last > 95.0);
+    }
+
+    #[test]
+    fn option_call_signal_enters_after_confirmation_high_break_when_rr_is_valid() {
         let candles = vec![
             ic(15, 100.0, 113.0, 99.0, 112.0, 100.0, 110.0, 90.0, 8.0),
             ic(20, 112.0, 113.0, 99.0, 101.0, 100.0, 110.0, 90.0, 7.0),
-            ic(25, 99.0, 106.0, 98.0, 104.0, 100.0, 110.0, 90.0, 6.0),
-            ic(30, 104.0, 106.5, 101.0, 105.0, 100.0, 110.0, 90.0, 5.0),
-            ic(35, 105.0, 108.0, 103.0, 107.0, 100.0, 110.0, 90.0, 4.0),
+            ic(25, 99.0, 106.0, 103.0, 104.0, 100.0, 115.0, 90.0, 0.4),
+            ic(30, 104.0, 106.5, 103.5, 105.0, 100.0, 115.0, 90.0, 0.4),
+            ic(35, 105.0, 108.0, 104.0, 107.0, 100.0, 115.0, 90.0, 0.6),
         ];
         let signal = option_signal(&candles, OptionSide::Call).unwrap();
         assert_eq!(signal.side, OptionSide::Call);
         assert_eq!(signal.confirmation_at, candles[2].candle.at);
         assert_eq!(signal.signal_at, candles[4].candle.at);
-        assert_eq!(signal.stop_loss, 98.0);
+        assert_eq!(signal.stop_loss, 103.0);
         assert_eq!(signal.entry_price, 107.0);
     }
 
     #[test]
-    fn option_put_signal_follows_retrace_confirmation_break() {
+    fn option_put_signal_enters_after_confirmation_low_break_when_rr_is_valid() {
         let candles = vec![
             ic(15, 100.0, 101.0, 87.0, 88.0, 100.0, 110.0, 90.0, -8.0),
             ic(20, 88.0, 101.0, 87.0, 99.0, 100.0, 110.0, 90.0, -7.0),
-            ic(25, 101.0, 102.0, 94.0, 96.0, 100.0, 110.0, 90.0, -6.0),
-            ic(30, 96.0, 99.0, 93.5, 94.5, 100.0, 110.0, 90.0, -5.0),
-            ic(35, 94.5, 95.0, 91.0, 93.0, 100.0, 110.0, 90.0, -4.0),
+            ic(25, 101.0, 102.0, 94.0, 96.0, 100.0, 110.0, 80.0, -0.4),
+            ic(30, 96.0, 97.0, 94.5, 95.0, 100.0, 110.0, 80.0, -0.4),
+            ic(35, 95.0, 96.0, 92.0, 93.0, 100.0, 110.0, 80.0, -0.6),
         ];
         let signal = option_signal(&candles, OptionSide::Put).unwrap();
         assert_eq!(signal.side, OptionSide::Put);
@@ -5734,6 +7985,95 @@ mod tests {
         assert_eq!(signal.signal_at, candles[4].candle.at);
         assert_eq!(signal.stop_loss, 102.0);
         assert_eq!(signal.entry_price, 93.0);
+    }
+
+    #[test]
+    fn option_signal_rejects_entry_near_target_when_rr_is_below_one() {
+        let candles = vec![
+            ic(15, 100.0, 113.0, 99.0, 112.0, 100.0, 110.0, 90.0, 8.0),
+            ic(20, 112.0, 113.0, 99.0, 101.0, 100.0, 110.0, 90.0, 7.0),
+            ic(25, 101.0, 106.0, 100.0, 104.0, 100.0, 110.0, 90.0, 6.0),
+            ic(30, 104.0, 109.5, 103.0, 109.0, 100.0, 110.0, 90.0, 6.0),
+        ];
+        assert!(option_signal(&candles, OptionSide::Call).is_none());
+    }
+
+    #[test]
+    fn option_signal_requires_tsi_to_clear_half_point_threshold_at_entry() {
+        let candles = vec![
+            ic(15, 100.0, 113.0, 99.0, 112.0, 100.0, 110.0, 90.0, 8.0),
+            ic(20, 112.0, 113.0, 99.0, 101.0, 100.0, 110.0, 90.0, 7.0),
+            ic(25, 99.0, 106.0, 103.0, 104.0, 100.0, 115.0, 90.0, 8.0),
+            ic(30, 104.0, 108.0, 104.0, 107.0, 100.0, 115.0, 90.0, 0.5),
+        ];
+        assert!(option_signal(&candles, OptionSide::Call).is_none());
+    }
+
+    #[test]
+    fn option_signal_does_not_carry_setup_across_trading_days() {
+        let candles = vec![
+            ic_at(
+                6, 15, 20, 100.0, 113.0, 99.0, 112.0, 100.0, 110.0, 90.0, 8.0,
+            ),
+            ic_at(
+                6, 15, 25, 112.0, 113.0, 99.0, 101.0, 100.0, 110.0, 90.0, 7.0,
+            ),
+            ic_at(
+                6, 15, 30, 99.0, 106.0, 103.0, 104.0, 100.0, 115.0, 90.0, 8.0,
+            ),
+            ic_at(
+                7, 9, 15, 104.0, 108.0, 104.0, 107.0, 100.0, 115.0, 90.0, 8.0,
+            ),
+        ];
+        assert!(option_signal(&candles, OptionSide::Call).is_none());
+    }
+
+    #[test]
+    fn option_put_entries_are_long_pe_trades() {
+        assert_eq!(OptionSide::Put.entry_role(), "SELL_ENTRY");
+        assert_eq!(OptionSide::Put.entry_side(), "BUY");
+        assert_eq!(OptionSide::Put.exit_side(), "SELL");
+    }
+
+    #[test]
+    fn option_entries_stop_before_intraday_square_off() {
+        let offset = FixedOffset::east_opt(19_800).unwrap();
+        let at = |hour, minute| {
+            offset
+                .with_ymd_and_hms(2026, 7, 24, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        assert!(!option_entry_allowed(at(9, 19)));
+        assert!(option_entry_allowed(at(9, 20)));
+        assert!(option_entry_allowed(at(15, 15)));
+        assert!(!option_entry_allowed(at(15, 20)));
+        assert!(!option_square_off_due(at(15, 19)));
+        assert!(option_square_off_due(at(15, 20)));
+    }
+
+    #[test]
+    fn option_exit_scan_ignores_pre_entry_candles_and_catches_later_exit() {
+        let offset = FixedOffset::east_opt(19_800).unwrap();
+        let entry_time = offset
+            .with_ymd_and_hms(2026, 8, 5, 9, 25, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let candles = vec![
+            ic_at(5, 9, 20, 100.0, 112.0, 98.0, 111.0, 100.0, 110.0, 90.0, 5.0),
+            ic_at(
+                5, 9, 30, 111.0, 112.0, 105.0, 106.0, 100.0, 115.0, 90.0, 5.0,
+            ),
+            ic_at(
+                5, 9, 35, 106.0, 116.0, 105.0, 115.5, 100.0, 115.0, 90.0, 5.0,
+            ),
+        ];
+
+        let exit = option_exit_since(&candles, OptionSide::Call, 99.0, Some(entry_time)).unwrap();
+
+        assert_eq!(exit.0, "TARGET");
+        assert_eq!(exit.2, candles[2].candle.at);
     }
 
     fn option_contract(token: &str, strike: f64) -> OptionContract {
@@ -5759,8 +8099,8 @@ mod tests {
         let premiums = HashMap::from([
             ("outside_low".to_string(), 219.95),
             ("inside_best".to_string(), 258.0),
-            ("inside_farther".to_string(), 292.0),
-            ("outside_high".to_string(), 300.05),
+            ("inside_farther".to_string(), 289.0),
+            ("outside_high".to_string(), 290.05),
         ]);
 
         let selected = choose_premium_contract(&candidates, &premiums, 76125.0).unwrap();
@@ -5775,7 +8115,7 @@ mod tests {
             option_contract("below", 76000.0),
             option_contract("above", 76100.0),
         ];
-        let premiums = HashMap::from([("below".to_string(), 219.0), ("above".to_string(), 301.0)]);
+        let premiums = HashMap::from([("below".to_string(), 219.0), ("above".to_string(), 291.0)]);
 
         assert!(choose_premium_contract(&candidates, &premiums, 76100.0).is_none());
     }
@@ -5975,6 +8315,18 @@ mod tests {
         assert!(within_catchup_window(9 * 60 + 10, 9 * 60 + 10));
         assert!(within_catchup_window(9 * 60 + 25, 9 * 60 + 10));
         assert!(!within_catchup_window(9 * 60 + 26, 9 * 60 + 10));
+    }
+    #[test]
+    fn deterministic_demo_margin_failures_are_terminal() {
+        assert!(is_terminal_scheduler_error(
+            "Order rejected: demo balance is insufficient for the required margin."
+        ));
+        assert!(is_terminal_scheduler_error(
+            "Order rejected: demo balance is insufficient for the required margin.; Order rejected: demo balance is insufficient for the required margin."
+        ));
+        assert!(!is_terminal_scheduler_error(
+            "Angel One API rate limit is active."
+        ));
     }
     #[test]
     fn durable_order_state_machine_blocks_terminal_regressions() {

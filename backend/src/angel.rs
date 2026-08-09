@@ -535,35 +535,6 @@ async fn secure_json(
     Ok(payload.data.unwrap_or(Value::Null))
 }
 
-pub async fn get_candles(
-    state: &AppState,
-    api_key: &str,
-    jwt_token: &str,
-    token: &str,
-    from_date: &str,
-    to_date: &str,
-) -> AppResult<Value> {
-    get_candles_with_interval(
-        state, api_key, jwt_token, token, "ONE_DAY", from_date, to_date,
-    )
-    .await
-}
-
-pub async fn get_candles_with_interval(
-    state: &AppState,
-    api_key: &str,
-    jwt_token: &str,
-    token: &str,
-    interval: &str,
-    from_date: &str,
-    to_date: &str,
-) -> AppResult<Value> {
-    get_candles_with_exchange_interval(
-        state, api_key, jwt_token, "MCX", token, interval, from_date, to_date,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn get_candles_with_exchange_interval(
     state: &AppState,

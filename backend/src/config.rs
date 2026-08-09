@@ -137,6 +137,15 @@ impl Config {
         self.app_env.eq_ignore_ascii_case("production")
     }
 
+    pub fn requires_secure_transport_headers(&self) -> bool {
+        self.is_production()
+            || self.frontend_origins.iter().all(|origin| {
+                Url::parse(origin)
+                    .ok()
+                    .is_some_and(|parsed| parsed.scheme() == "https")
+            })
+    }
+
     fn validate(&self, mut lookup: impl FnMut(&str) -> Option<String>) -> Result<()> {
         if self.otp_ttl_minutes <= 0
             || self.otp_max_attempts <= 0
@@ -388,5 +397,29 @@ mod tests {
         values.retain(|(key, _)| *key != "SMTP_PASSWORD");
         values.push(("SMTP_PASSWORD", "REPLACE_WITH_SECRET"));
         assert!(config_from(&values).is_err());
+    }
+
+    #[test]
+    fn secure_transport_headers_follow_https_frontend_origins() {
+        let mut values = production_values();
+        values.retain(|(key, _)| *key != "APP_ENV");
+        values.push(("APP_ENV", "staging"));
+        let config = config_from(&values).unwrap();
+        assert!(config.requires_secure_transport_headers());
+
+        let config = config_from(&[
+            (
+                "DATABASE_URL",
+                "postgres://rulenix:secret@localhost:5432/rulenix",
+            ),
+            ("FRONTEND_ORIGINS", "http://localhost:5173"),
+            (
+                "CREDENTIAL_ENCRYPTION_KEYS",
+                "1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+            ),
+            ("CREDENTIAL_ENCRYPTION_PRIMARY_VERSION", "1"),
+        ])
+        .unwrap();
+        assert!(!config.requires_secure_transport_headers());
     }
 }

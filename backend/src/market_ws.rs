@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use tokio::time::{Duration, Instant, interval};
 use tokio_tungstenite::{
     connect_async,
@@ -212,20 +213,33 @@ fn exchange_segment(exchange_type: u8) -> &'static str {
 }
 
 pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: String) {
-    let feed_key = format!("{}:{}", exchange.to_uppercase(), token);
+    let exchange = exchange.to_uppercase();
     {
+        let mut requested = state.strategy_feed_tokens.lock().await;
+        requested.entry(exchange.clone()).or_default().insert(token);
         let mut active = state.strategy_feeds.lock().await;
-        if !active.insert(feed_key.clone()) {
+        // One websocket per exchange serves all active contracts. Per-token
+        // sockets exceed Angel One's connection/rate limits under load.
+        if !active.insert(exchange.clone()) {
             return;
         }
     }
     tokio::spawn(async move {
         let mut attempt = 0_u32;
         loop {
-            match run_strategy_feed(&state, &exchange, &token).await {
-                Ok(()) => attempt = 0,
+            let tokens = refresh_requested_tokens(&state, &exchange).await;
+            if tokens.is_empty() {
+                break;
+            }
+            let rate_limited;
+            match run_strategy_feed(&state, &exchange, &tokens).await {
+                Ok(()) => {
+                    attempt = 0;
+                    rate_limited = false;
+                }
                 Err(error) => {
-                    tracing::warn!(%token,%error,attempt,"shared strategy market feed stopped");
+                    rate_limited = crate::angel::is_rate_limit_error(&error.to_string());
+                    tracing::warn!(exchange = %exchange, tokens = tokens.len(), %error, attempt, "shared strategy market feed stopped");
                     crate::strategy::operational_alert(
                         &state,
                         None,
@@ -240,21 +254,55 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
                     attempt = attempt.saturating_add(1);
                 }
             }
-            let needed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.exchange_segment=$1 AND s.contract_token=$2 AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.exchange_segment=$1 AND s.contract_token=$2)")
-                .bind(&exchange).bind(&token)
-                .fetch_one(&state.db).await.unwrap_or(false);
-            if !needed {
+            if refresh_requested_tokens(&state, &exchange).await.is_empty() {
                 break;
             }
-            let ceiling = (1_u64 << attempt.min(6)).min(60);
+            let ceiling = if rate_limited {
+                60
+            } else {
+                (1_u64 << attempt.min(6)).min(90)
+            };
             let jitter = rand::thread_rng().gen_range(0..=ceiling * 250);
             tokio::time::sleep(Duration::from_millis(ceiling * 1000 + jitter)).await;
         }
-        state.strategy_feeds.lock().await.remove(&feed_key);
+        let mut requested = state.strategy_feed_tokens.lock().await;
+        if requested.get(&exchange).is_none_or(HashSet::is_empty) {
+            requested.remove(&exchange);
+            state.strategy_feeds.lock().await.remove(&exchange);
+        }
     });
 }
 
-async fn run_strategy_feed(state: &AppState, exchange: &str, token: &str) -> anyhow::Result<()> {
+async fn refresh_requested_tokens(state: &AppState, exchange: &str) -> HashSet<String> {
+    let query = sqlx::query_scalar::<_, String>("SELECT DISTINCT s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.exchange_segment=$1 AND s.contract_token IS NOT NULL AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') UNION SELECT DISTINCT s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.exchange_segment=$1 AND s.contract_token IS NOT NULL")
+        .bind(exchange)
+        .fetch_all(&state.db)
+        .await;
+    let mut requested = state.strategy_feed_tokens.lock().await;
+    let entry = requested.entry(exchange.to_owned()).or_default();
+    if let Ok(tokens) = query {
+        *entry = tokens.into_iter().collect();
+    }
+    entry.clone()
+}
+
+fn subscribe_message(exchange_type: u8, tokens: &HashSet<String>) -> AngelMessage {
+    AngelMessage::Text(
+        json!({
+            "correlationID": uuid::Uuid::new_v4().simple().to_string()[..10].to_string(),
+            "action": 1,
+            "params": {"mode": 1, "tokenList": [{"exchangeType": exchange_type, "tokens": tokens.iter().collect::<Vec<_>>()}]}
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+async fn run_strategy_feed(
+    state: &AppState,
+    exchange: &str,
+    tokens: &HashSet<String>,
+) -> anyhow::Result<()> {
     let exchange_type = exchange_type(exchange)
         .ok_or_else(|| anyhow::anyhow!("unsupported Angel One exchange segment {exchange}"))?;
     let profile: BrokerageProfile = sqlx::query_as(
@@ -272,29 +320,33 @@ async fn run_strategy_feed(state: &AppState, exchange: &str, token: &str) -> any
     headers.insert("x-feed-token", credentials.feed_token.parse()?);
     let (socket, _) = connect_async(request).await?;
     let (mut sender, mut receiver) = socket.split();
+    let mut subscribed = tokens.clone();
     sender
-        .send(AngelMessage::Text(
-            json!({
-                "correlationID":uuid::Uuid::new_v4().simple().to_string()[..10].to_string(),
-                "action":1,
-                "params":{"mode":1,"tokenList":[{"exchangeType":exchange_type,"tokens":[token]}]}
-            })
-            .to_string()
-            .into(),
-        ))
+        .send(subscribe_message(exchange_type, &subscribed))
         .await?;
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut freshness = interval(Duration::from_secs(5));
+    let mut subscriptions = interval(Duration::from_secs(5));
     let mut last_tick = Instant::now();
     loop {
         tokio::select! {
             _=heartbeat.tick()=>sender.send(AngelMessage::Text("ping".into())).await?,
             _=freshness.tick(), if last_tick.elapsed()>Duration::from_secs(30)=>anyhow::bail!("shared Angel One feed is stale (no tick for 30 seconds)"),
+            _=subscriptions.tick()=> {
+                let desired = refresh_requested_tokens(state, exchange).await;
+                if desired.is_empty() { return Ok(()); }
+                let added: HashSet<String> = desired.difference(&subscribed).cloned().collect();
+                if !added.is_empty() {
+                    sender.send(subscribe_message(exchange_type, &added)).await?;
+                    subscribed.extend(added);
+                }
+            },
             incoming=receiver.next()=>match incoming {
                 Some(Ok(AngelMessage::Binary(data)))=>if let Some(tick)=parse_tick(&data)
-                    && tick["token"].as_str()==Some(token)
                     && tick["exchange_type"].as_u64()==Some(u64::from(exchange_type))
+                    && tick["token"].as_str().is_some_and(|token| subscribed.contains(token))
                     && let Some(ltp)=tick["last_traded_price"].as_f64() {
+                    let token = tick["token"].as_str().unwrap_or_default();
                     last_tick=Instant::now();
                     crate::strategy::process_tick_shared(state,exchange,token,ltp).await?;
                 },
@@ -321,5 +373,26 @@ mod tests {
         let value = parse_tick(&data).unwrap();
         assert_eq!(value["token"], "12345");
         assert_eq!(value["last_traded_price"], 123.45);
+    }
+
+    #[test]
+    fn shared_subscription_contains_all_tokens() {
+        let tokens = ["100", "200"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let AngelMessage::Text(text) = subscribe_message(5, &tokens) else {
+            panic!("expected a text subscription message");
+        };
+        let payload: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+        assert_eq!(payload["action"], 1);
+        assert_eq!(payload["params"]["tokenList"][0]["exchangeType"], 5);
+        assert_eq!(
+            payload["params"]["tokenList"][0]["tokens"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

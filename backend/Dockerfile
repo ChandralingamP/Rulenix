@@ -10,7 +10,9 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin rulenix
+    && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin rulenix \
+    && mkdir -p /var/log/rulenix \
+    && chown -R rulenix:rulenix /var/log/rulenix
 WORKDIR /app
 COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/target/release/rulenix-backend /usr/local/bin/rulenix-backend
