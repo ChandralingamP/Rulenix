@@ -5971,6 +5971,10 @@ fn runtime_pnl_units(instrument: &str, quantity: i32, lot_size: Option<i32>) -> 
     futures_pnl_units(instrument, quantity, lot_size)
 }
 
+fn supertrend_protection_session_key(entry_session_key: &str) -> String {
+    format!("{}:p", entry_session_key)
+}
+
 fn required_exit_level(value: Option<f64>, label: &str) -> AppResult<f64> {
     value
         .filter(|level| level.is_finite() && *level > 0.0)
@@ -6832,7 +6836,7 @@ async fn complete_option_entry_order(
             underlying,
         )
         .await?;
-        let protection_session = format!("{}:protect", order.session_key);
+        let protection_session = supertrend_protection_session_key(&order.session_key);
         place_strategy_order(
             state,
             &runner,
@@ -8123,6 +8127,13 @@ mod tests {
         assert_eq!(IndexOptionSide::Put.entry_side(), "BUY");
         assert_eq!(IndexOptionSide::Call.exit_side(), "SELL");
         assert_eq!(IndexOptionSide::Put.exit_side(), "SELL");
+    }
+
+    #[test]
+    fn supertrend_protection_session_key_fits_order_column() {
+        let key = supertrend_protection_session_key("st-SENSEX-20260810-0935-PE");
+        assert_eq!(key, "st-SENSEX-20260810-0935-PE:p");
+        assert!(key.len() <= 32);
     }
 
     #[test]
