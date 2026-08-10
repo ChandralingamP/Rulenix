@@ -54,8 +54,8 @@ const KELTNER_MULTIPLIER: f64 = 2.0;
 const TSI_LONG_PERIOD: usize = 25;
 const TSI_SHORT_PERIOD: usize = 13;
 const OPTION_TSI_ENTRY_THRESHOLD: f64 = 0.5;
-const SUPERTREND_ATR_PERIOD: usize = 10;
-const SUPERTREND_FACTOR: f64 = 3.0;
+const SUPERTREND_ATR_PERIOD: usize = 7;
+const SUPERTREND_FACTOR: f64 = 2.0;
 const SUPERTREND_SENSEX_DEFAULT_TARGET_POINTS: f64 = 40.0;
 const SUPERTREND_SENSEX_DEFAULT_STOP_POINTS: f64 = 25.0;
 const SUPERTREND_NIFTY_DEFAULT_TARGET_POINTS: f64 = 25.0;
@@ -149,10 +149,7 @@ impl IndexOptionSide {
     }
 
     fn entry_role(self) -> &'static str {
-        match self {
-            Self::Call => "BUY_ENTRY",
-            Self::Put => "SELL_ENTRY",
-        }
+        "BUY_ENTRY"
     }
 
     fn entry_side(self) -> &'static str {
@@ -161,6 +158,13 @@ impl IndexOptionSide {
 
     fn exit_side(self) -> &'static str {
         "SELL"
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Call => Self::Put,
+            Self::Put => Self::Call,
+        }
     }
 }
 
@@ -3459,20 +3463,228 @@ async fn supertrend_runners(
     .await?)
 }
 
-async fn user_has_supertrend_exposure(
+async fn user_has_supertrend_side_exposure(
     state: &AppState,
     user_id: Uuid,
     underlying: &str,
+    side: IndexOptionSide,
 ) -> AppResult<bool> {
-    let call = format!("{underlying}_CE");
-    let put = format!("{underlying}_PE");
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label IN ($3,$4) AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND s.strategy_key=$2 AND s.instrument IN ($3,$4) AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+    let instrument = format!("{}_{}", underlying, side.option_type());
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND s.strategy_key=$2 AND s.instrument=$3 AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
         .bind(user_id)
         .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
-        .bind(call)
-        .bind(put)
+        .bind(instrument)
         .fetch_one(&state.db)
         .await?)
+}
+
+async fn cancel_supertrend_active_entries_for_side(
+    state: &AppState,
+    user_id: Uuid,
+    underlying: &str,
+    side: IndexOptionSide,
+    reason: &str,
+) -> AppResult<()> {
+    let instrument = format!("{}_{}", underlying, side.option_type());
+    let orders: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT o.id,o.broker_order_id,o.execution_mode,o.order_type,o.status
+         FROM strategy_orders o
+         JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+         WHERE o.user_id=$1
+           AND s.strategy_key=$2
+           AND s.instrument=$3
+           AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+           AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')",
+    )
+    .bind(user_id)
+    .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+    .bind(&instrument)
+    .fetch_all(&state.db)
+    .await?;
+    if orders.is_empty() {
+        return Ok(());
+    }
+
+    let credentials = if orders.iter().any(|(_, _, mode, _, status)| {
+        mode == "live" && matches!(status.as_str(), "submitted" | "partially_filled")
+    }) {
+        Some(state.credentials.load(user_id).await?)
+    } else {
+        None
+    };
+    let mut errors = Vec::new();
+    for (id, broker_id, mode, order_type, status) in orders {
+        if status == "pending" || mode == "demo" {
+            sqlx::query("UPDATE strategy_orders SET status='cancelled',broker_status=$2,state_version=state_version+1,updated_at=NOW() WHERE id=$1 AND status IN ('pending','submitted','partially_filled')")
+                .bind(id)
+                .bind(reason)
+                .execute(&state.db)
+                .await?;
+            continue;
+        }
+        if mode == "live" && matches!(status.as_str(), "submitted" | "partially_filled") {
+            let Some(credentials) = credentials.as_ref() else {
+                errors.push(format!("{id}: live broker credentials are unavailable"));
+                continue;
+            };
+            if broker_id.is_empty() {
+                errors.push(format!("{id}: live entry order has no broker order id"));
+                continue;
+            }
+            let variety = if order_type.starts_with("STOPLOSS") {
+                "STOPLOSS"
+            } else {
+                "NORMAL"
+            };
+            match angel::cancel_order(
+                state,
+                &credentials.api_key,
+                &credentials.jwt_token,
+                &broker_id,
+                variety,
+            )
+            .await
+            {
+                Ok(()) => {
+                    sqlx::query("UPDATE strategy_orders SET status='cancelling',broker_status=$2,state_version=state_version+1,updated_at=NOW() WHERE id=$1 AND status IN ('submitted','partially_filled')")
+                        .bind(id)
+                        .bind(reason)
+                        .execute(&state.db)
+                        .await?;
+                }
+                Err(error) => errors.push(format!("{id}: {error}")),
+            }
+            continue;
+        }
+        errors.push(format!("{id}: entry order is already {status}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(errors.join("; ")))
+    }
+}
+
+async fn close_supertrend_open_trades_for_side(
+    state: &AppState,
+    runner: &SuperTrendRunner,
+    config: IndexOptionConfig,
+    side: IndexOptionSide,
+    now: DateTime<FixedOffset>,
+    reason: &str,
+) -> AppResult<()> {
+    let instrument = config.option_instrument(side);
+    let trades: Vec<(Uuid, String, i32, i32, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id,instrument_label,quantity,remaining_lots,strategy_snapshot_id
+         FROM trades
+         WHERE user_id=$1
+           AND strategy_key=$2
+           AND instrument_label=$3
+           AND status='open'
+           AND remaining_lots>0
+           AND strategy_snapshot_id IS NOT NULL",
+    )
+    .bind(runner.user_id)
+    .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+    .bind(&instrument)
+    .fetch_all(&state.db)
+    .await?;
+    if trades.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    let base_runner = Runner::from(runner.clone());
+    for (trade_id, instrument, quantity, remaining_lots, snapshot_id) in trades {
+        let Some(snapshot_id) = snapshot_id else {
+            continue;
+        };
+        let active_exit_order_types = active_option_exit_order_types(state, trade_id).await?;
+        if active_exit_order_types
+            .iter()
+            .any(|order_type| order_type == "MARKET")
+        {
+            continue;
+        }
+        if !active_exit_order_types.is_empty() {
+            if let Err(error) = cancel_active_exits(state, runner.user_id, trade_id).await {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+            if !active_option_exit_order_types(state, trade_id)
+                .await?
+                .is_empty()
+            {
+                errors.push(format!(
+                    "{instrument} {trade_id}: active protective exit is still pending cancellation"
+                ));
+                continue;
+            }
+        }
+        let query = format!("{} WHERE id=$1", snapshot_select());
+        let snapshot: Snapshot = match sqlx::query_as(&query)
+            .bind(snapshot_id)
+            .fetch_one(&state.db)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
+        let price = match option_execution_ltp(state, &snapshot).await {
+            Ok(price) => price,
+            Err(error) => {
+                errors.push(format!("{instrument} {trade_id}: {error}"));
+                continue;
+            }
+        };
+        let session = format!(
+            "strev-{}-{}-{}-{}",
+            config.instrument,
+            now.format("%Y%m%d"),
+            now.format("%H%M"),
+            side.option_type()
+        );
+        if let Err(error) = place_strategy_order(
+            state,
+            &base_runner,
+            &snapshot,
+            &session,
+            NewOrder {
+                role: "SL1",
+                side: side.exit_side(),
+                order_type: "MARKET",
+                lots: remaining_lots.max(1),
+                price,
+                trigger: None,
+                trade_id: Some(trade_id),
+                quantity: Some(quantity.max(1)),
+            },
+        )
+        .await
+        {
+            errors.push(format!("{instrument} {trade_id}: {error}"));
+        } else {
+            emit_for(
+                state,
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                Some(runner.user_id),
+                config.instrument,
+                "supertrend_reversal_square_off",
+                json!({"trade_id":trade_id,"square_off_at":now,"closed_side":side.option_type(),"option_execution_price":price,"reason":reason}),
+            )
+            .await;
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(errors.join("; ")))
+    }
 }
 
 async fn user_has_any_option_exposure(state: &AppState, user_id: Uuid) -> AppResult<bool> {
@@ -3488,6 +3700,22 @@ async fn has_any_active_option_exit(state: &AppState, trade_id: Uuid) -> AppResu
         .bind(trade_id)
         .fetch_one(&state.db)
         .await?)
+}
+
+async fn active_option_exit_order_types(
+    state: &AppState,
+    trade_id: Uuid,
+) -> AppResult<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT order_type
+         FROM strategy_orders
+         WHERE trade_id=$1
+           AND role IN ('TARGET','SL1','SL2')
+           AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')",
+    )
+    .bind(trade_id)
+    .fetch_all(&state.db)
+    .await?)
 }
 
 async fn update_option_snapshot_levels(
@@ -3916,6 +4144,7 @@ async fn place_supertrend_entries_for_signal(
     config: IndexOptionConfig,
     runners: &[SuperTrendRunner],
     signal: SuperTrendSignal,
+    now: DateTime<FixedOffset>,
 ) -> AppResult<()> {
     let mut errors = Vec::new();
     for runner in runners {
@@ -3926,7 +4155,35 @@ async fn place_supertrend_entries_for_signal(
             ));
             continue;
         }
-        if user_has_supertrend_exposure(state, runner.user_id, config.instrument).await? {
+        if user_has_supertrend_side_exposure(state, runner.user_id, config.instrument, signal.side)
+            .await?
+        {
+            continue;
+        }
+        let opposite = signal.side.opposite();
+        if let Err(error) = cancel_supertrend_active_entries_for_side(
+            state,
+            runner.user_id,
+            config.instrument,
+            opposite,
+            "SuperTrend reversal confirmed; cancelling stale opposite entry.",
+        )
+        .await
+        {
+            errors.push(format!("{}: {error}", runner.username));
+            continue;
+        }
+        if let Err(error) = close_supertrend_open_trades_for_side(
+            state,
+            runner,
+            config,
+            opposite,
+            now,
+            "SuperTrend reversal confirmed.",
+        )
+        .await
+        {
+            errors.push(format!("{}: {error}", runner.username));
             continue;
         }
         let (snapshot, execution_price, underlying_ltp) =
@@ -4036,16 +4293,7 @@ async fn process_supertrend_instrument(
     {
         return Ok(());
     }
-    let mut eligible = Vec::new();
-    for runner in runners {
-        if !user_has_supertrend_exposure(state, runner.user_id, config.instrument).await? {
-            eligible.push(runner);
-        }
-    }
-    if eligible.is_empty() {
-        return Ok(());
-    }
-    place_supertrend_entries_for_signal(state, config, &eligible, signal).await
+    place_supertrend_entries_for_signal(state, config, &runners, signal, now).await
 }
 
 async fn process_supertrend_square_off(
@@ -4064,12 +4312,22 @@ async fn process_supertrend_square_off(
         let Some(underlying) = supertrend_snapshot_underlying(&instrument) else {
             continue;
         };
-        if has_any_active_option_exit(state, trade_id).await? {
+        let active_exit_order_types = active_option_exit_order_types(state, trade_id).await?;
+        if active_exit_order_types
+            .iter()
+            .any(|order_type| order_type == "MARKET")
+        {
+            continue;
+        }
+        if !active_exit_order_types.is_empty() {
             if let Err(error) = cancel_active_exits(state, user_id, trade_id).await {
                 errors.push(format!("{instrument} {trade_id}: {error}"));
                 continue;
             }
-            if has_any_active_option_exit(state, trade_id).await? {
+            if !active_option_exit_order_types(state, trade_id)
+                .await?
+                .is_empty()
+            {
                 continue;
             }
         }
@@ -7853,6 +8111,18 @@ mod tests {
             selected.expiry,
             NaiveDate::from_ymd_opt(2026, 8, 20).unwrap()
         );
+    }
+
+    #[test]
+    fn supertrend_defaults_and_entries_are_long_options_only() {
+        assert_eq!(SUPERTREND_ATR_PERIOD, 7);
+        assert!((SUPERTREND_FACTOR - 2.0).abs() < f64::EPSILON);
+        assert_eq!(IndexOptionSide::Call.entry_role(), "BUY_ENTRY");
+        assert_eq!(IndexOptionSide::Put.entry_role(), "BUY_ENTRY");
+        assert_eq!(IndexOptionSide::Call.entry_side(), "BUY");
+        assert_eq!(IndexOptionSide::Put.entry_side(), "BUY");
+        assert_eq!(IndexOptionSide::Call.exit_side(), "SELL");
+        assert_eq!(IndexOptionSide::Put.exit_side(), "SELL");
     }
 
     #[test]

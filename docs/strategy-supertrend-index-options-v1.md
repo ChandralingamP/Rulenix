@@ -22,8 +22,8 @@ calculate SuperTrend on option premium candles.
 Defaults:
 
 - Interval: `FIVE_MINUTE`
-- SuperTrend ATR period: `10`
-- SuperTrend multiplier/factor: `3.0`
+- SuperTrend ATR period: `7`
+- SuperTrend multiplier/factor: `2.0`
 
 The runtime only acts after a completed 5-minute candle. It does not use
 intrabar flips.
@@ -32,6 +32,11 @@ Entry rules:
 
 - SuperTrend flips from downtrend to uptrend: buy ATM CE.
 - SuperTrend flips from uptrend to downtrend: buy ATM PE.
+- If the opposite SuperTrend option trade is still open, cancel its active
+  protective exits, close it with a MARKET SELL square-off, then place the new
+  ATM option BUY entry.
+- Entries are long options only. The strategy never opens short option
+  positions; SELL orders are used only to close existing long CE/PE trades.
 
 ## Contract selection
 
@@ -77,11 +82,11 @@ remaining active exit order.
 
 ## Trading window
 
-Entries run from 09:20 IST until before 15:20 IST.
+Entries and reversals run from 09:20 IST until before 15:20 IST.
 
 At/after 15:20 IST, the strategy attempts intraday square-off for open
 positions. Active protective orders are cancelled before square-off when
-possible.
+possible. No new SuperTrend entries are submitted at or after 15:20 IST.
 
 ## Backtesting
 
