@@ -9,7 +9,7 @@ use argon2::{
 };
 use axum::{
     Json,
-    extract::{ConnectInfo, Extension, Request, State},
+    extract::{ConnectInfo, Extension, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -18,14 +18,14 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, FixedOffset, NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     transport::smtp::authentication::Credentials,
 };
 use rand::{Rng, RngCore, rngs::OsRng as TokenRng};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -90,6 +90,23 @@ pub struct AdminMutation {
     pub can_live_trade: Option<bool>,
     pub can_backtest: Option<bool>,
     pub can_backtest_on_trading_days: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DailyTradeQuery {
+    pub date: Option<NaiveDate>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DailyUserTrades {
+    pub user_id: Uuid,
+    pub username: String,
+    pub total_trades: i64,
+    pub demo_trades: i64,
+    pub live_trades: i64,
+    pub open_trades: i64,
+    pub closed_trades: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -905,6 +922,34 @@ pub async fn list_users(
     Ok(Json(users))
 }
 
+pub async fn daily_trade_report(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+    Query(query): Query<DailyTradeQuery>,
+) -> AppResult<Json<Value>> {
+    require_admin_permission(&admin)?;
+    let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60)
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("invalid IST offset")))?;
+    let date = query.date.unwrap_or_else(|| Utc::now().with_timezone(&ist).date_naive());
+    let users: Vec<DailyUserTrades> = sqlx::query_as(
+        "SELECT u.id AS user_id,u.username,COUNT(t.id)::bigint AS total_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='demo')::bigint AS demo_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='live')::bigint AS live_trades,COUNT(t.id) FILTER (WHERE t.status='open')::bigint AS open_trades,COUNT(t.id) FILTER (WHERE t.status='closed')::bigint AS closed_trades FROM users u LEFT JOIN trades t ON t.user_id=u.id AND (t.entry_datetime AT TIME ZONE 'Asia/Kolkata')::date=$1 GROUP BY u.id,u.username ORDER BY COUNT(t.id) DESC,u.username",
+    )
+    .bind(date)
+    .fetch_all(&state.db)
+    .await?;
+    let total_trades: i64 = users.iter().map(|user| user.total_trades).sum();
+    let demo_trades: i64 = users.iter().map(|user| user.demo_trades).sum();
+    let live_trades: i64 = users.iter().map(|user| user.live_trades).sum();
+    Ok(Json(json!({
+        "date":date,
+        "timezone":"Asia/Kolkata",
+        "total_trades":total_trades,
+        "demo_trades":demo_trades,
+        "live_trades":live_trades,
+        "users":users
+    })))
+}
+
 pub async fn update_user(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthUser>,
@@ -1063,6 +1108,66 @@ pub async fn delete_user(
         tracing::warn!(%error, "could not write admin delete audit event");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn clear_user_trade_logs(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+    headers: HeaderMap,
+    context: Option<Extension<crate::security::RequestContext>>,
+    Json(input): Json<AdminMutation>,
+) -> AppResult<Json<Value>> {
+    require_admin_permission(&admin)?;
+    let mut tx = state.db.begin().await?;
+    let target: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id,username FROM users WHERE LOWER(username)=LOWER($1)")
+            .bind(&input.username)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (target_id, username) =
+        target.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+        .bind(target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if execution_in_flight {
+        return Err(AppError::BadRequest(
+            "Trade logs cannot be cleared while this account has an open position or active broker order.".into(),
+        ));
+    }
+    let deleted = sqlx::query("DELETE FROM trades WHERE user_id=$1")
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+
+    let request_context = crate::audit::optional_context(context);
+    if let Err(error) = crate::audit::record(
+        &state,
+        crate::audit::AuditEvent {
+            context: request_context.as_ref(),
+            headers: Some(&headers),
+            event_type: "admin_user_trade_logs_cleared",
+            actor_user_id: Some(admin.id),
+            target_user_id: Some(target_id),
+            summary: "Administrator cleared a user's trade logs",
+            metadata: json!({"username":username,"deleted_trades":deleted}),
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not write trade-log clearing audit event");
+    }
+    Ok(Json(json!({
+        "detail":"Trade logs cleared successfully.",
+        "username":username,
+        "deleted_trades":deleted
+    })))
 }
 
 #[cfg(test)]

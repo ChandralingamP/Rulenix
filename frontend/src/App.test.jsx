@@ -219,6 +219,7 @@ describe("App", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "User control" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Daily trades" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Risk limits" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "System jobs" })).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Strategies" })).not.toBeInTheDocument();

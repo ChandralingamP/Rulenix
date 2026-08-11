@@ -29,6 +29,9 @@ export default function AdminUsersPage() {
   const [savingUser, setSavingUser] = useState("");
   const [deletingUser, setDeletingUser] = useState("");
   const [pendingDelete, setPendingDelete] = useState(null);
+  const [clearingLogsUser, setClearingLogsUser] = useState("");
+  const [pendingClearLogs, setPendingClearLogs] = useState(null);
+  const [notice, setNotice] = useState("");
   const adminUsername = session?.username || "";
 
   const loadUsers = useCallback(async () => {
@@ -126,6 +129,26 @@ export default function AdminUsersPage() {
     }
   }, [loadUsers, pendingDelete]);
 
+  const confirmClearLogs = useCallback(async () => {
+    if (!pendingClearLogs) return;
+    const username = pendingClearLogs.username;
+    setClearingLogsUser(username);
+    setError("");
+    setNotice("");
+    try {
+      const response = await apiClient.delete("/auth/admin/users/trade-logs/", {
+        data: { username },
+      });
+      const deleted = response.data?.deleted_trades ?? 0;
+      setNotice(`Cleared ${deleted} trade ${deleted === 1 ? "record" : "records"} for ${username}.`);
+      setPendingClearLogs(null);
+    } catch (requestError) {
+      setError(requestError.response?.data?.detail || "Unable to clear trade logs.");
+    } finally {
+      setClearingLogsUser("");
+    }
+  }, [pendingClearLogs]);
+
   return (
     <div className="space-y-6">
       <header className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
@@ -166,6 +189,11 @@ export default function AdminUsersPage() {
           {error}
         </div>
       ) : null}
+      {notice ? (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
+          {notice}
+        </div>
+      ) : null}
 
       <section className="overflow-hidden rounded-xl border border-slate-800 bg-slate-900/70 shadow-lg shadow-black/20">
         <div className="flex flex-col justify-between gap-3 border-b border-slate-800 px-5 py-4 sm:flex-row sm:items-center">
@@ -203,7 +231,7 @@ export default function AdminUsersPage() {
                 {filteredUsers.length === 0 ? (
                   <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No matching users.</td></tr>
                 ) : filteredUsers.map((user) => {
-                  const busy = savingUser === user.username || deletingUser === user.username;
+                  const busy = savingUser === user.username || deletingUser === user.username || clearingLogsUser === user.username;
                   const isSelf = adminUsername.toLowerCase() === user.username.toLowerCase();
                   return (
                     <tr key={user.id ?? user.username} className="align-top">
@@ -262,6 +290,9 @@ export default function AdminUsersPage() {
                           <button type="button" disabled={busy} onClick={() => updatePermission(user.username, "can_backtest", !user.can_backtest)} className="rounded-lg border border-sky-500/40 px-3 py-2 text-xs font-semibold text-sky-200 disabled:border-slate-700 disabled:text-slate-600">
                             {user.can_backtest ? "Revoke backtest" : "Grant backtest"}
                           </button>
+                          <button type="button" disabled={busy} onClick={() => setPendingClearLogs({ username: user.username })} className="rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-200 disabled:border-slate-700 disabled:text-slate-600">
+                            {clearingLogsUser === user.username ? "Clearing..." : "Clear trade logs"}
+                          </button>
                           <button type="button" disabled={busy || isSelf} onClick={() => setPendingDelete({ username: user.username })} className="rounded-lg bg-rose-500/80 px-3 py-2 text-xs font-semibold text-white disabled:bg-slate-700">
                             {deletingUser === user.username ? "Deleting..." : "Delete"}
                           </button>
@@ -284,6 +315,19 @@ export default function AdminUsersPage() {
             <div className="mt-6 flex justify-end gap-3">
               <button type="button" disabled={Boolean(deletingUser)} onClick={() => setPendingDelete(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
               <button type="button" disabled={Boolean(deletingUser)} onClick={confirmDelete} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{deletingUser ? "Deleting..." : "Delete user"}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingClearLogs ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
+          <div role="dialog" aria-modal="true" aria-labelledby="clear-trade-logs-title" className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+            <h2 id="clear-trade-logs-title" className="text-lg font-semibold text-white">Clear trade logs for {pendingClearLogs.username}?</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently removes this user&apos;s complete P&amp;L trade history. Open positions and active broker orders must be resolved first. This action cannot be undone.</p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button type="button" disabled={Boolean(clearingLogsUser)} onClick={() => setPendingClearLogs(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
+              <button type="button" disabled={Boolean(clearingLogsUser)} onClick={confirmClearLogs} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{clearingLogsUser ? "Clearing..." : "Clear trade logs"}</button>
             </div>
           </div>
         </div>

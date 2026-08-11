@@ -21,6 +21,7 @@ const baseNavItems = [
 
 const adminNavItems = [
   { label: "User control", to: "/admin/users" },
+  { label: "Daily trades", to: "/admin/trades" },
   { label: "Risk limits", to: "/admin/limits" },
   { label: "System jobs", to: "/admin/jobs" },
 ];
