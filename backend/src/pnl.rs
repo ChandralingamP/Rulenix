@@ -33,6 +33,10 @@ pub struct TradeRow {
     pub quantity: i32,
     pub entry_price: Option<f64>,
     pub exit_price: Option<f64>,
+    pub exit_reason: String,
+    pub tp1_exit_price: Option<f64>,
+    pub tp1_exit_datetime: Option<DateTime<Utc>>,
+    pub tp1_exit_quantity: i32,
     pub last_price: Option<f64>,
     pub pnl: f64,
     pub pnl_realtime: f64,
@@ -62,6 +66,10 @@ const TRADE_ROWS_SQL: &str = r#"
         quantity,
         entry_price::float8 AS entry_price,
         exit_price::float8 AS exit_price,
+        exit_reason,
+        tp1_exit_price::float8 AS tp1_exit_price,
+        tp1_exit_datetime,
+        tp1_exit_quantity,
         last_price::float8 AS last_price,
         pnl::float8 AS pnl,
         CASE
@@ -199,6 +207,10 @@ pub async fn export(
         "Quantity",
         "Entry @",
         "Exit @",
+        "Exit Reason",
+        "TP1 Exit @",
+        "TP1 Exit Date",
+        "TP1 Quantity",
         "P/L",
         "Notes",
     ]
@@ -260,10 +272,31 @@ pub async fn export(
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
         sheet
-            .write_number(row, 10, trade.pnl_realtime)
+            .write_string(row, 10, &trade.exit_reason)
+            .map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(v) = trade.tp1_exit_price {
+            sheet
+                .write_number(row, 11, v)
+                .map_err(|e| AppError::Internal(e.into()))?;
+        }
+        sheet
+            .write_string(
+                row,
+                12,
+                trade
+                    .tp1_exit_datetime
+                    .map(|v| v.to_rfc3339())
+                    .unwrap_or_default(),
+            )
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 11, &trade.notes)
+            .write_number(row, 13, trade.tp1_exit_quantity as f64)
+            .map_err(|e| AppError::Internal(e.into()))?;
+        sheet
+            .write_number(row, 14, trade.pnl_realtime)
+            .map_err(|e| AppError::Internal(e.into()))?;
+        sheet
+            .write_string(row, 15, &trade.notes)
             .map_err(|e| AppError::Internal(e.into()))?;
     }
     let bytes = workbook

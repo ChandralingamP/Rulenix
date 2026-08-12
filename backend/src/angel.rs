@@ -769,6 +769,13 @@ fn is_expiry_error(message: &str, code: Option<&str>) -> bool {
     .any(|phrase| value.contains(phrase))
 }
 
+pub fn is_authentication_error(message: &str) -> bool {
+    let value = message.to_ascii_lowercase();
+    is_expiry_error(message, None)
+        || value.contains("token missing")
+        || value.contains("authentication")
+}
+
 pub fn is_invalid_api_key_error(message: &str) -> bool {
     if is_rate_limit_error(message) {
         return false;
@@ -992,6 +999,13 @@ mod tests {
             "Access denied because of exceeding access rate"
         ));
         assert!(!is_invalid_api_key_error("Service temporarily unavailable"));
+    }
+
+    #[test]
+    fn authentication_errors_include_missing_token_responses() {
+        assert!(is_authentication_error("Token missing (AG8003)"));
+        assert!(is_authentication_error("JWT expired"));
+        assert!(!is_authentication_error("Too many requests"));
     }
 
     #[test]

@@ -1107,6 +1107,7 @@ fn refresh_position_levels(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn process_exit(
     mut current: Position,
     candle: &Candle,

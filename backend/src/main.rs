@@ -238,10 +238,7 @@ async fn main() -> Result<()> {
             "/auth/admin/users/trade-logs/",
             axum::routing::delete(auth::clear_user_trade_logs),
         )
-        .route(
-            "/auth/admin/trades/daily/",
-            get(auth::daily_trade_report),
-        )
+        .route("/auth/admin/trades/daily/", get(auth::daily_trade_report))
         .route("/home/status/", get(home::status))
         .route("/home/connect/", post(home::connect))
         .route("/home/profile/", patch(home::update_profile))

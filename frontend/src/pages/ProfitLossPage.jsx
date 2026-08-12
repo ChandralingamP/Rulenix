@@ -112,6 +112,20 @@ export default function ProfitLossPage() {
     return numeric.toFixed(2);
   };
 
+  const formatExitReason = (value, status) => {
+    if (status === "open") return "Open";
+    return {
+      SL1: "SL1 hit",
+      SL2: "SL2 hit",
+      SL: "SL hit",
+      TP1: "TP1 hit",
+      TP: "TP hit",
+      MARKET_CLOSED: "Market closed (3:20 PM)",
+      SIGNAL_REVERSAL: "Signal reversal",
+      SAR_REVERSAL: "Stop-and-reverse",
+    }[value] || value || "Closed";
+  };
+
   const modeOptions = [
     { value: "all", label: "All" },
     { value: "demo", label: "Demo" },
@@ -206,6 +220,8 @@ export default function ProfitLossPage() {
               <th className="whitespace-nowrap px-4 py-3">Entry @</th>
               <th className="whitespace-nowrap px-4 py-3">Current @</th>
               <th className="whitespace-nowrap px-4 py-3">Exit @</th>
+              <th className="whitespace-nowrap px-4 py-3">Exit reason</th>
+              <th className="whitespace-nowrap px-4 py-3">TP1 details</th>
               <th className="whitespace-nowrap px-4 py-3">P/L</th>
             </tr>
           </thead>
@@ -213,7 +229,7 @@ export default function ProfitLossPage() {
             {status === "loading" ? (
               <tr>
                 <td
-                  colSpan={11}
+                  colSpan={13}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   Loading trades...
@@ -222,7 +238,7 @@ export default function ProfitLossPage() {
             ) : entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={11}
+                  colSpan={13}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   No trade history available.
@@ -274,6 +290,11 @@ export default function ProfitLossPage() {
                 const exitPrice = formatPrice(
                   trade.exit_price ?? trade.sell_price
                 );
+                const exitReason = formatExitReason(trade.exit_reason, trade.status);
+                const tp1Price = formatPrice(trade.tp1_exit_price);
+                const tp1Details = trade.tp1_exit_price == null
+                  ? "—"
+                  : `${tp1Price} · Qty ${Number(trade.tp1_exit_quantity || 0).toLocaleString("en-IN")} · ${formatDateTime(trade.tp1_exit_datetime)}`;
 
                 return (
                   <tr key={trade.id ?? serial} className="text-center">
@@ -305,6 +326,8 @@ export default function ProfitLossPage() {
                       {currentPrice}
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">{exitPrice}</td>
+                    <td className="whitespace-nowrap px-4 py-3">{exitReason}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-amber-200">{tp1Details}</td>
                     <td
                       className={`whitespace-nowrap px-4 py-3 text-center font-semibold ${
                         profitValue < 0 ? "text-rose-300" : "text-emerald-300"

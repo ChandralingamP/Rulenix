@@ -930,7 +930,9 @@ pub async fn daily_trade_report(
     require_admin_permission(&admin)?;
     let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60)
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("invalid IST offset")))?;
-    let date = query.date.unwrap_or_else(|| Utc::now().with_timezone(&ist).date_naive());
+    let date = query
+        .date
+        .unwrap_or_else(|| Utc::now().with_timezone(&ist).date_naive());
     let users: Vec<DailyUserTrades> = sqlx::query_as(
         "SELECT u.id AS user_id,u.username,COUNT(t.id)::bigint AS total_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='demo')::bigint AS demo_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='live')::bigint AS live_trades,COUNT(t.id) FILTER (WHERE t.status='open')::bigint AS open_trades,COUNT(t.id) FILTER (WHERE t.status='closed')::bigint AS closed_trades FROM users u LEFT JOIN trades t ON t.user_id=u.id AND (t.entry_datetime AT TIME ZONE 'Asia/Kolkata')::date=$1 GROUP BY u.id,u.username ORDER BY COUNT(t.id) DESC,u.username",
     )

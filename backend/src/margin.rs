@@ -98,12 +98,14 @@ pub async fn estimate(
         });
     }
 
+    let mut api_key = api_key.to_owned();
+    let mut jwt_token = jwt_token.to_owned();
     let mut last_response = Value::Null;
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let response = match angel::calculate_margin(
             state,
-            api_key,
-            jwt_token,
+            &api_key,
+            &jwt_token,
             &exchange,
             &product_type,
             token,
@@ -114,6 +116,16 @@ pub async fn estimate(
         .await
         {
             Ok(value) => value,
+            Err(error)
+                if attempt == 0
+                    && angel::is_authentication_error(&error.to_string())
+                    && crate::home::refresh_broker_session_now(state, user_id).await? =>
+            {
+                let refreshed = state.credentials.load(user_id).await?;
+                api_key.clone_from(&refreshed.api_key);
+                jwt_token.clone_from(&refreshed.jwt_token);
+                continue;
+            }
             Err(error) => {
                 return Err(AppError::BadRequest(format!(
                     "Unable to calculate broker margin for {symbol}. Please retry after reconnecting Angel One if this continues. ({error})"

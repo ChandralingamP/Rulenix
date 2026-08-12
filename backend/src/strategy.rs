@@ -289,6 +289,7 @@ type ExitFillTradeRow = (
     Option<f64>,
     Option<f64>,
     String,
+    String,
 );
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -2168,6 +2169,7 @@ async fn select_supertrend_atm_option_contract(
     Ok(Some(selected))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supertrend_option_snapshot_for_signal(
     state: &AppState,
     config: IndexOptionConfig,
@@ -2851,7 +2853,7 @@ pub(crate) async fn place_strategy_order(
     let protective = matches!(order.role, "TARGET" | "SL1" | "SL2");
     let mut live_margin = None;
     let mut live_reconciled = runner.trading_mode != "live" || protective;
-    let entry_credentials = if !protective {
+    let mut entry_credentials = if !protective {
         Some(state.credentials.load(runner.user_id).await?)
     } else {
         None
@@ -2879,6 +2881,11 @@ pub(crate) async fn place_strategy_order(
         .await?
         .margin_required
     };
+    if !protective {
+        // Margin estimation may refresh an expired Angel session. Reload the
+        // encrypted credentials before reconciliation and order submission.
+        entry_credentials = Some(state.credentials.load(runner.user_id).await?);
+    }
     if runner.trading_mode == "live" && !protective {
         let credentials = entry_credentials
             .as_ref()
@@ -4507,13 +4514,35 @@ fn carry_exit_role(action: &str, target_done: bool) -> Option<&'static str> {
     }
 }
 
+fn may_submit_exit_replacement(has_previous_nonterminal_order: bool) -> bool {
+    !has_previous_nonterminal_order
+}
+
+fn recorded_exit_reason(strategy_key: &str, role: &str, session_key: &str) -> &'static str {
+    if session_key.starts_with("optsq-") || session_key.starts_with("stsq-") {
+        "MARKET_CLOSED"
+    } else if session_key.starts_with("strev-") {
+        "SIGNAL_REVERSAL"
+    } else if strategy_key == STRATEGY_KEY {
+        match role {
+            "TARGET" => "TP1",
+            "SL2" => "SL2",
+            _ => "SL1",
+        }
+    } else if role == "TARGET" {
+        "TP"
+    } else {
+        "SL"
+    }
+}
+
 async fn cancel_active_exit_role(
     state: &AppState,
     user_id: Uuid,
     trade_id: Uuid,
     target_role: &str,
     exclude_session: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let orders: Vec<(Uuid, String, String, String)> = if target_role == "TARGET" {
         sqlx::query_as("SELECT id,broker_order_id,execution_mode,order_type FROM strategy_orders WHERE trade_id=$1 AND role='TARGET' AND session_key<>$2 AND status IN ('submitted','partially_filled')")
             .bind(trade_id)
@@ -4527,7 +4556,21 @@ async fn cancel_active_exit_role(
             .fetch_all(&state.db)
             .await?
     };
-    cancel_exit_orders(state, user_id, orders).await
+    cancel_exit_orders(state, user_id, orders).await?;
+    let active: bool = if target_role == "TARGET" {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role='TARGET' AND session_key<>$2 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+            .bind(trade_id)
+            .bind(exclude_session)
+            .fetch_one(&state.db)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('SL1','SL2') AND session_key<>$2 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+            .bind(trade_id)
+            .bind(exclude_session)
+            .fetch_one(&state.db)
+            .await?
+    };
+    Ok(may_submit_exit_replacement(active))
 }
 
 async fn place_carry_orders(
@@ -4599,11 +4642,19 @@ async fn place_carry_orders(
             } else {
                 trade.remaining_lots
             };
-            if let Err(error) =
-                cancel_active_exit_role(state, trade.user_id, trade.id, role, &key).await
-            {
-                errors.push(error.to_string());
-                continue;
+            match cancel_active_exit_role(state, trade.user_id, trade.id, role, &key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    errors.push(format!(
+                        "Trade {} is waiting for the previous {exit_role} broker order cancellation to be confirmed.",
+                        trade.id
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
             }
             if let Err(error) = place_strategy_order(
                 state,
@@ -6944,7 +6995,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     cancel_active_exits(state,order.user_id,existing.0).await?;
                     let pnl=trade_pnl(&existing.1,existing.3,fill,runtime_pnl_units(&instrument, existing.2, snapshot.lot_size));
                     let release_margin = existing.6;
-                    sqlx::query("WITH closed AS (UPDATE trades SET status='closed',exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),remaining_lots=0,notes=CONCAT(notes,'; SAR reversal'),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'")
+                    sqlx::query("WITH closed AS (UPDATE trades SET status='closed',exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),remaining_lots=0,exit_reason='SAR_REVERSAL',notes=CONCAT(notes,'; SAR reversal'),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'")
                         .bind(existing.0).bind(fill).bind(pnl).bind(release_margin).execute(&state.db).await?;
                     let contract_label = contract_log_label(&instrument, Some(&existing.7));
                     append_user_log(state, order.user_id, &format!("STRATEGY POSITION CLOSED {} SAR @ {:.2} P&L {:+.2}", contract_label, fill, pnl)).await;
@@ -7154,7 +7205,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "TARGET" => {
             if let Some(trade_id) = order.trade_id {
-                let trade:(String,i32,i32,i32,f64,f64,Option<f64>,String)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade:(String,i32,i32,i32,f64,f64,Option<f64>,String,String)=sqlx::query_as("SELECT direction,total_lots,remaining_lots,quantity,entry_price::float8,margin_required,sl2_price::float8,COALESCE(contract_symbol,''),strategy_key FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed = order.lots.min(trade.2);
                 let remaining = (trade.2 - closed).max(0);
@@ -7172,15 +7223,26 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     0.0
                 };
                 let remaining_margin = (trade.5 - release_margin).max(0.0);
+                let reporting_quantity = if trade.8 == STRATEGY_KEY {
+                    trade
+                        .1
+                        .saturating_mul(snapshot.lot_size.unwrap_or(1).max(1))
+                } else {
+                    trade.3
+                };
                 let mut fill_tx = state.db.begin().await?;
                 if remaining_quantity == 0 {
-                    sqlx::query("WITH closed AS (UPDATE trades SET status='closed',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=(pnl::float8+$3)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'").bind(trade_id).bind(fill).bind(realized).bind(release_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH closed AS (UPDATE trades SET status='closed',quantity=$5,remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=(pnl::float8+$3)::numeric,exit_datetime=NOW(),exit_reason=CASE WHEN strategy_key='futures_breakout_v3' THEN 'TP1' ELSE 'TP' END,tp1_exit_price=CASE WHEN strategy_key='futures_breakout_v3' THEN ($2::float8)::numeric ELSE tp1_exit_price END,tp1_exit_datetime=CASE WHEN strategy_key='futures_breakout_v3' THEN NOW() ELSE tp1_exit_datetime END,tp1_exit_quantity=CASE WHEN strategy_key='futures_breakout_v3' THEN $6 ELSE tp1_exit_quantity END,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$3+$4)::numeric,updated_at=NOW() FROM closed WHERE p.user_id=closed.user_id AND closed.execution_mode='demo'").bind(trade_id).bind(fill).bind(realized).bind(release_margin).bind(reporting_quantity).bind(closed_quantity).execute(&mut *fill_tx).await?;
                 } else {
-                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,margin_required=$7,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining_quantity).bind(fill).bind(realized).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH reduced AS (UPDATE trades SET remaining_lots=$2,quantity=$3,last_price=($4::float8)::numeric,pnl=(pnl::float8+$5)::numeric,margin_required=$7,tp1_exit_price=($4::float8)::numeric,tp1_exit_datetime=NOW(),tp1_exit_quantity=tp1_exit_quantity+$8,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$5+$6)::numeric,updated_at=NOW() FROM reduced WHERE p.user_id=reduced.user_id AND reduced.execution_mode='demo'").bind(trade_id).bind(remaining).bind(remaining_quantity).bind(fill).bind(realized).bind(release_margin).bind(remaining_margin).bind(closed_quantity).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status='filled',processed_quantity=GREATEST(processed_quantity,$2),filled_quantity=GREATEST(filled_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(cumulative_fill).execute(&mut *fill_tx).await?;
                 fill_tx.commit().await?;
-                if remaining_quantity > 0 {
+                // A live SL1 remains capable of filling until Angel confirms
+                // its cancellation. The reconciliation loop creates SL2 only
+                // after every earlier protective order is terminal, avoiding
+                // overlapping stops at different daily levels.
+                if remaining_quantity > 0 && order.execution_mode == "demo" {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
                     let sl2 = required_exit_level(trade.6, "continuation stop loss")?;
                     let side = if trade.0 == "BUY" { "SELL" } else { "BUY" };
@@ -7209,7 +7271,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
         }
         "SL1" | "SL2" => {
             if let Some(trade_id) = order.trade_id {
-                let trade: ExitFillTradeRow = sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,sl1_price::float8,sl2_price::float8,COALESCE(contract_symbol,'') FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
+                let trade: ExitFillTradeRow = sqlx::query_as("SELECT direction,quantity,remaining_lots,total_lots,entry_price::float8,pnl::float8,margin_required,sl1_price::float8,sl2_price::float8,COALESCE(contract_symbol,''),strategy_key FROM trades WHERE id=$1").bind(trade_id).fetch_one(&state.db).await?;
                 cancel_active_exits(state, order.user_id, trade_id).await?;
                 let closed_quantity = order.quantity.min(trade.1);
                 let remaining_quantity = trade.1 - closed_quantity;
@@ -7228,17 +7290,23 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     0.0
                 };
                 let remaining_margin = (trade.6 - release_margin).max(0.0);
-                let reversal = if order.role == "SL2"
-                    && remaining_quantity == 0
-                    && snapshot.strategy_key == STRATEGY_KEY
-                {
-                    sl2_reversal_plan(&trade.0, trade.3)
+                let reversal =
+                    if order.role == "SL2" && remaining_quantity == 0 && trade.10 == STRATEGY_KEY {
+                        sl2_reversal_plan(&trade.0, trade.3)
+                    } else {
+                        None
+                    };
+                let exit_reason = recorded_exit_reason(&trade.10, &order.role, &order.session_key);
+                let reporting_quantity = if trade.10 == STRATEGY_KEY {
+                    trade
+                        .3
+                        .saturating_mul(snapshot.lot_size.unwrap_or(1).max(1))
                 } else {
-                    None
+                    trade.1
                 };
                 let mut fill_tx = state.db.begin().await?;
                 if remaining_quantity == 0 {
-                    sqlx::query("WITH changed AS (UPDATE trades SET status='closed',quantity=0,remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$4+$5)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).execute(&mut *fill_tx).await?;
+                    sqlx::query("WITH changed AS (UPDATE trades SET status='closed',quantity=$6,remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),exit_reason=$7,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$4+$5)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).bind(reporting_quantity).bind(exit_reason).execute(&mut *fill_tx).await?;
                 } else {
                     sqlx::query("WITH changed AS (UPDATE trades SET quantity=$2,remaining_lots=$3,last_price=($4::float8)::numeric,pnl=($5::float8)::numeric,margin_required=$8,updated_at=NOW() WHERE id=$1 RETURNING user_id,execution_mode) UPDATE user_profiles p SET demo_balance=(p.demo_balance::float8+$6+$7)::numeric,updated_at=NOW() FROM changed WHERE p.user_id=changed.user_id AND changed.execution_mode='demo'").bind(trade_id).bind(remaining_quantity).bind(remaining_lots).bind(fill).bind(pnl).bind(closing_pnl).bind(release_margin).bind(remaining_margin).execute(&mut *fill_tx).await?;
                 }
@@ -7314,7 +7382,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                         tracing::warn!(%trade_id, %error, "immediate SL2 reversal submission failed");
                     }
                 }
-                if remaining_quantity > 0 {
+                if remaining_quantity > 0 && order.execution_mode == "demo" {
                     let runner = runner_for(state, order.user_id, &instrument).await?;
                     let (next_role, stop) = if order.role == "SL1" {
                         ("SL1", trade.7)
@@ -7875,9 +7943,10 @@ pub async fn update(
     let instrument = input
         .instrument
         .unwrap_or_else(|| {
-            if strategy_key == OPTION_ENTRY_STRATEGY_KEY {
-                "SENSEX".into()
-            } else if strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY {
+            if matches!(
+                strategy_key.as_str(),
+                OPTION_ENTRY_STRATEGY_KEY | SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+            ) {
                 "SENSEX".into()
             } else {
                 "GOLDTEN".into()
@@ -8175,6 +8244,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ic_at(
         day: u32,
         hour: u32,
@@ -8449,6 +8519,35 @@ mod tests {
         assert_eq!(carry_exit_role("TARGET", true), None);
         assert_eq!(carry_exit_role("STOP", false), Some("SL1"));
         assert_eq!(carry_exit_role("STOP", true), Some("SL2"));
+        assert!(!may_submit_exit_replacement(true));
+        assert!(may_submit_exit_replacement(false));
+    }
+
+    #[test]
+    fn exit_reasons_distinguish_protective_and_scheduled_closures() {
+        assert_eq!(recorded_exit_reason(STRATEGY_KEY, "TARGET", "day"), "TP1");
+        assert_eq!(recorded_exit_reason(STRATEGY_KEY, "SL1", "day"), "SL1");
+        assert_eq!(recorded_exit_reason(STRATEGY_KEY, "SL2", "day"), "SL2");
+        assert_eq!(
+            recorded_exit_reason(OPTION_ENTRY_STRATEGY_KEY, "TARGET", "opt"),
+            "TP"
+        );
+        assert_eq!(
+            recorded_exit_reason(OPTION_ENTRY_STRATEGY_KEY, "SL1", "opt"),
+            "SL"
+        );
+        assert_eq!(
+            recorded_exit_reason(OPTION_ENTRY_STRATEGY_KEY, "SL1", "optsq-20260812-1520"),
+            "MARKET_CLOSED"
+        );
+        assert_eq!(
+            recorded_exit_reason(
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                "SL1",
+                "strev-SENSEX-20260812-1000-CE"
+            ),
+            "SIGNAL_REVERSAL"
+        );
     }
 
     #[test]

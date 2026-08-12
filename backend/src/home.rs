@@ -417,6 +417,14 @@ async fn refresh_tokens(state: &AppState, snapshot: &SessionSnapshot) -> AppResu
     }
 }
 
+pub(crate) async fn refresh_broker_session_now(state: &AppState, user_id: Uuid) -> AppResult<bool> {
+    let snapshot = session_snapshot(state, user_id).await?;
+    if snapshot.credentials.api_key.is_empty() || snapshot.credentials.refresh_token.is_empty() {
+        return Ok(false);
+    }
+    refresh_tokens(state, &snapshot).await
+}
+
 async fn maintain_user_session(state: &AppState, user_id: Uuid) -> AppResult<()> {
     {
         let mut active = state.session_checks.lock().await;
