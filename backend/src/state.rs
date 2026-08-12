@@ -21,6 +21,7 @@ pub struct AppState {
     pub strategy_feed_tokens: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     pub session_checks: Arc<Mutex<HashSet<uuid::Uuid>>>,
     pub angel_api_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    pub shared_historical_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     pub shared_market_cursor: Arc<Mutex<usize>>,
     pub credentials: CredentialStore,
     pub abuse_prevention: AbusePrevention,

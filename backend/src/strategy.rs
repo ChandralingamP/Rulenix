@@ -60,6 +60,8 @@ const SUPERTREND_SENSEX_DEFAULT_TARGET_POINTS: f64 = 40.0;
 const SUPERTREND_SENSEX_DEFAULT_STOP_POINTS: f64 = 25.0;
 const SUPERTREND_NIFTY_DEFAULT_TARGET_POINTS: f64 = 25.0;
 const SUPERTREND_NIFTY_DEFAULT_STOP_POINTS: f64 = 15.0;
+const SHARED_HISTORICAL_RATE_LIMIT_BACKOFF: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 #[derive(Debug, Clone)]
 struct OptionContract {
     token: String,
@@ -1793,6 +1795,43 @@ async fn shared_market_candles(
     )))
 }
 
+fn historical_cooldown_key(exchange: &str, token: &str, interval: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        exchange.to_uppercase(),
+        token.trim(),
+        interval.to_uppercase()
+    )
+}
+
+async fn shared_historical_cooldown_active(
+    state: &AppState,
+    exchange: &str,
+    token: &str,
+    interval: &str,
+) -> bool {
+    let key = historical_cooldown_key(exchange, token, interval);
+    let now = std::time::Instant::now();
+    let mut cooldowns = state.shared_historical_cooldowns.lock().await;
+    cooldowns.retain(|_, until| *until > now);
+    cooldowns.get(&key).is_some_and(|until| *until > now)
+}
+
+async fn activate_shared_historical_cooldown(
+    state: &AppState,
+    exchange: &str,
+    token: &str,
+    interval: &str,
+) {
+    let key = historical_cooldown_key(exchange, token, interval);
+    let until = std::time::Instant::now() + SHARED_HISTORICAL_RATE_LIMIT_BACKOFF;
+    let mut cooldowns = state.shared_historical_cooldowns.lock().await;
+    cooldowns
+        .entry(key)
+        .and_modify(|current| *current = (*current).max(until))
+        .or_insert(until);
+}
+
 async fn first_session_open(state: &AppState, snapshot: &Snapshot) -> AppResult<f64> {
     let token = snapshot
         .contract_token
@@ -2469,7 +2508,15 @@ async fn cached_index_candles(
         })
         .unwrap_or(from_candle);
 
-    if fetch_from <= to_candle {
+    if fetch_from <= to_candle
+        && !shared_historical_cooldown_active(
+            state,
+            config.index_exchange,
+            config.index_token,
+            OPTION_INTERVAL,
+        )
+        .await
+    {
         let fetched = shared_market_candles(
             state,
             config.index_exchange,
@@ -2485,6 +2532,15 @@ async fn cached_index_candles(
                 cache_index_candles(state, config, &candles).await?;
             }
             Err(error) => {
+                if angel::is_rate_limit_error(&error.to_string()) {
+                    activate_shared_historical_cooldown(
+                        state,
+                        config.index_exchange,
+                        config.index_token,
+                        OPTION_INTERVAL,
+                    )
+                    .await;
+                }
                 let fresh_enough =
                     max_cached.is_some_and(|cached| cached >= to_utc - Duration::minutes(10));
                 if !fresh_enough {
@@ -2596,7 +2652,10 @@ async fn cached_sensex_index_candles(
         })
         .unwrap_or(from_candle);
 
-    if fetch_from <= to_candle {
+    if fetch_from <= to_candle
+        && !shared_historical_cooldown_active(state, "BSE", SENSEX_INDEX_TOKEN, OPTION_INTERVAL)
+            .await
+    {
         let fetched = shared_market_candles(
             state,
             "BSE",
@@ -2612,6 +2671,15 @@ async fn cached_sensex_index_candles(
                 cache_sensex_index_candles(state, &candles).await?;
             }
             Err(error) => {
+                if angel::is_rate_limit_error(&error.to_string()) {
+                    activate_shared_historical_cooldown(
+                        state,
+                        "BSE",
+                        SENSEX_INDEX_TOKEN,
+                        OPTION_INTERVAL,
+                    )
+                    .await;
+                }
                 let fresh_enough =
                     max_cached.is_some_and(|cached| cached >= to_utc - Duration::minutes(10));
                 if !fresh_enough {
@@ -3487,7 +3555,7 @@ async fn user_has_supertrend_side_exposure(
     side: IndexOptionSide,
 ) -> AppResult<bool> {
     let instrument = format!("{}_{}", underlying, side.option_type());
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND instrument_label=$3 AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND s.strategy_key=$2 AND s.instrument=$3 AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.user_id=$1 AND t.strategy_key=$2 AND t.instrument_label=$3 AND t.status='open' AND t.remaining_lots>0 AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND s.strategy_key=$2 AND s.instrument=$3 AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE))")
         .bind(user_id)
         .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
         .bind(instrument)
@@ -3705,7 +3773,7 @@ async fn close_supertrend_open_trades_for_side(
 }
 
 async fn user_has_any_option_exposure(state: &AppState, user_id: Uuid) -> AppResult<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND strategy_key=$2 AND status='open' AND remaining_lots>0) OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND snapshot_id IN (SELECT id FROM strategy_market_snapshots WHERE strategy_key=$2))")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.user_id=$1 AND t.strategy_key=$2 AND t.status='open' AND t.remaining_lots>0 AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)) OR EXISTS(SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.role IN ('BUY_ENTRY','SELL_ENTRY') AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.strategy_key=$2 AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE))")
         .bind(user_id)
         .bind(OPTION_ENTRY_STRATEGY_KEY)
         .fetch_one(&state.db)
@@ -5164,7 +5232,7 @@ pub fn start(state: AppState) {
                     }
                 });
             }
-            let active_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.contract_token IS NOT NULL UNION SELECT DISTINCT s.exchange_segment,s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.contract_token IS NOT NULL")
+            let active_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE) UNION SELECT DISTINCT s.exchange_segment,s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)")
                 .fetch_all(&state.db).await.unwrap_or_default();
             for (exchange, token) in active_tokens {
                 crate::market_ws::ensure_strategy_feed(state.clone(), exchange, token).await;

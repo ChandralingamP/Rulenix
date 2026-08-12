@@ -196,6 +196,7 @@ async fn main() -> Result<()> {
         strategy_feed_tokens: Default::default(),
         session_checks: Default::default(),
         angel_api_cooldowns: Default::default(),
+        shared_historical_cooldowns: Default::default(),
         shared_market_cursor: Default::default(),
         credentials: credential_store,
         abuse_prevention: Default::default(),

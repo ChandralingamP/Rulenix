@@ -274,7 +274,7 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
 }
 
 async fn refresh_requested_tokens(state: &AppState, exchange: &str) -> HashSet<String> {
-    let query = sqlx::query_scalar::<_, String>("SELECT DISTINCT s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.exchange_segment=$1 AND s.contract_token IS NOT NULL AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') UNION SELECT DISTINCT s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.exchange_segment=$1 AND s.contract_token IS NOT NULL")
+    let query = sqlx::query_scalar::<_, String>("SELECT DISTINCT s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.exchange_segment=$1 AND s.contract_token IS NOT NULL AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE) UNION SELECT DISTINCT s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.exchange_segment=$1 AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)")
         .bind(exchange)
         .fetch_all(&state.db)
         .await;
