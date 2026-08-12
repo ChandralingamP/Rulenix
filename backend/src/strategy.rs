@@ -947,6 +947,10 @@ fn option_square_off_due(now: DateTime<FixedOffset>) -> bool {
     option_minute_of_day(now) >= OPTION_SQUARE_OFF_MINUTE
 }
 
+fn option_expiry_checkpoint_due(expiry: NaiveDate, now: DateTime<FixedOffset>) -> bool {
+    expiry < now.date_naive() || (expiry == now.date_naive() && option_square_off_due(now))
+}
+
 fn option_exit(
     item: IndicatorCandle,
     side: OptionSide,
@@ -3787,6 +3791,93 @@ async fn has_any_active_option_exit(state: &AppState, trade_id: Uuid) -> AppResu
         .await?)
 }
 
+async fn close_lingering_expired_option_trades(
+    state: &AppState,
+    now: DateTime<FixedOffset>,
+) -> AppResult<()> {
+    let rows: Vec<(Uuid, Uuid, String, String, Option<String>, NaiveDate)> = sqlx::query_as(
+        "WITH candidates AS (
+            SELECT t.id,t.user_id,t.strategy_key,t.instrument_label,t.contract_symbol,s.contract_expiry
+            FROM trades t
+            JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+            WHERE t.status='open'
+              AND t.remaining_lots>0
+              AND t.strategy_key IN ($1,$2)
+              AND s.contract_expiry IS NOT NULL
+              AND (
+                    s.contract_expiry<CURRENT_DATE
+                 OR (s.contract_expiry=CURRENT_DATE AND $3::boolean)
+              )
+        ),
+        changed AS (
+            UPDATE trades t
+            SET status='closed',
+                exit_price=COALESCE(t.last_price,t.entry_price),
+                last_price=COALESCE(t.last_price,t.entry_price),
+                pnl=CASE
+                    WHEN t.direction='BUY' THEN ((COALESCE(t.last_price,t.entry_price)::float8-t.entry_price::float8)*t.quantity)::numeric
+                    ELSE ((t.entry_price::float8-COALESCE(t.last_price,t.entry_price)::float8)*t.quantity)::numeric
+                END,
+                exit_datetime=$4,
+                remaining_lots=0,
+                exit_reason='MARKET_CLOSED',
+                notes=CONCAT(COALESCE(t.notes,''), CASE WHEN COALESCE(t.notes,'')='' THEN '' ELSE '; ' END, 'Auto-closed by expiry checkpoint'),
+                updated_at=NOW()
+            FROM candidates c
+            WHERE t.id=c.id
+            RETURNING t.id,t.user_id,t.strategy_key,t.instrument_label,t.contract_symbol,c.contract_expiry
+        )
+        SELECT * FROM changed",
+    )
+    .bind(OPTION_ENTRY_STRATEGY_KEY)
+    .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+    .bind(option_square_off_due(now))
+    .bind(now.with_timezone(&Utc))
+    .fetch_all(&state.db)
+    .await?;
+
+    for (trade_id, user_id, strategy_key, instrument, contract_symbol, expiry) in rows {
+        sqlx::query(
+            "UPDATE strategy_orders
+             SET status='cancelled',
+                 broker_status='Cancelled by expiry checkpoint',
+                 updated_at=NOW()
+             WHERE trade_id=$1
+               AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')",
+        )
+        .bind(trade_id)
+        .execute(&state.db)
+        .await?;
+        emit_for(
+            state,
+            &strategy_key,
+            Some(user_id),
+            &instrument,
+            "option_expiry_checkpoint_closed",
+            json!({
+                "trade_id":trade_id,
+                "contract_symbol":contract_symbol,
+                "contract_expiry":expiry,
+                "closed_at":now,
+                "exit_reason":"MARKET_CLOSED"
+            }),
+        )
+        .await;
+        append_user_log(
+            state,
+            user_id,
+            &format!(
+                "OPTION EXPIRY CHECKPOINT closed {} [{} expiry {}] as MARKET_CLOSED",
+                contract_log_label(&instrument, contract_symbol.as_deref()),
+                strategy_key,
+                expiry
+            ),
+        )
+        .await;
+    }
+    Ok(())
+}
+
 async fn active_option_exit_order_types(
     state: &AppState,
     trade_id: Uuid,
@@ -4134,15 +4225,15 @@ async fn process_option_square_off(state: &AppState, now: DateTime<FixedOffset>)
             .await?;
         if snapshot
             .contract_expiry
-            .is_some_and(|expiry| expiry < now.date_naive())
+            .is_some_and(|expiry| option_expiry_checkpoint_due(expiry, now))
         {
-            tracing::warn!(
+            tracing::info!(
                 %trade_id,
                 user_id=%user_id,
                 instrument=%instrument,
                 contract=?snapshot.contract_symbol,
                 expiry=?snapshot.contract_expiry,
-                "skipping expired option entry trade during square-off scan"
+                "deferring expired option entry trade to expiry checkpoint"
             );
             continue;
         }
@@ -4507,6 +4598,7 @@ async fn run_supertrend_cycle(state: &AppState, now: DateTime<FixedOffset>) -> A
     }
     if option_square_off_due(now) {
         process_supertrend_square_off(state, now).await?;
+        close_lingering_expired_option_trades(state, now).await?;
         return Ok(());
     }
     if !option_entry_allowed(now) {
@@ -4538,6 +4630,7 @@ async fn run_option_entry_cycle(state: &AppState, now: DateTime<FixedOffset>) ->
     }
     if option_square_off_due(now) {
         process_option_square_off(state, now).await?;
+        close_lingering_expired_option_trades(state, now).await?;
         return Ok(());
     }
     let mut indicators = None;
@@ -5070,6 +5163,13 @@ pub fn start(state: AppState) {
                 && let Err(error) = sqlx::query("UPDATE strategy_orders o SET status='cancelled',broker_status='Demo DAY order expired',updated_at=NOW() FROM strategy_market_snapshots s WHERE s.id=o.snapshot_id AND s.trade_date<$1 AND o.execution_mode='demo' AND o.status IN ('pending','submitted')")
                     .bind(date).execute(&state.db).await {
                 tracing::warn!(%error, "could not expire prior-day strategy orders");
+            }
+            if dispatched.insert(format!(
+                "{date}:option-expiry-checkpoint:{}",
+                now.format("%H%M")
+            )) && let Err(error) = close_lingering_expired_option_trades(&state, now).await
+            {
+                tracing::warn!(%error, "could not close lingering expired option trades");
             }
             let mut contracts_ready = true;
             for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
@@ -8540,6 +8640,26 @@ mod tests {
         assert!(!option_entry_allowed(at(15, 20)));
         assert!(!option_square_off_due(at(15, 19)));
         assert!(option_square_off_due(at(15, 20)));
+    }
+
+    #[test]
+    fn option_expiry_checkpoint_runs_on_expiry_square_off_or_later() {
+        let offset = FixedOffset::east_opt(19_800).unwrap();
+        let at = |day, hour, minute| {
+            offset
+                .with_ymd_and_hms(2026, 8, day, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        let expiry = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+
+        assert!(!option_expiry_checkpoint_due(expiry, at(12, 15, 19)));
+        assert!(option_expiry_checkpoint_due(expiry, at(12, 15, 20)));
+        assert!(option_expiry_checkpoint_due(expiry, at(13, 9, 15)));
+        assert!(!option_expiry_checkpoint_due(
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+            at(12, 15, 20)
+        ));
     }
 
     #[test]
