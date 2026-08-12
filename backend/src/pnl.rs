@@ -29,6 +29,8 @@ pub struct TradeRow {
     pub id: Uuid,
     pub execution_mode: String,
     pub status: String,
+    pub strategy_key: String,
+    pub strategy_name: String,
     pub direction: String,
     pub quantity: i32,
     pub entry_price: Option<f64>,
@@ -62,6 +64,13 @@ const TRADE_ROWS_SQL: &str = r#"
         id,
         execution_mode,
         status,
+        strategy_key,
+        CASE strategy_key
+            WHEN 'futures_breakout_v3' THEN 'Futures Breakout v3'
+            WHEN 'option_entry_v1' THEN 'Option Entry Strategy V1.0'
+            WHEN 'supertrend_index_options_v1' THEN 'SuperTrend Index Options v1'
+            ELSE COALESCE(NULLIF(strategy_key,''),'Manual')
+        END AS strategy_name,
         direction,
         quantity,
         entry_price::float8 AS entry_price,
@@ -200,6 +209,7 @@ pub async fn export(
         "#",
         "Entry Date",
         "Exit Date",
+        "Strategy",
         "Instrument",
         "Symbol",
         "Mode",
@@ -247,42 +257,45 @@ pub async fn export(
             )
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 3, &trade.instrument_label)
+            .write_string(row, 3, &trade.strategy_name)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 4, &trade.contract_symbol)
+            .write_string(row, 4, &trade.instrument_label)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 5, &trade.execution_mode)
+            .write_string(row, 5, &trade.contract_symbol)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 6, &trade.direction)
+            .write_string(row, 6, &trade.execution_mode)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_number(row, 7, trade.quantity as f64)
+            .write_string(row, 7, &trade.direction)
+            .map_err(|e| AppError::Internal(e.into()))?;
+        sheet
+            .write_number(row, 8, trade.quantity as f64)
             .map_err(|e| AppError::Internal(e.into()))?;
         if let Some(v) = trade.entry_price {
-            sheet
-                .write_number(row, 8, v)
-                .map_err(|e| AppError::Internal(e.into()))?;
-        }
-        if let Some(v) = trade.exit_price {
             sheet
                 .write_number(row, 9, v)
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
+        if let Some(v) = trade.exit_price {
+            sheet
+                .write_number(row, 10, v)
+                .map_err(|e| AppError::Internal(e.into()))?;
+        }
         sheet
-            .write_string(row, 10, &trade.exit_reason)
+            .write_string(row, 11, &trade.exit_reason)
             .map_err(|e| AppError::Internal(e.into()))?;
         if let Some(v) = trade.tp1_exit_price {
             sheet
-                .write_number(row, 11, v)
+                .write_number(row, 12, v)
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
         sheet
             .write_string(
                 row,
-                12,
+                13,
                 trade
                     .tp1_exit_datetime
                     .map(|v| v.to_rfc3339())
@@ -290,13 +303,13 @@ pub async fn export(
             )
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_number(row, 13, trade.tp1_exit_quantity as f64)
+            .write_number(row, 14, trade.tp1_exit_quantity as f64)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_number(row, 14, trade.pnl_realtime)
+            .write_number(row, 15, trade.pnl_realtime)
             .map_err(|e| AppError::Internal(e.into()))?;
         sheet
-            .write_string(row, 15, &trade.notes)
+            .write_string(row, 16, &trade.notes)
             .map_err(|e| AppError::Internal(e.into()))?;
     }
     let bytes = workbook

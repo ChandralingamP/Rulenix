@@ -45,6 +45,12 @@ export default function ProfitLossPage() {
   // Fetch trades on page/mode change
   useEffect(() => {
     dispatch(fetchTrades({ page, pageSize, mode }));
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") {
+        dispatch(fetchTrades({ page, pageSize, mode }));
+      }
+    }, 5000);
+    return () => window.clearInterval(intervalId);
   }, [dispatch, page, pageSize, mode]);
 
   const handleRefresh = () => {
@@ -213,6 +219,7 @@ export default function ProfitLossPage() {
               <th className="whitespace-nowrap px-4 py-3">#</th>
               <th className="whitespace-nowrap px-4 py-3">Entry Date</th>
               <th className="whitespace-nowrap px-4 py-3">Exit Date</th>
+              <th className="whitespace-nowrap px-4 py-3">Strategy</th>
               <th className="whitespace-nowrap px-4 py-3">Instrument</th>
               <th className="whitespace-nowrap px-4 py-3">Symbol</th>
               <th className="whitespace-nowrap px-4 py-3">Side</th>
@@ -226,10 +233,10 @@ export default function ProfitLossPage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800">
-            {status === "loading" ? (
+            {status === "loading" && entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={13}
+                  colSpan={14}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   Loading trades...
@@ -238,7 +245,7 @@ export default function ProfitLossPage() {
             ) : entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={13}
+                  colSpan={14}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   No trade history available.
@@ -256,6 +263,16 @@ export default function ProfitLossPage() {
                   : "—";
                 const entryDisplay = formatDateTime(trade.entry_datetime);
                 const exitDisplay = formatDateTime(trade.exit_datetime);
+                const strategyDisplay =
+                  trade.strategy_name ||
+                  {
+                    futures_breakout_v3: "Futures Breakout v3",
+                    option_entry_v1: "Option Entry Strategy V1.0",
+                    supertrend_index_options_v1:
+                      "SuperTrend Index Options v1",
+                  }[trade.strategy_key] ||
+                  trade.strategy_key ||
+                  "Manual";
                 const instrumentLabel =
                   trade.instrument_label ||
                   trade.instrument_symbol ||
@@ -306,6 +323,9 @@ export default function ProfitLossPage() {
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">
                       {exitDisplay}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-slate-300">
+                      {strategyDisplay}
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">
                       {instrumentLabel}

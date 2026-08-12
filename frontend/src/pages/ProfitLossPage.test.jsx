@@ -42,6 +42,8 @@ describe("ProfitLossPage exit audit", () => {
       status: "closed",
       direction: "BUY",
       quantity: 2,
+      strategy_key: "futures_breakout_v3",
+      strategy_name: "Futures Breakout v3",
       instrument_label: "SILVERMIC",
       contract_symbol: "SILVERMIC31AUG26FUT",
       entry_price: 223237,
@@ -54,6 +56,7 @@ describe("ProfitLossPage exit audit", () => {
     }]);
 
     expect(await screen.findByText("SL2 hit")).toBeInTheDocument();
+    expect(screen.getByText("Futures Breakout v3")).toBeInTheDocument();
     expect(screen.getByText(/227100\.00.*Qty 1/)).toBeInTheDocument();
     expect(screen.getByText("226902.00")).toBeInTheDocument();
   });
@@ -64,6 +67,8 @@ describe("ProfitLossPage exit audit", () => {
       status: "closed",
       direction: "BUY",
       quantity: 20,
+      strategy_key: "option_entry_v1",
+      strategy_name: "Option Entry Strategy V1.0",
       instrument_label: "SENSEX_CE",
       contract_symbol: "SENSEX26AUGCE",
       entry_price: 250,
@@ -73,5 +78,6 @@ describe("ProfitLossPage exit audit", () => {
     }]);
 
     expect(await screen.findByText("Market closed (3:20 PM)")).toBeInTheDocument();
+    expect(screen.getByText("Option Entry Strategy V1.0")).toBeInTheDocument();
   });
 });

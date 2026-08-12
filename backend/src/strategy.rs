@@ -5154,9 +5154,9 @@ pub fn start(state: AppState) {
                     }
                 });
             }
-            let demo_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.execution_mode='demo' AND o.status='submitted' AND s.contract_token IS NOT NULL")
+            let active_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.contract_token IS NOT NULL UNION SELECT DISTINCT s.exchange_segment,s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.contract_token IS NOT NULL")
                 .fetch_all(&state.db).await.unwrap_or_default();
-            for (exchange, token) in demo_tokens {
+            for (exchange, token) in active_tokens {
                 crate::market_ws::ensure_strategy_feed(state.clone(), exchange, token).await;
             }
             if let Err(error) = retry_failed_protective_orders(&state).await {
@@ -7439,7 +7439,7 @@ async fn process_demo_tick(
     token: &str,
     ltp: f64,
 ) -> AppResult<()> {
-    sqlx::query("UPDATE trades t SET last_price=($4::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.user_id=$1 AND t.execution_mode='demo' AND t.status='open' AND s.exchange_segment=$2 AND s.contract_token=$3")
+    sqlx::query("UPDATE trades t SET last_price=($4::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.user_id=$1 AND t.status='open' AND s.exchange_segment=$2 AND s.contract_token=$3")
         .bind(user_id).bind(exchange_segment).bind(token).bind(ltp).execute(&state.db).await?;
     let orders:Vec<StoredOrder>=sqlx::query_as("SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.order_type,o.execution_mode,o.lots,o.quantity,o.price,o.margin_required,o.broker_order_id,o.client_order_id,o.status,o.filled_quantity,o.processed_quantity,o.average_fill_price::float8 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.user_id=$1 AND o.execution_mode='demo' AND o.status='submitted' AND s.exchange_segment=$2 AND s.contract_token=$3 ORDER BY CASE WHEN o.role IN ('TARGET','SL1','SL2') THEN 0 ELSE 1 END,o.created_at")
         .bind(user_id).bind(exchange_segment).bind(token).fetch_all(&state.db).await?;
@@ -7475,6 +7475,12 @@ pub async fn process_tick_shared(
     ltp: f64,
 ) -> AppResult<()> {
     risk::record_tick(state, exchange_segment, token, ltp).await?;
+    sqlx::query("UPDATE trades t SET last_price=($3::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.status='open' AND s.exchange_segment=$1 AND s.contract_token=$2")
+        .bind(exchange_segment)
+        .bind(token)
+        .bind(ltp)
+        .execute(&state.db)
+        .await?;
     let users: Vec<Uuid> = sqlx::query_scalar("SELECT DISTINCT o.user_id FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.execution_mode='demo' AND o.status='submitted' AND s.exchange_segment=$1 AND s.contract_token=$2")
         .bind(exchange_segment).bind(token).fetch_all(&state.db).await?;
     for user in users {
