@@ -1264,6 +1264,10 @@ fn extract_quote_ltps(value: &Value) -> HashMap<String, f64> {
     prices
 }
 
+fn quote_ltp_for_token(value: &Value, token: &str) -> Option<f64> {
+    extract_quote_ltps(value).get(token).copied()
+}
+
 fn collect_quote_opens(value: &Value, prices: &mut HashMap<String, f64>) {
     match value {
         Value::Array(values) => {
@@ -2159,9 +2163,9 @@ async fn select_supertrend_atm_option_contract(
         json!({config.option_exchange:[selected.token.clone()]}),
     )
     .await?;
-    selected.premium = find_quote_ltp(&quote).ok_or_else(|| {
+    selected.premium = quote_ltp_for_token(&quote, &selected.token).ok_or_else(|| {
         AppError::BadRequest(format!(
-            "Angel One {} {} ATM option quote did not include LTP.",
+            "Angel One {} {} ATM option quote did not include contract-token LTP.",
             config.instrument,
             side.option_type()
         ))
@@ -2650,8 +2654,14 @@ async fn option_execution_ltp(state: &AppState, snapshot: &Snapshot) -> AppResul
     let mut token_map = serde_json::Map::new();
     token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
     let quote = shared_market_quote(state, "LTP", Value::Object(token_map)).await?;
-    let ltp = find_quote_ltp(&quote).ok_or_else(|| {
-        AppError::BadRequest("Angel One option quote did not include LTP.".into())
+    let ltp = quote_ltp_for_token(&quote, token).ok_or_else(|| {
+        let contract = snapshot
+            .contract_symbol
+            .as_deref()
+            .unwrap_or(&snapshot.instrument);
+        AppError::BadRequest(format!(
+            "Angel One option quote for {contract} did not include contract-token LTP."
+        ))
     })?;
     risk::record_tick(state, &snapshot.exchange_segment, token, ltp).await?;
     Ok(ltp)
@@ -2676,13 +2686,13 @@ async fn refresh_snapshot_market_tick(state: &AppState, snapshot: &Snapshot) -> 
     let mut token_map = serde_json::Map::new();
     token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
     let quote = shared_market_quote(state, "LTP", Value::Object(token_map)).await?;
-    let ltp = find_quote_ltp(&quote).ok_or_else(|| {
+    let ltp = quote_ltp_for_token(&quote, token).ok_or_else(|| {
         let contract = snapshot
             .contract_symbol
             .as_deref()
             .unwrap_or(&snapshot.instrument);
         AppError::BadRequest(format!(
-            "Angel One quote for {contract} did not include LTP."
+            "Angel One quote for {contract} did not include contract-token LTP."
         ))
     })?;
     risk::record_tick(state, &snapshot.exchange_segment, token, ltp).await?;
@@ -7428,8 +7438,60 @@ pub async fn process_tick(
     token: &str,
     ltp: f64,
 ) -> AppResult<()> {
+    if implausible_option_tick(state, exchange_segment, token, ltp).await? {
+        return Ok(());
+    }
     risk::record_tick(state, exchange_segment, token, ltp).await?;
     process_demo_tick(state, user_id, exchange_segment, token, ltp).await
+}
+
+async fn implausible_option_tick(
+    state: &AppState,
+    exchange_segment: &str,
+    token: &str,
+    ltp: f64,
+) -> AppResult<bool> {
+    let implausible: bool = sqlx::query_scalar(
+        "WITH token_context AS (
+            SELECT
+                BOOL_OR(
+                    s.contract_symbol ILIKE '%CE'
+                    OR s.contract_symbol ILIKE '%PE'
+                    OR s.instrument ILIKE '%\\_CE' ESCAPE '\\'
+                    OR s.instrument ILIKE '%\\_PE' ESCAPE '\\'
+                ) AS is_option,
+                COALESCE(
+                    MAX(GREATEST(COALESCE(t.entry_price::float8,0),COALESCE(o.price,0))*20.0)
+                        FILTER (WHERE t.id IS NOT NULL OR o.id IS NOT NULL),
+                    20000.0
+                ) AS max_plausible_price
+            FROM strategy_market_snapshots s
+            LEFT JOIN trades t
+                ON t.strategy_snapshot_id=s.id
+               AND t.status='open'
+            LEFT JOIN strategy_orders o
+                ON o.snapshot_id=s.id
+               AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+            WHERE s.exchange_segment=$1
+              AND s.contract_token=$2
+        )
+        SELECT COALESCE(is_option,FALSE) AND $3::float8>max_plausible_price
+        FROM token_context",
+    )
+    .bind(exchange_segment)
+    .bind(token)
+    .bind(ltp)
+    .fetch_one(&state.db)
+    .await?;
+    if implausible {
+        tracing::warn!(
+            exchange_segment,
+            token,
+            ltp,
+            "ignored implausible option market tick"
+        );
+    }
+    Ok(implausible)
 }
 
 async fn process_demo_tick(
@@ -7474,6 +7536,9 @@ pub async fn process_tick_shared(
     token: &str,
     ltp: f64,
 ) -> AppResult<()> {
+    if implausible_option_tick(state, exchange_segment, token, ltp).await? {
+        return Ok(());
+    }
     risk::record_tick(state, exchange_segment, token, ltp).await?;
     sqlx::query("UPDATE trades t SET last_price=($3::float8)::numeric,updated_at=NOW() FROM strategy_market_snapshots s WHERE t.strategy_snapshot_id=s.id AND t.status='open' AND s.exchange_segment=$1 AND s.contract_token=$2")
         .bind(exchange_segment)
@@ -8475,6 +8540,21 @@ mod tests {
         let premiums = HashMap::from([("below".to_string(), 219.0), ("above".to_string(), 291.0)]);
 
         assert!(choose_premium_contract(&candidates, &premiums, 76100.0).is_none());
+    }
+
+    #[test]
+    fn option_ltp_lookup_uses_requested_contract_token() {
+        let quote = json!({
+            "data": {
+                "fetched": [
+                    {"symbolToken": SENSEX_INDEX_TOKEN, "ltp": 77928.15},
+                    {"symbolToken": "1145633", "ltp": 272.0}
+                ]
+            }
+        });
+
+        assert_eq!(quote_ltp_for_token(&quote, "1145633"), Some(272.0));
+        assert_eq!(quote_ltp_for_token(&quote, "missing"), None);
     }
 
     #[test]
