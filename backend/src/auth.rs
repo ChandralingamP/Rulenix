@@ -1168,16 +1168,17 @@ pub async fn clear_user_trade_logs(
         .bind(target_id)
         .execute(&mut *tx)
         .await?;
-    let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+    let open_trades: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM trades WHERE user_id=$1 AND status='open'",
+    )
+    .bind(target_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let active_orders: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
         .bind(target_id)
         .fetch_one(&mut *tx)
         .await?;
-    if execution_in_flight {
-        return Err(AppError::BadRequest(
-            "Trade logs cannot be cleared while this account has an open position or active broker order.".into(),
-        ));
-    }
-    let deleted_trades = sqlx::query("DELETE FROM trades WHERE user_id=$1")
+    let deleted_trades = sqlx::query("DELETE FROM trades WHERE user_id=$1 AND status='closed'")
         .bind(target_id)
         .execute(&mut *tx)
         .await?
@@ -1205,7 +1206,7 @@ pub async fn clear_user_trade_logs(
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
             summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades}),
+            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"preserved_open_trades":open_trades,"preserved_active_orders":active_orders}),
         },
     )
     .await
@@ -1217,7 +1218,9 @@ pub async fn clear_user_trade_logs(
         "username":username,
         "deleted_trades":deleted_trades,
         "deleted_backtest_runs":deleted_backtest_runs,
-        "deleted_backtest_trades":deleted_backtest_trades
+        "deleted_backtest_trades":deleted_backtest_trades,
+        "preserved_open_trades":open_trades,
+        "preserved_active_orders":active_orders
     })))
 }
 

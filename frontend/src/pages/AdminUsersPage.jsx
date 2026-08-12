@@ -141,8 +141,10 @@ export default function AdminUsersPage() {
       });
       const deletedTrades = response.data?.deleted_trades ?? 0;
       const deletedBacktests = response.data?.deleted_backtest_runs ?? 0;
+      const preservedOpenTrades = response.data?.preserved_open_trades ?? 0;
+      const preservedActiveOrders = response.data?.preserved_active_orders ?? 0;
       setNotice(
-        `Cleared ${deletedTrades} P&L ${deletedTrades === 1 ? "record" : "records"} and ${deletedBacktests} backtest ${deletedBacktests === 1 ? "run" : "runs"} for ${username}.`
+        `Cleared ${deletedTrades} closed P&L ${deletedTrades === 1 ? "record" : "records"} and ${deletedBacktests} backtest ${deletedBacktests === 1 ? "run" : "runs"} for ${username}. Preserved ${preservedOpenTrades} open ${preservedOpenTrades === 1 ? "trade" : "trades"} and ${preservedActiveOrders} active ${preservedActiveOrders === 1 ? "order" : "orders"}.`
       );
       setPendingClearLogs(null);
     } catch (requestError) {
@@ -327,7 +329,7 @@ export default function AdminUsersPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
           <div role="dialog" aria-modal="true" aria-labelledby="clear-trade-logs-title" className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
             <h2 id="clear-trade-logs-title" className="text-lg font-semibold text-white">Clear trade logs for {pendingClearLogs.username}?</h2>
-            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently removes this user&apos;s P&amp;L trade history and saved backtest runs. Open positions and active broker orders must be resolved first. This action cannot be undone.</p>
+            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently removes this user&apos;s closed P&amp;L trade history and saved backtest runs. Open positions and active broker orders are preserved. This action cannot be undone.</p>
             <div className="mt-6 flex justify-end gap-3">
               <button type="button" disabled={Boolean(clearingLogsUser)} onClick={() => setPendingClearLogs(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
               <button type="button" disabled={Boolean(clearingLogsUser)} onClick={confirmClearLogs} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{clearingLogsUser ? "Clearing..." : "Clear trade logs"}</button>
