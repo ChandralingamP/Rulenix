@@ -65,8 +65,8 @@ export default function AdminDailyTradesPage() {
         {[
           ["Total trades", report?.total_trades ?? 0],
           ["Users who traded", activeUsers],
-          ["Demo trades", report?.demo_trades ?? 0],
-          ["Live trades", report?.live_trades ?? 0],
+          ["P&L trades", report?.pnl_trades ?? 0],
+          ["Backtest trades", report?.backtest_trades ?? 0],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-4">
             <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
@@ -84,15 +84,17 @@ export default function AdminDailyTradesPage() {
           <div className="px-5 py-10 text-center text-sm text-slate-400">Loading trade report...</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-[720px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
+            <table className="min-w-[900px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
               <thead className="bg-slate-950/50 text-xs uppercase tracking-wide text-slate-500">
-                <tr><th className="px-5 py-3">User</th><th className="px-4 py-3 text-right">Total</th><th className="px-4 py-3 text-right">Demo</th><th className="px-4 py-3 text-right">Live</th><th className="px-4 py-3 text-right">Open</th><th className="px-5 py-3 text-right">Closed</th></tr>
+                <tr><th className="px-5 py-3">User</th><th className="px-4 py-3 text-right">Total</th><th className="px-4 py-3 text-right">P&amp;L</th><th className="px-4 py-3 text-right">Backtest</th><th className="px-4 py-3 text-right">Demo</th><th className="px-4 py-3 text-right">Live</th><th className="px-4 py-3 text-right">Open</th><th className="px-5 py-3 text-right">Closed</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
                 {(report?.users || []).map((user) => (
                   <tr key={user.user_id} className={user.total_trades === 0 ? "text-slate-500" : ""}>
                     <td className="px-5 py-4 font-semibold text-white">{user.username}</td>
                     <td className="px-4 py-4 text-right font-semibold">{user.total_trades}</td>
+                    <td className="px-4 py-4 text-right">{user.pnl_trades}</td>
+                    <td className="px-4 py-4 text-right">{user.backtest_trades}</td>
                     <td className="px-4 py-4 text-right">{user.demo_trades}</td>
                     <td className="px-4 py-4 text-right">{user.live_trades}</td>
                     <td className="px-4 py-4 text-right">{user.open_trades}</td>

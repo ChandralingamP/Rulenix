@@ -103,6 +103,8 @@ pub struct DailyUserTrades {
     pub user_id: Uuid,
     pub username: String,
     pub total_trades: i64,
+    pub pnl_trades: i64,
+    pub backtest_trades: i64,
     pub demo_trades: i64,
     pub live_trades: i64,
     pub open_trades: i64,
@@ -934,18 +936,52 @@ pub async fn daily_trade_report(
         .date
         .unwrap_or_else(|| Utc::now().with_timezone(&ist).date_naive());
     let users: Vec<DailyUserTrades> = sqlx::query_as(
-        "SELECT u.id AS user_id,u.username,COUNT(t.id)::bigint AS total_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='demo')::bigint AS demo_trades,COUNT(t.id) FILTER (WHERE t.execution_mode='live')::bigint AS live_trades,COUNT(t.id) FILTER (WHERE t.status='open')::bigint AS open_trades,COUNT(t.id) FILTER (WHERE t.status='closed')::bigint AS closed_trades FROM users u LEFT JOIN trades t ON t.user_id=u.id AND (t.entry_datetime AT TIME ZONE 'Asia/Kolkata')::date=$1 GROUP BY u.id,u.username ORDER BY COUNT(t.id) DESC,u.username",
+        "WITH pnl_counts AS (
+            SELECT user_id,
+                   COUNT(*)::bigint AS pnl_trades,
+                   COUNT(*) FILTER (WHERE execution_mode='demo')::bigint AS demo_trades,
+                   COUNT(*) FILTER (WHERE execution_mode='live')::bigint AS live_trades,
+                   COUNT(*) FILTER (WHERE status='open')::bigint AS open_trades,
+                   COUNT(*) FILTER (WHERE status='closed')::bigint AS closed_trades
+            FROM trades
+            WHERE (entry_datetime AT TIME ZONE 'Asia/Kolkata')::date=$1
+            GROUP BY user_id
+        ),
+        backtest_counts AS (
+            SELECT run.user_id,COUNT(trade.id)::bigint AS backtest_trades
+            FROM backtest_runs run
+            JOIN backtest_trades trade ON trade.run_id=run.id
+            WHERE (trade.entry_time AT TIME ZONE 'Asia/Kolkata')::date=$1
+            GROUP BY run.user_id
+        )
+        SELECT u.id AS user_id,
+               u.username,
+               (COALESCE(p.pnl_trades,0)+COALESCE(b.backtest_trades,0))::bigint AS total_trades,
+               COALESCE(p.pnl_trades,0)::bigint AS pnl_trades,
+               COALESCE(b.backtest_trades,0)::bigint AS backtest_trades,
+               COALESCE(p.demo_trades,0)::bigint AS demo_trades,
+               COALESCE(p.live_trades,0)::bigint AS live_trades,
+               COALESCE(p.open_trades,0)::bigint AS open_trades,
+               COALESCE(p.closed_trades,0)::bigint AS closed_trades
+        FROM users u
+        LEFT JOIN pnl_counts p ON p.user_id=u.id
+        LEFT JOIN backtest_counts b ON b.user_id=u.id
+        ORDER BY (COALESCE(p.pnl_trades,0)+COALESCE(b.backtest_trades,0)) DESC,u.username",
     )
     .bind(date)
     .fetch_all(&state.db)
     .await?;
     let total_trades: i64 = users.iter().map(|user| user.total_trades).sum();
+    let pnl_trades: i64 = users.iter().map(|user| user.pnl_trades).sum();
+    let backtest_trades: i64 = users.iter().map(|user| user.backtest_trades).sum();
     let demo_trades: i64 = users.iter().map(|user| user.demo_trades).sum();
     let live_trades: i64 = users.iter().map(|user| user.live_trades).sum();
     Ok(Json(json!({
         "date":date,
         "timezone":"Asia/Kolkata",
         "total_trades":total_trades,
+        "pnl_trades":pnl_trades,
+        "backtest_trades":backtest_trades,
         "demo_trades":demo_trades,
         "live_trades":live_trades,
         "users":users
@@ -1141,7 +1177,18 @@ pub async fn clear_user_trade_logs(
             "Trade logs cannot be cleared while this account has an open position or active broker order.".into(),
         ));
     }
-    let deleted = sqlx::query("DELETE FROM trades WHERE user_id=$1")
+    let deleted_trades = sqlx::query("DELETE FROM trades WHERE user_id=$1")
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let deleted_backtest_trades: i64 = sqlx::query_scalar(
+        "SELECT COUNT(trade.id)::bigint FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id WHERE run.user_id=$1",
+    )
+    .bind(target_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let deleted_backtest_runs = sqlx::query("DELETE FROM backtest_runs WHERE user_id=$1")
         .bind(target_id)
         .execute(&mut *tx)
         .await?
@@ -1158,7 +1205,7 @@ pub async fn clear_user_trade_logs(
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
             summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":deleted}),
+            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades}),
         },
     )
     .await
@@ -1168,7 +1215,9 @@ pub async fn clear_user_trade_logs(
     Ok(Json(json!({
         "detail":"Trade logs cleared successfully.",
         "username":username,
-        "deleted_trades":deleted
+        "deleted_trades":deleted_trades,
+        "deleted_backtest_runs":deleted_backtest_runs,
+        "deleted_backtest_trades":deleted_backtest_trades
     })))
 }
 
