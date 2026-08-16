@@ -1075,10 +1075,11 @@ fn sensex_option_candidates(
             })
         })
         .collect();
-    let Some(nearest_expiry) = candidates.iter().map(|contract| contract.expiry).min() else {
-        return Vec::new();
-    };
-    candidates.retain(|contract| contract.expiry == nearest_expiry);
+    candidates.sort_by(|left, right| {
+        left.expiry
+            .cmp(&right.expiry)
+            .then_with(|| left.strike.total_cmp(&right.strike))
+    });
     candidates
 }
 
@@ -1153,10 +1154,11 @@ fn supertrend_option_candidates(
             })
         })
         .collect();
-    let Some(nearest_expiry) = candidates.iter().map(|contract| contract.expiry).min() else {
-        return Vec::new();
-    };
-    candidates.retain(|contract| contract.expiry == nearest_expiry);
+    candidates.sort_by(|left, right| {
+        left.expiry
+            .cmp(&right.expiry)
+            .then_with(|| left.strike.total_cmp(&right.strike))
+    });
     candidates
 }
 
@@ -1281,6 +1283,54 @@ fn quote_ltp_for_token(value: &Value, token: &str) -> Option<f64> {
     extract_quote_ltps(value).get(token).copied()
 }
 
+async fn quote_option_premiums(
+    state: &AppState,
+    exchange: &str,
+    candidates: &[OptionContract],
+) -> AppResult<HashMap<String, f64>> {
+    let mut premiums = HashMap::new();
+    for chunk in candidates.chunks(50) {
+        let tokens: Vec<String> = chunk
+            .iter()
+            .map(|contract| contract.token.clone())
+            .collect();
+        match shared_market_quote(state, "LTP", json!({exchange:tokens})).await {
+            Ok(quote) => premiums.extend(extract_quote_ltps(&quote)),
+            Err(error)
+                if tokens.len() > 1 && angel::is_contract_unavailable_error(&error.to_string()) =>
+            {
+                for token in tokens {
+                    match shared_market_quote(state, "LTP", json!({exchange:[token.clone()]})).await
+                    {
+                        Ok(quote) => premiums.extend(extract_quote_ltps(&quote)),
+                        Err(error) if angel::is_contract_unavailable_error(&error.to_string()) => {
+                            tracing::warn!(
+                                exchange,
+                                token,
+                                error = %error,
+                                "skipping unavailable option contract token"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error) if angel::is_contract_unavailable_error(&error.to_string()) => {
+                for token in tokens {
+                    tracing::warn!(
+                        exchange,
+                        token,
+                        error = %error,
+                        "skipping unavailable option contract token"
+                    );
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(premiums)
+}
+
 fn collect_quote_opens(value: &Value, prices: &mut HashMap<String, f64>) {
     match value {
         Value::Array(values) => {
@@ -1318,32 +1368,37 @@ async fn select_sensex_option_contract(
     date: NaiveDate,
     option_type: &'static str,
     underlying_ltp: f64,
+    excluded_tokens: &HashSet<String>,
 ) -> AppResult<Option<OptionContract>> {
     let mut candidates = sensex_option_candidates(contracts, date, option_type);
+    candidates.retain(|contract| !excluded_tokens.contains(&contract.token));
     candidates.sort_by(|left, right| {
-        (left.strike - underlying_ltp)
-            .abs()
-            .total_cmp(&(right.strike - underlying_ltp).abs())
+        left.expiry.cmp(&right.expiry).then_with(|| {
+            (left.strike - underlying_ltp)
+                .abs()
+                .total_cmp(&(right.strike - underlying_ltp).abs())
+        })
     });
     if candidates.is_empty() {
         return Ok(None);
     }
 
-    let mut premiums = HashMap::new();
-    for chunk in candidates.chunks(50) {
-        let tokens: Vec<String> = chunk
+    let mut expiries: Vec<NaiveDate> = candidates.iter().map(|contract| contract.expiry).collect();
+    expiries.sort();
+    expiries.dedup();
+    for expiry in expiries {
+        let bucket: Vec<OptionContract> = candidates
             .iter()
-            .map(|contract| contract.token.clone())
+            .filter(|contract| contract.expiry == expiry)
+            .cloned()
             .collect();
-        let quote = shared_market_quote(state, "LTP", json!({"BFO":tokens})).await?;
-        premiums.extend(extract_quote_ltps(&quote));
+        let premiums = quote_option_premiums(state, "BFO", &bucket).await?;
+        if let Some(contract) = choose_premium_contract(&bucket, &premiums, underlying_ltp) {
+            return Ok(Some(contract));
+        }
     }
 
-    Ok(choose_premium_contract(
-        &candidates,
-        &premiums,
-        underlying_ltp,
-    ))
+    Ok(None)
 }
 
 fn find_quote_ltp(value: &Value) -> Option<f64> {
@@ -2228,9 +2283,15 @@ async fn ensure_sensex_option_contract_metadata(
     date: NaiveDate,
 ) -> AppResult<()> {
     let contracts = load_contract_master(state).await?;
-    let Some((expiry, lot_size)) = sensex_option_expiry_preview(&contracts, date) else {
+    let mut preview = sensex_option_expiry_preview(&contracts, date);
+    if preview.is_none() {
+        contract_master::invalidate_cache().await;
+        let refreshed = load_contract_master(state).await?;
+        preview = sensex_option_expiry_preview(&refreshed, date);
+    }
+    let Some((expiry, lot_size)) = preview else {
         return Err(AppError::BadRequest(format!(
-            "No current BFO SENSEX option expiry is available in Angel One contract master for {date}."
+            "No current BFO SENSEX option expiry is available in the refreshed Angel One contract master for {date}."
         )));
     };
     tracing::debug!(
@@ -2239,6 +2300,40 @@ async fn ensure_sensex_option_contract_metadata(
         lot_size,
         "SENSEX option contract metadata warmed"
     );
+    Ok(())
+}
+
+async fn ensure_supertrend_option_contract_metadata(
+    state: &AppState,
+    date: NaiveDate,
+) -> AppResult<()> {
+    let mut contracts = load_contract_master(state).await?;
+    let mut refreshed = false;
+    for instrument in ["SENSEX", "NIFTY"] {
+        let Some(config) = index_option_config(instrument) else {
+            continue;
+        };
+        let mut preview = supertrend_option_expiry_preview(&contracts, config, date);
+        if preview.is_none() && !refreshed {
+            contract_master::invalidate_cache().await;
+            contracts = load_contract_master(state).await?;
+            refreshed = true;
+            preview = supertrend_option_expiry_preview(&contracts, config, date);
+        }
+        let Some((expiry, lot_size)) = preview else {
+            return Err(AppError::BadRequest(format!(
+                "No current {} option expiry is available in the refreshed Angel One contract master for {date}.",
+                config.label
+            )));
+        };
+        tracing::debug!(
+            %date,
+            %expiry,
+            lot_size,
+            instrument = config.instrument,
+            "SuperTrend option contract metadata warmed"
+        );
+    }
     Ok(())
 }
 
@@ -2270,25 +2365,75 @@ async fn select_supertrend_atm_option_contract(
     date: NaiveDate,
     side: IndexOptionSide,
     underlying_ltp: f64,
+    excluded_tokens: &HashSet<String>,
 ) -> AppResult<Option<OptionContract>> {
-    let candidates = supertrend_option_candidates(contracts, config, date, side);
-    let Some(mut selected) = choose_atm_contract(&candidates, underlying_ltp) else {
+    let mut candidates = supertrend_option_candidates(contracts, config, date, side);
+    candidates.retain(|contract| !excluded_tokens.contains(&contract.token));
+    candidates.sort_by(|left, right| {
+        left.expiry
+            .cmp(&right.expiry)
+            .then_with(|| {
+                (left.strike - underlying_ltp)
+                    .abs()
+                    .total_cmp(&(right.strike - underlying_ltp).abs())
+            })
+            .then_with(|| left.strike.total_cmp(&right.strike))
+    });
+    if candidates.is_empty() {
         return Ok(None);
-    };
-    let quote = shared_market_quote(
-        state,
-        "LTP",
-        json!({config.option_exchange:[selected.token.clone()]}),
-    )
-    .await?;
-    selected.premium = quote_ltp_for_token(&quote, &selected.token).ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "Angel One {} {} ATM option quote did not include contract-token LTP.",
-            config.instrument,
-            side.option_type()
-        ))
-    })?;
-    Ok(Some(selected))
+    }
+
+    let mut expiries: Vec<NaiveDate> = candidates.iter().map(|contract| contract.expiry).collect();
+    expiries.sort();
+    expiries.dedup();
+    for expiry in expiries {
+        let mut bucket: Vec<OptionContract> = candidates
+            .iter()
+            .filter(|contract| contract.expiry == expiry)
+            .cloned()
+            .collect();
+        bucket.sort_by(|left, right| {
+            (left.strike - underlying_ltp)
+                .abs()
+                .total_cmp(&(right.strike - underlying_ltp).abs())
+                .then_with(|| left.strike.total_cmp(&right.strike))
+        });
+        for mut selected in bucket {
+            match shared_market_quote(
+                state,
+                "LTP",
+                json!({config.option_exchange:[selected.token.clone()]}),
+            )
+            .await
+            {
+                Ok(quote) => {
+                    if let Some(premium) = quote_ltp_for_token(&quote, &selected.token) {
+                        selected.premium = premium;
+                        return Ok(Some(selected));
+                    }
+                    tracing::warn!(
+                        instrument = config.instrument,
+                        option_type = side.option_type(),
+                        token = %selected.token,
+                        symbol = %selected.symbol,
+                        "skipping ATM option candidate without contract-token LTP"
+                    );
+                }
+                Err(error) if angel::is_contract_unavailable_error(&error.to_string()) => {
+                    tracing::warn!(
+                        instrument = config.instrument,
+                        option_type = side.option_type(),
+                        token = %selected.token,
+                        symbol = %selected.symbol,
+                        error = %error,
+                        "skipping unavailable ATM option candidate"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2303,17 +2448,39 @@ async fn supertrend_option_snapshot_for_signal(
     stop_loss_points: f64,
 ) -> AppResult<(Snapshot, f64, f64)> {
     let underlying = index_ltp(state, config).await?;
+    let excluded_tokens = HashSet::new();
     let contracts = load_contract_master(state).await?;
-    let contract =
-        select_supertrend_atm_option_contract(state, &contracts, config, date, side, underlying)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "No {} {} ATM option contract is available for {date}.",
-                    config.instrument,
-                    side.option_type(),
-                ))
-            })?;
+    let mut contract = select_supertrend_atm_option_contract(
+        state,
+        &contracts,
+        config,
+        date,
+        side,
+        underlying,
+        &excluded_tokens,
+    )
+    .await?;
+    if contract.is_none() {
+        contract_master::invalidate_cache().await;
+        let refreshed = load_contract_master(state).await?;
+        contract = select_supertrend_atm_option_contract(
+            state,
+            &refreshed,
+            config,
+            date,
+            side,
+            underlying,
+            &excluded_tokens,
+        )
+        .await?;
+    }
+    let contract = contract.ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "No {} {} ATM option contract is available for {date}; Rulenix refreshed the Angel One contract master and could not find a quoteable contract.",
+            config.instrument,
+            side.option_type(),
+        ))
+    })?;
     risk::record_tick(
         state,
         config.option_exchange,
@@ -2394,21 +2561,36 @@ async fn option_snapshot_for_signal(
     date: NaiveDate,
 ) -> AppResult<(Snapshot, f64)> {
     let underlying = sensex_ltp(state).await?;
+    let excluded_tokens = HashSet::new();
     let contracts = load_contract_master(state).await?;
-    let contract = select_sensex_option_contract(
+    let mut contract = select_sensex_option_contract(
         state,
         &contracts,
         date,
         side.option_type(),
         underlying,
+        &excluded_tokens,
     )
-    .await?
-    .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "No BFO SENSEX {} option contract with premium between Rs. {OPTION_MIN_PREMIUM:.0} and Rs. {OPTION_MAX_PREMIUM:.0} is available for {date}.",
-                side.option_type(),
-            ))
-        })?;
+    .await?;
+    if contract.is_none() {
+        contract_master::invalidate_cache().await;
+        let refreshed = load_contract_master(state).await?;
+        contract = select_sensex_option_contract(
+            state,
+            &refreshed,
+            date,
+            side.option_type(),
+            underlying,
+            &excluded_tokens,
+        )
+        .await?;
+    }
+    let contract = contract.ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "No BFO SENSEX {} option contract with premium between Rs. {OPTION_MIN_PREMIUM:.0} and Rs. {OPTION_MAX_PREMIUM:.0} is available for {date}; Rulenix refreshed the Angel One contract master and could not find a quoteable contract.",
+            side.option_type(),
+        ))
+    })?;
     risk::record_tick(state, "BFO", &contract.token, contract.premium).await?;
     let id = Uuid::new_v4();
     let instrument = side.instrument();
@@ -2449,6 +2631,189 @@ async fn option_snapshot_for_signal(
     )
     .await;
     Ok((snapshot, contract.premium))
+}
+
+async fn option_entry_retry_snapshot(
+    state: &AppState,
+    original: &Snapshot,
+    user_id: Uuid,
+) -> AppResult<Option<(Snapshot, f64)>> {
+    let Some(side) = OptionSide::from_instrument(&original.instrument) else {
+        return Ok(None);
+    };
+    let old_token = original.contract_token.clone().unwrap_or_default();
+    let mut excluded_tokens = HashSet::new();
+    if !old_token.trim().is_empty() {
+        excluded_tokens.insert(old_token);
+    }
+    contract_master::invalidate_cache().await;
+    let underlying = sensex_ltp(state).await?;
+    let contracts = load_contract_master(state).await?;
+    let Some(contract) = select_sensex_option_contract(
+        state,
+        &contracts,
+        original.trade_date,
+        side.option_type(),
+        underlying,
+        &excluded_tokens,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    risk::record_tick(state, "BFO", &contract.token, contract.premium).await?;
+    let execution_key = format!(
+        "{}-retry-{}",
+        contract.symbol,
+        &user_id.simple().to_string()[..8]
+    );
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,buy_entry,buy_target,buy_sl1,sell_entry,sell_target,sell_sl1,previous_close,fetched_at) VALUES ($1,$2,$3,$4,'ready','',$5,$6,$7,$8,'BFO',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error='',contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment='BFO',product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,buy_entry=EXCLUDED.buy_entry,buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,sell_entry=EXCLUDED.sell_entry,sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,previous_close=EXCLUDED.previous_close,fetched_at=NOW()")
+        .bind(id)
+        .bind(OPTION_ENTRY_STRATEGY_KEY)
+        .bind(&original.instrument)
+        .bind(original.trade_date)
+        .bind(&contract.token)
+        .bind(&contract.symbol)
+        .bind(contract.expiry)
+        .bind(contract.lot_size)
+        .bind(OPTION_PRODUCT_TYPE)
+        .bind(&execution_key)
+        .bind(SENSEX_INDEX_TOKEN)
+        .bind(original.buy_entry)
+        .bind(original.buy_target)
+        .bind(original.buy_sl1)
+        .bind(original.sell_entry)
+        .bind(original.sell_target)
+        .bind(original.sell_sl1)
+        .bind(underlying)
+        .execute(&state.db)
+        .await?;
+    let query = format!(
+        "{} WHERE strategy_key=$1 AND instrument=$2 AND trade_date=$3 AND execution_key=$4",
+        snapshot_select()
+    );
+    let snapshot = sqlx::query_as(&query)
+        .bind(OPTION_ENTRY_STRATEGY_KEY)
+        .bind(&original.instrument)
+        .bind(original.trade_date)
+        .bind(&execution_key)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Some((snapshot, contract.premium)))
+}
+
+async fn supertrend_retry_snapshot(
+    state: &AppState,
+    original: &Snapshot,
+    user_id: Uuid,
+) -> AppResult<Option<(Snapshot, f64)>> {
+    let Some(underlying_name) = supertrend_snapshot_underlying(&original.instrument) else {
+        return Ok(None);
+    };
+    let Some(config) = index_option_config(underlying_name) else {
+        return Ok(None);
+    };
+    let Some(side) = supertrend_snapshot_side(&original.instrument) else {
+        return Ok(None);
+    };
+    let Some((target_points, stop_loss_points)) = supertrend_config_points(original) else {
+        return Ok(None);
+    };
+    let old_token = original.contract_token.clone().unwrap_or_default();
+    let mut excluded_tokens = HashSet::new();
+    if !old_token.trim().is_empty() {
+        excluded_tokens.insert(old_token);
+    }
+    contract_master::invalidate_cache().await;
+    let underlying = index_ltp(state, config).await?;
+    let contracts = load_contract_master(state).await?;
+    let Some(contract) = select_supertrend_atm_option_contract(
+        state,
+        &contracts,
+        config,
+        original.trade_date,
+        side,
+        underlying,
+        &excluded_tokens,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    risk::record_tick(
+        state,
+        config.option_exchange,
+        &contract.token,
+        contract.premium,
+    )
+    .await?;
+    let id = Uuid::new_v4();
+    let execution_key = format!(
+        "{}-retry-{}",
+        contract.symbol,
+        &user_id.simple().to_string()[..8]
+    );
+    let (buy_target, buy_sl1, sell_target, sell_sl1) = match side {
+        IndexOptionSide::Call => (
+            Some(target_points),
+            Some(stop_loss_points),
+            None::<f64>,
+            None::<f64>,
+        ),
+        IndexOptionSide::Put => (
+            None::<f64>,
+            None::<f64>,
+            Some(target_points),
+            Some(stop_loss_points),
+        ),
+    };
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token,buy_target,buy_sl1,sell_target,sell_sl1,previous_close,fetched_at) VALUES ($1,$2,$3,$4,'ready','',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status='ready',error='',contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,exchange_segment=EXCLUDED.exchange_segment,product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,previous_close=EXCLUDED.previous_close,fetched_at=NOW()")
+        .bind(id)
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .bind(&original.instrument)
+        .bind(original.trade_date)
+        .bind(&contract.token)
+        .bind(&contract.symbol)
+        .bind(contract.expiry)
+        .bind(contract.lot_size)
+        .bind(config.option_exchange)
+        .bind(OPTION_PRODUCT_TYPE)
+        .bind(&execution_key)
+        .bind(config.index_token)
+        .bind(buy_target)
+        .bind(buy_sl1)
+        .bind(sell_target)
+        .bind(sell_sl1)
+        .bind(underlying)
+        .execute(&state.db)
+        .await?;
+    let query = format!(
+        "{} WHERE strategy_key=$1 AND instrument=$2 AND trade_date=$3 AND execution_key=$4",
+        snapshot_select()
+    );
+    let snapshot = sqlx::query_as(&query)
+        .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+        .bind(&original.instrument)
+        .bind(original.trade_date)
+        .bind(&execution_key)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Some((snapshot, contract.premium)))
+}
+
+async fn option_entry_retry_contract_snapshot(
+    state: &AppState,
+    snapshot: &Snapshot,
+    user_id: Uuid,
+) -> AppResult<Option<(Snapshot, f64)>> {
+    match snapshot.strategy_key.as_str() {
+        OPTION_ENTRY_STRATEGY_KEY => option_entry_retry_snapshot(state, snapshot, user_id).await,
+        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY => {
+            supertrend_retry_snapshot(state, snapshot, user_id).await
+        }
+        _ => Ok(None),
+    }
 }
 
 async fn sensex_index_candles(
@@ -3041,9 +3406,55 @@ pub(crate) async fn place_strategy_order(
         {
             Ok(estimate) => estimate.margin_required,
             Err(error)
-                if snapshot.strategy_key == STRATEGY_KEY
+                if !protective
+                    && matches!(
+                        snapshot.strategy_key.as_str(),
+                        STRATEGY_KEY
+                            | OPTION_ENTRY_STRATEGY_KEY
+                            | SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+                    )
+                    && !session.contains(":oroll")
                     && angel::is_contract_unavailable_error(&error.to_string()) =>
             {
+                if snapshot.strategy_key != STRATEGY_KEY
+                    && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY")
+                    && let Some((refreshed_snapshot, refreshed_price)) =
+                        option_entry_retry_contract_snapshot(state, snapshot, runner.user_id)
+                            .await?
+                {
+                    let retry_session = session_with_suffix(session, "oroll");
+                    let mut retry_order = order.clone();
+                    retry_order.price = refreshed_price;
+                    retry_order.trigger = None;
+                    operational_alert_for(
+                        state,
+                        &snapshot.strategy_key,
+                        Some(runner.user_id),
+                        &runner.instrument,
+                        "option_contract_rolled_forward",
+                        "warning",
+                        &format!(
+                            "{} was unavailable for broker margin calculation, so Rulenix refreshed the contract master and is retrying with {}.",
+                            symbol,
+                            refreshed_snapshot
+                                .contract_symbol
+                                .as_deref()
+                                .unwrap_or("a fresh option contract")
+                        ),
+                    )
+                    .await;
+                    return Box::pin(place_strategy_order(
+                        state,
+                        runner,
+                        &refreshed_snapshot,
+                        &retry_session,
+                        retry_order,
+                    ))
+                    .await;
+                }
+                if snapshot.strategy_key != STRATEGY_KEY {
+                    return Err(error);
+                }
                 if let Some(refreshed_snapshot) = force_refresh_futures_contract_snapshot(
                     state,
                     &snapshot.instrument,
@@ -3051,7 +3462,7 @@ pub(crate) async fn place_strategy_order(
                 )
                 .await?
                 {
-                    let retry_session = format!("{session}:contract-roll");
+                    let retry_session = session_with_suffix(session, "croll");
                     operational_alert_for(
                         state,
                         &snapshot.strategy_key,
@@ -3335,7 +3746,12 @@ pub(crate) async fn place_strategy_order(
         }
         Err(error) => {
             let contract_unavailable = !protective
-                && snapshot.strategy_key == STRATEGY_KEY
+                && matches!(
+                    snapshot.strategy_key.as_str(),
+                    STRATEGY_KEY
+                        | OPTION_ENTRY_STRATEGY_KEY
+                        | SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+                )
                 && angel::is_contract_unavailable_error(&format!("{} {}", error, error.diagnostic));
             let status = if angel::may_retry_submission(error.class)
                 || error.class == angel::BrokerErrorClass::Authentication
@@ -3373,7 +3789,66 @@ pub(crate) async fn place_strategy_order(
                 ),
             )
             .await;
-            if contract_unavailable {
+            if contract_unavailable && !session.contains(":oroll") {
+                if snapshot.strategy_key != STRATEGY_KEY
+                    && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY")
+                    && let Some((refreshed_snapshot, refreshed_price)) =
+                        option_entry_retry_contract_snapshot(state, snapshot, runner.user_id)
+                            .await?
+                {
+                    let retry_session = session_with_suffix(session, "oroll");
+                    let mut retry_order = order.clone();
+                    retry_order.price = refreshed_price;
+                    retry_order.trigger = None;
+                    operational_alert_for(
+                        state,
+                        &snapshot.strategy_key,
+                        Some(runner.user_id),
+                        &runner.instrument,
+                        "option_contract_rolled_forward",
+                        "warning",
+                        &format!(
+                            "{} was unavailable at Angel One, so Rulenix refreshed the contract master and is retrying with {}.",
+                            symbol,
+                            refreshed_snapshot
+                                .contract_symbol
+                                .as_deref()
+                                .unwrap_or("a fresh option contract")
+                        ),
+                    )
+                    .await;
+                    return Box::pin(place_strategy_order(
+                        state,
+                        runner,
+                        &refreshed_snapshot,
+                        &retry_session,
+                        retry_order,
+                    ))
+                    .await;
+                }
+                if snapshot.strategy_key != STRATEGY_KEY {
+                    operational_alert_for(
+                        state,
+                        &snapshot.strategy_key,
+                        Some(runner.user_id),
+                        &runner.instrument,
+                        "option_contract_roll_forward_unavailable",
+                        "error",
+                        "Angel One rejected the selected option contract, and the refreshed contract master did not provide another quoteable contract.",
+                    )
+                    .await;
+                    return Err(match error.class {
+                        angel::BrokerErrorClass::Authentication => {
+                            AppError::Unauthorized(error.to_string())
+                        }
+                        angel::BrokerErrorClass::Rejected => {
+                            AppError::BadRequest(error.to_string())
+                        }
+                        angel::BrokerErrorClass::Retryable | angel::BrokerErrorClass::Ambiguous => {
+                            AppError::BadRequest(error.to_string())
+                        }
+                    });
+                }
                 match force_refresh_futures_contract_snapshot(
                     state,
                     &snapshot.instrument,
@@ -3382,7 +3857,7 @@ pub(crate) async fn place_strategy_order(
                 .await
                 {
                     Ok(Some(refreshed_snapshot)) => {
-                        let retry_session = format!("{session}:contract-roll");
+                        let retry_session = session_with_suffix(session, "croll");
                         operational_alert_for(
                             state,
                             &snapshot.strategy_key,
@@ -3910,6 +4385,20 @@ async fn close_supertrend_open_trades_for_side(
                 continue;
             }
         };
+        if snapshot
+            .contract_expiry
+            .is_some_and(|expiry| option_expiry_checkpoint_due(expiry, now))
+        {
+            tracing::info!(
+                %trade_id,
+                user_id=%runner.user_id,
+                instrument=%instrument,
+                contract=?snapshot.contract_symbol,
+                expiry=?snapshot.contract_expiry,
+                "deferring expired SuperTrend reversal square-off to expiry checkpoint"
+            );
+            continue;
+        }
         let price = match option_execution_ltp(state, &snapshot).await {
             Ok(price) => price,
             Err(error) => {
@@ -4717,6 +5206,20 @@ async fn process_supertrend_square_off(
             .bind(snapshot_id)
             .fetch_one(&state.db)
             .await?;
+        if snapshot
+            .contract_expiry
+            .is_some_and(|expiry| option_expiry_checkpoint_due(expiry, now))
+        {
+            tracing::info!(
+                %trade_id,
+                user_id=%user_id,
+                instrument=%instrument,
+                contract=?snapshot.contract_symbol,
+                expiry=?snapshot.contract_expiry,
+                "deferring expired SuperTrend trade to expiry checkpoint"
+            );
+            continue;
+        }
         let price = match option_execution_ltp(state, &snapshot).await {
             Ok(price) => price,
             Err(error) => {
@@ -5427,6 +5930,21 @@ pub fn start(state: AppState) {
             )
             .await;
         }
+        if let Err(error) = ensure_supertrend_option_contract_metadata(&state, startup_date).await {
+            tracing::warn!(%error, "startup SuperTrend option contract metadata failed");
+            operational_alert_for(
+                &state,
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                None,
+                "",
+                "supertrend_contract_metadata_failed",
+                "error",
+                &format!(
+                    "SuperTrend option contract metadata refresh failed and will retry: {error}"
+                ),
+            )
+            .await;
+        }
         let mut timer = interval(std::time::Duration::from_secs(5));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut dispatched = HashSet::new();
@@ -5500,6 +6018,32 @@ pub fn start(state: AppState) {
                             "error",
                             &format!(
                                 "SENSEX option contract metadata refresh failed and will retry: {error}"
+                            ),
+                        )
+                        .await;
+                    }
+                });
+            }
+            if dispatched.insert(format!(
+                "{date}:supertrend-option-contracts:{}:{}",
+                now.hour(),
+                now.minute() / 5
+            )) {
+                let cloned = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        ensure_supertrend_option_contract_metadata(&cloned, date).await
+                    {
+                        tracing::warn!(%error, "daily SuperTrend option contract metadata failed");
+                        operational_alert_for(
+                            &cloned,
+                            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                            None,
+                            "",
+                            "supertrend_contract_metadata_failed",
+                            "error",
+                            &format!(
+                                "SuperTrend option contract metadata refresh failed and will retry: {error}"
                             ),
                         )
                         .await;
@@ -5681,6 +6225,12 @@ pub async fn admin_reload(state: &AppState) -> AppResult<Value> {
             }
         }
         Err(error) => snapshot_errors.push(format!("contract metadata: {error}")),
+    }
+    if let Err(error) = ensure_sensex_option_contract_metadata(state, date).await {
+        snapshot_errors.push(format!("SENSEX option metadata: {error}"));
+    }
+    if let Err(error) = ensure_supertrend_option_contract_metadata(state, date).await {
+        snapshot_errors.push(format!("SuperTrend option metadata: {error}"));
     }
 
     let due_runs: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
@@ -6558,6 +7108,16 @@ fn runtime_pnl_units(instrument: &str, quantity: i32, lot_size: Option<i32>) -> 
 
 fn supertrend_protection_session_key(entry_session_key: &str) -> String {
     format!("{}:p", entry_session_key)
+}
+
+fn session_with_suffix(session: &str, suffix: &str) -> String {
+    let suffix = suffix.trim_matches(':');
+    if suffix.is_empty() {
+        return session.chars().take(32).collect();
+    }
+    let max_base = 32_usize.saturating_sub(suffix.len() + 1);
+    let base: String = session.chars().take(max_base).collect();
+    format!("{base}:{suffix}")
 }
 
 fn required_exit_level(value: Option<f64>, label: &str) -> AppResult<f64> {
@@ -7487,6 +8047,7 @@ async fn complete_option_entry_order(
         .execute(&mut *fill_tx)
         .await?;
     fill_tx.commit().await?;
+    crate::notifications::notify_trade_opened(state.clone(), trade_id);
     emit_for(
         state,
         strategy_key,
@@ -7749,6 +8310,7 @@ async fn complete_claimed_order(state: &AppState, order: StoredOrder, fill: f64)
                     .await?;
             }
             fill_tx.commit().await?;
+            crate::notifications::notify_trade_opened(state.clone(), trade_id);
             if let Err(error) = cancel_active_breakout_entry_orders(
                 state,
                 order.user_id,

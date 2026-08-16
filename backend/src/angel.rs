@@ -783,8 +783,10 @@ pub fn is_contract_unavailable_error(message: &str) -> bool {
         "symboltoken",
         "token not found",
         "invalid token for symbol",
+        "invalid token for instrument",
         "invalid symbol",
         "symbol not found",
+        "instrument not found",
         "trading symbol not found",
         "scrip not found",
         "script not found",
@@ -796,6 +798,9 @@ pub fn is_contract_unavailable_error(message: &str) -> bool {
         "not enabled for trading",
         "not available for trading",
         "security is not allowed",
+        "scrip is not allowed",
+        "instrument is not allowed",
+        "not allowed in this segment",
     ]
     .iter()
     .any(|phrase| value.contains(phrase))

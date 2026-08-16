@@ -15,6 +15,7 @@ mod logs;
 mod margin;
 mod market_ws;
 mod models;
+mod notifications;
 mod ops;
 mod pnl;
 mod risk;
