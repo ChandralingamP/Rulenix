@@ -464,12 +464,12 @@ pub(crate) fn futures_exit_levels_for_entry(
     }
     let (target, sl1, sl2) = match direction {
         "BUY" => {
-            let main_stop = entry * (1.0 - 0.015);
+            let fallback_stop = entry * (1.0 - 0.015);
             let stop = |technical: f64| {
                 if technical < entry {
-                    main_stop.max(technical)
+                    technical
                 } else {
-                    main_stop
+                    fallback_stop
                 }
             };
             (
@@ -479,12 +479,12 @@ pub(crate) fn futures_exit_levels_for_entry(
             )
         }
         "SELL" => {
-            let main_stop = entry * (1.0 + 0.015);
+            let fallback_stop = entry * (1.0 + 0.015);
             let stop = |technical: f64| {
                 if technical > entry {
-                    main_stop.min(technical)
+                    technical
                 } else {
-                    main_stop
+                    fallback_stop
                 }
             };
             (
@@ -8914,6 +8914,19 @@ mod tests {
         assert_eq!(v.ll2, 93.0);
         assert!((v.buy_entry - 110.132).abs() < 1e-9);
         assert!((v.sell_entry - 89.892).abs() < 1e-9);
+    }
+
+    #[test]
+    fn buy_sl2_tracks_opposite_four_day_breakout_level() {
+        let v = calculate(
+            &[151_128.0, 152_100.0, 154_074.0, 154_450.0],
+            &[147_979.0, 150_001.0, 152_011.0, 152_971.0],
+        )
+        .unwrap();
+        assert!((v.buy_entry - 154_635.34).abs() < 1e-9);
+        assert!((v.buy_sl1 - 151_828.5868).abs() < 1e-9);
+        assert!((v.buy_sl2 - 147_801.4252).abs() < 1e-9);
+        assert!((v.buy_sl2 - v.sell_entry).abs() < 1e-9);
     }
 
     #[allow(clippy::too_many_arguments)]

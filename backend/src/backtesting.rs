@@ -2407,7 +2407,7 @@ mod tests {
                 5,
                 levels.buy_entry,
                 levels.buy_target + 0.1,
-                levels.buy_sl2 + 1.0,
+                levels.buy_sl1 + 1.0,
                 levels.buy_target,
             ),
             candle(
@@ -2463,7 +2463,8 @@ mod tests {
         let levels =
             calculate(&[170.0, 160.0, 150.0, 151.0], &[140.0, 141.0, 142.0, 143.0]).unwrap();
         let reversal = levels_for_entry_price(levels, "SELL", levels.buy_sl2).unwrap();
-        assert!(levels.sell_sl1 < levels.buy_sl2);
+        assert!((levels.buy_sl2 - levels.sell_entry).abs() < 1e-9);
+        assert!(levels.sell_sl1 > levels.buy_sl2);
         assert!(reversal.sell_sl1 > levels.buy_sl2);
         let intraday = vec![
             candle(
@@ -2477,7 +2478,7 @@ mod tests {
                 5,
                 levels.buy_entry,
                 levels.buy_target + 0.1,
-                levels.buy_sl2 + 1.0,
+                levels.buy_sl1 + 1.0,
                 levels.buy_target,
             ),
             candle(
