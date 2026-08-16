@@ -17,7 +17,7 @@ pub struct TriggerRequest {
     pub job_key: String,
 }
 
-const JOBS: [(&str, &str, &str, &str); 2] = [
+const JOBS: [(&str, &str, &str, &str); 3] = [
     (
         "cleanup_otps",
         "Clean expired OTPs",
@@ -29,6 +29,12 @@ const JOBS: [(&str, &str, &str, &str); 2] = [
         "Audit broker sessions",
         "Marks stale Angel One sessions for reconnection.",
         "Every 30 minutes",
+    ),
+    (
+        "strategy_reload",
+        "Reload strategy engine",
+        "Refreshes Futures Breakout contracts, snapshots, feed state, expiry checks, and stuck retries.",
+        "Manual admin recovery",
     ),
 ];
 
@@ -68,11 +74,25 @@ pub async fn trigger(
         .execute(&state.db)
         .await?;
     let db = state.db.clone();
+    let state_for_job = state.clone();
     let key = input.job_key.clone();
     tokio::spawn(async move {
-        let operation = match key.as_str() {
-            "cleanup_otps" => sqlx::query("DELETE FROM email_otps WHERE expires_at < NOW() OR is_used=TRUE").execute(&db).await.map(|_|()),
-            _ => sqlx::query("UPDATE user_profiles p SET token_state='stale' WHERE token_received_at < NOW()-INTERVAL '12 hours' AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token')").execute(&db).await.map(|_|()),
+        let operation: Result<(), String> = match key.as_str() {
+            "cleanup_otps" => sqlx::query("DELETE FROM email_otps WHERE expires_at < NOW() OR is_used=TRUE")
+                .execute(&db)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "session_audit" => sqlx::query("UPDATE user_profiles p SET token_state='stale' WHERE token_received_at < NOW()-INTERVAL '12 hours' AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id=p.user_id AND s.secret_kind='jwt_token')")
+                .execute(&db)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "strategy_reload" => crate::strategy::admin_reload(&state_for_job)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => Err("Unknown job key.".into()),
         };
         match operation {
             Ok(_) => {

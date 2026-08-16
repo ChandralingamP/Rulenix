@@ -100,6 +100,12 @@ pub(crate) async fn load(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>
     Ok(contracts)
 }
 
+pub(crate) async fn invalidate_cache() {
+    if let Some(cache) = MASTER_CACHE.get() {
+        *cache.lock().await = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -776,6 +776,31 @@ pub fn is_authentication_error(message: &str) -> bool {
         || value.contains("authentication")
 }
 
+pub fn is_contract_unavailable_error(message: &str) -> bool {
+    let value = message.to_ascii_lowercase();
+    [
+        "symbol token",
+        "symboltoken",
+        "token not found",
+        "invalid token for symbol",
+        "invalid symbol",
+        "symbol not found",
+        "trading symbol not found",
+        "scrip not found",
+        "script not found",
+        "contract not found",
+        "contract expired",
+        "expired contract",
+        "instrument expired",
+        "not allowed to trade",
+        "not enabled for trading",
+        "not available for trading",
+        "security is not allowed",
+    ]
+    .iter()
+    .any(|phrase| value.contains(phrase))
+}
+
 pub fn is_invalid_api_key_error(message: &str) -> bool {
     if is_rate_limit_error(message) {
         return false;

@@ -47,6 +47,7 @@ const OPTION_PRODUCT_TYPE: &str = "INTRADAY";
 const OPTION_ENTRY_START_MINUTE: u32 = 9 * 60 + 20;
 const OPTION_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
 const OPTION_SCHEDULER_END_MINUTE: u32 = 15 * 60 + 30;
+const FUTURES_EXPIRY_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
 const SHARED_MARKET_CREDENTIAL_LIMIT: i64 = 8;
 const KELTNER_EMA_PERIOD: usize = 20;
 const KELTNER_ATR_PERIOD: usize = 10;
@@ -951,6 +952,12 @@ fn option_expiry_checkpoint_due(expiry: NaiveDate, now: DateTime<FixedOffset>) -
     expiry < now.date_naive() || (expiry == now.date_naive() && option_square_off_due(now))
 }
 
+fn futures_expiry_checkpoint_due(expiry: NaiveDate, now: DateTime<FixedOffset>) -> bool {
+    expiry < now.date_naive()
+        || (expiry == now.date_naive()
+            && option_minute_of_day(now) >= FUTURES_EXPIRY_SQUARE_OFF_MINUTE)
+}
+
 fn option_exit(
     item: IndicatorCandle,
     side: OptionSide,
@@ -1426,10 +1433,50 @@ async fn load_snapshot(
 }
 
 fn has_contract_metadata(snapshot: &Snapshot) -> bool {
-    snapshot.contract_token.is_some()
-        && snapshot.contract_symbol.is_some()
+    snapshot
+        .contract_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && snapshot
+            .contract_symbol
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
         && snapshot.contract_expiry.is_some()
-        && snapshot.lot_size.is_some()
+        && snapshot.lot_size.is_some_and(|value| value > 0)
+}
+
+fn has_valid_contract_metadata(snapshot: &Snapshot, date: NaiveDate) -> bool {
+    if !has_contract_metadata(snapshot) {
+        return false;
+    }
+    let Some(expiry) = snapshot.contract_expiry else {
+        return false;
+    };
+    if expiry < date {
+        return false;
+    }
+    if snapshot.strategy_key == STRATEGY_KEY {
+        return weekdays_until(date, expiry) >= 10;
+    }
+    true
+}
+
+async fn select_contract_with_master_refresh(
+    state: &AppState,
+    contracts: &[MasterContract],
+    instrument: &str,
+    date: NaiveDate,
+) -> AppResult<(MasterContract, NaiveDate)> {
+    if let Some(selected) = select_contract(contracts, instrument, date) {
+        return Ok(selected);
+    }
+    contract_master::invalidate_cache().await;
+    let refreshed = load_contract_master(state).await?;
+    select_contract(&refreshed, instrument, date).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "No eligible MCX {instrument} FUTCOM contract is at least 10 trading days from expiry in the latest Angel One contract master."
+        ))
+    })
 }
 
 async fn upsert_contract_metadata(
@@ -1438,17 +1485,22 @@ async fn upsert_contract_metadata(
     instrument: &str,
     date: NaiveDate,
 ) -> AppResult<Snapshot> {
-    let (contract, expiry) = select_contract(contracts, instrument, date).ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "No eligible MCX {instrument} FUTCOM contract is at least 10 trading days from expiry."
-        ))
-    })?;
+    let (contract, expiry) =
+        select_contract_with_master_refresh(state, contracts, instrument, date).await?;
     let lot_size = parse_lot_size(&contract.lotsize)
         .filter(|value| *value > 0)
         .ok_or_else(|| AppError::BadRequest("Selected contract has an invalid lot size.".into()))?;
-    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size) VALUES ($1,$2,$3,$4,'missing','Daily market levels are pending.',$5,$6,$7,$8) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,error=CASE WHEN strategy_market_snapshots.status='ready' THEN strategy_market_snapshots.error ELSE EXCLUDED.error END,fetched_at=NOW()")
+    let previous = load_snapshot(state, instrument, date).await?;
+    let contract_changed = previous.as_ref().is_none_or(|snapshot| {
+        snapshot.contract_token.as_deref() != Some(contract.token.as_str())
+            || snapshot.contract_symbol.as_deref() != Some(contract.symbol.as_str())
+            || snapshot.contract_expiry != Some(expiry)
+            || snapshot.lot_size != Some(lot_size)
+    });
+    sqlx::query("INSERT INTO strategy_market_snapshots (id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size) VALUES ($1,$2,$3,$4,'missing','Daily market levels are pending.',$5,$6,$7,$8) ON CONFLICT (strategy_key,instrument,trade_date,execution_key) DO UPDATE SET status=CASE WHEN $9 THEN 'missing' ELSE strategy_market_snapshots.status END,error=CASE WHEN $9 THEN 'Daily market levels are pending after contract rollover.' WHEN strategy_market_snapshots.status='ready' THEN strategy_market_snapshots.error ELSE EXCLUDED.error END,contract_token=EXCLUDED.contract_token,contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,lot_size=EXCLUDED.lot_size,fetched_at=NOW()")
         .bind(Uuid::new_v4()).bind(STRATEGY_KEY).bind(instrument).bind(date)
         .bind(&contract.token).bind(&contract.symbol).bind(expiry).bind(lot_size)
+        .bind(contract_changed)
         .execute(&state.db).await?;
     let snapshot = load_snapshot(state, instrument, date)
         .await?
@@ -1470,7 +1522,7 @@ async fn ensure_contract_metadata(
     date: NaiveDate,
 ) -> AppResult<Snapshot> {
     if let Some(snapshot) = load_snapshot(state, instrument, date).await?
-        && has_contract_metadata(&snapshot)
+        && has_valid_contract_metadata(&snapshot, date)
     {
         return Ok(snapshot);
     }
@@ -1486,7 +1538,7 @@ async fn ensure_supported_contract_metadata(
     let mut missing = Vec::new();
     for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
         match load_snapshot(state, instrument, date).await? {
-            Some(snapshot) if has_contract_metadata(&snapshot) => {
+            Some(snapshot) if has_valid_contract_metadata(&snapshot, date) => {
                 snapshots.insert(instrument.to_string(), snapshot);
             }
             _ => missing.push(instrument),
@@ -1503,6 +1555,28 @@ async fn ensure_supported_contract_metadata(
     Ok(snapshots)
 }
 
+async fn force_refresh_futures_contract_snapshot(
+    state: &AppState,
+    instrument: &str,
+    date: NaiveDate,
+) -> AppResult<Option<Snapshot>> {
+    let previous = load_snapshot(state, instrument, date).await?;
+    contract_master::invalidate_cache().await;
+    let contracts = load_contract_master(state).await?;
+    let refreshed = upsert_contract_metadata(state, &contracts, instrument, date).await?;
+    let changed = previous.as_ref().is_none_or(|snapshot| {
+        snapshot.contract_token != refreshed.contract_token
+            || snapshot.contract_symbol != refreshed.contract_symbol
+            || snapshot.contract_expiry != refreshed.contract_expiry
+            || snapshot.lot_size != refreshed.lot_size
+    });
+    if changed {
+        Ok(Some(create_snapshot(state, instrument, date).await?))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn create_snapshot(
     state: &AppState,
     instrument: &str,
@@ -1510,6 +1584,7 @@ async fn create_snapshot(
 ) -> AppResult<Snapshot> {
     if let Some(snapshot) = load_snapshot(state, instrument, date).await?
         && snapshot.status == "ready"
+        && has_valid_contract_metadata(&snapshot, date)
         && snapshot
             .previous_close
             .is_some_and(|value| value.is_finite() && value > 0.0)
@@ -2935,18 +3010,20 @@ pub(crate) async fn place_strategy_order(
     let protective = matches!(order.role, "TARGET" | "SL1" | "SL2");
     let mut live_margin = None;
     let mut live_reconciled = runner.trading_mode != "live" || protective;
-    let mut entry_credentials = if !protective {
+    let mut entry_credentials = if !protective && runner.trading_mode == "live" {
         Some(state.credentials.load(runner.user_id).await?)
     } else {
         None
     };
     let margin_required = if protective {
         0.0
+    } else if runner.trading_mode == "demo" {
+        demo_margin_required(state, runner.user_id, snapshot, order.price, quantity).await?
     } else {
         let credentials = entry_credentials
             .as_ref()
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
-        crate::margin::estimate(
+        match crate::margin::estimate(
             state,
             runner.user_id,
             &credentials.api_key,
@@ -2960,10 +3037,53 @@ pub(crate) async fn place_strategy_order(
             lot_size,
             order.lots,
         )
-        .await?
-        .margin_required
+        .await
+        {
+            Ok(estimate) => estimate.margin_required,
+            Err(error)
+                if snapshot.strategy_key == STRATEGY_KEY
+                    && angel::is_contract_unavailable_error(&error.to_string()) =>
+            {
+                if let Some(refreshed_snapshot) = force_refresh_futures_contract_snapshot(
+                    state,
+                    &snapshot.instrument,
+                    snapshot.trade_date,
+                )
+                .await?
+                {
+                    let retry_session = format!("{session}:contract-roll");
+                    operational_alert_for(
+                        state,
+                        &snapshot.strategy_key,
+                        Some(runner.user_id),
+                        &runner.instrument,
+                        "contract_rolled_forward",
+                        "warning",
+                        &format!(
+                            "{} was unavailable for broker margin calculation, so Rulenix refreshed the contract master and is retrying with {}.",
+                            symbol,
+                            refreshed_snapshot
+                                .contract_symbol
+                                .as_deref()
+                                .unwrap_or("the next eligible contract")
+                        ),
+                    )
+                    .await;
+                    return Box::pin(place_strategy_order(
+                        state,
+                        runner,
+                        &refreshed_snapshot,
+                        &retry_session,
+                        order.clone(),
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
     };
-    if !protective {
+    if !protective && runner.trading_mode == "live" {
         // Margin estimation may refresh an expired Angel session. Reload the
         // encrypted credentials before reconciliation and order submission.
         entry_credentials = Some(state.credentials.load(runner.user_id).await?);
@@ -3214,6 +3334,9 @@ pub(crate) async fn place_strategy_order(
             Ok(())
         }
         Err(error) => {
+            let contract_unavailable = !protective
+                && snapshot.strategy_key == STRATEGY_KEY
+                && angel::is_contract_unavailable_error(&format!("{} {}", error, error.diagnostic));
             let status = if angel::may_retry_submission(error.class)
                 || error.class == angel::BrokerErrorClass::Authentication
             {
@@ -3250,6 +3373,70 @@ pub(crate) async fn place_strategy_order(
                 ),
             )
             .await;
+            if contract_unavailable {
+                match force_refresh_futures_contract_snapshot(
+                    state,
+                    &snapshot.instrument,
+                    snapshot.trade_date,
+                )
+                .await
+                {
+                    Ok(Some(refreshed_snapshot)) => {
+                        let retry_session = format!("{session}:contract-roll");
+                        operational_alert_for(
+                            state,
+                            &snapshot.strategy_key,
+                            Some(runner.user_id),
+                            &runner.instrument,
+                            "contract_rolled_forward",
+                            "warning",
+                            &format!(
+                                "{} was unavailable at Angel One, so Rulenix refreshed the contract master and is retrying with {}.",
+                                symbol,
+                                refreshed_snapshot
+                                    .contract_symbol
+                                    .as_deref()
+                                    .unwrap_or("the next eligible contract")
+                            ),
+                        )
+                        .await;
+                        return Box::pin(place_strategy_order(
+                            state,
+                            runner,
+                            &refreshed_snapshot,
+                            &retry_session,
+                            order.clone(),
+                        ))
+                        .await;
+                    }
+                    Ok(None) => {
+                        operational_alert_for(
+                            state,
+                            &snapshot.strategy_key,
+                            Some(runner.user_id),
+                            &runner.instrument,
+                            "contract_roll_forward_unavailable",
+                            "error",
+                            "Angel One rejected the selected contract, and the refreshed contract master did not provide a different eligible expiry.",
+                        )
+                        .await;
+                    }
+                    Err(refresh_error) => {
+                        operational_alert_for(
+                            state,
+                            &snapshot.strategy_key,
+                            Some(runner.user_id),
+                            &runner.instrument,
+                            "contract_roll_forward_failed",
+                            "error",
+                            &format!(
+                                "Angel One rejected the selected contract, and contract refresh failed: {refresh_error}"
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
             Err(match error.class {
                 angel::BrokerErrorClass::Authentication => {
                     AppError::Unauthorized(error.to_string())
@@ -3791,7 +3978,7 @@ async fn has_any_active_option_exit(state: &AppState, trade_id: Uuid) -> AppResu
         .await?)
 }
 
-async fn close_lingering_expired_option_trades(
+async fn close_lingering_expired_contract_trades(
     state: &AppState,
     now: DateTime<FixedOffset>,
 ) -> AppResult<()> {
@@ -3802,11 +3989,11 @@ async fn close_lingering_expired_option_trades(
             JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
             WHERE t.status='open'
               AND t.remaining_lots>0
-              AND t.strategy_key IN ($1,$2)
+              AND t.strategy_key IN ($1,$2,$3)
               AND s.contract_expiry IS NOT NULL
               AND (
                     s.contract_expiry<CURRENT_DATE
-                 OR (s.contract_expiry=CURRENT_DATE AND $3::boolean)
+                 OR (s.contract_expiry=CURRENT_DATE AND $4::boolean)
               )
         ),
         changed AS (
@@ -3814,11 +4001,28 @@ async fn close_lingering_expired_option_trades(
             SET status='closed',
                 exit_price=COALESCE(t.last_price,t.entry_price),
                 last_price=COALESCE(t.last_price,t.entry_price),
-                pnl=CASE
-                    WHEN t.direction='BUY' THEN ((COALESCE(t.last_price,t.entry_price)::float8-t.entry_price::float8)*t.quantity)::numeric
-                    ELSE ((t.entry_price::float8-COALESCE(t.last_price,t.entry_price)::float8)*t.quantity)::numeric
-                END,
-                exit_datetime=$4,
+                pnl=(
+                    t.pnl::float8
+                    + CASE
+                        WHEN t.direction='BUY'
+                            THEN COALESCE(t.last_price,t.entry_price)::float8-t.entry_price::float8
+                        ELSE t.entry_price::float8-COALESCE(t.last_price,t.entry_price)::float8
+                    END
+                    * CASE
+                        WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='GOLDM'
+                            THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*10.0,t.quantity::float8/10.0)
+                        WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='GOLDTEN'
+                            THEN COALESCE(NULLIF(t.remaining_lots,0)::float8,t.quantity::float8/10.0)
+                        WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='SILVERM'
+                            THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*5.0,t.quantity::float8)
+                        WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='SILVERMIC'
+                            THEN COALESCE(NULLIF(t.remaining_lots,0)::float8,t.quantity::float8)
+                        WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='NATGASMINI'
+                            THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*250.0,t.quantity::float8)
+                        ELSE t.quantity::float8
+                    END
+                )::numeric,
+                exit_datetime=$5,
                 remaining_lots=0,
                 exit_reason='MARKET_CLOSED',
                 notes=CONCAT(COALESCE(t.notes,''), CASE WHEN COALESCE(t.notes,'')='' THEN '' ELSE '; ' END, 'Auto-closed by expiry checkpoint'),
@@ -3829,9 +4033,10 @@ async fn close_lingering_expired_option_trades(
         )
         SELECT * FROM changed",
     )
+    .bind(STRATEGY_KEY)
     .bind(OPTION_ENTRY_STRATEGY_KEY)
     .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
-    .bind(option_square_off_due(now))
+    .bind(option_square_off_due(now) || futures_expiry_checkpoint_due(now.date_naive(), now))
     .bind(now.with_timezone(&Utc))
     .fetch_all(&state.db)
     .await?;
@@ -3853,7 +4058,7 @@ async fn close_lingering_expired_option_trades(
             &strategy_key,
             Some(user_id),
             &instrument,
-            "option_expiry_checkpoint_closed",
+            "contract_expiry_checkpoint_closed",
             json!({
                 "trade_id":trade_id,
                 "contract_symbol":contract_symbol,
@@ -3867,7 +4072,7 @@ async fn close_lingering_expired_option_trades(
             state,
             user_id,
             &format!(
-                "OPTION EXPIRY CHECKPOINT closed {} [{} expiry {}] as MARKET_CLOSED",
+                "CONTRACT EXPIRY CHECKPOINT closed {} [{} expiry {}] as MARKET_CLOSED",
                 contract_log_label(&instrument, contract_symbol.as_deref()),
                 strategy_key,
                 expiry
@@ -4598,7 +4803,7 @@ async fn run_supertrend_cycle(state: &AppState, now: DateTime<FixedOffset>) -> A
     }
     if option_square_off_due(now) {
         process_supertrend_square_off(state, now).await?;
-        close_lingering_expired_option_trades(state, now).await?;
+        close_lingering_expired_contract_trades(state, now).await?;
         return Ok(());
     }
     if !option_entry_allowed(now) {
@@ -4630,7 +4835,7 @@ async fn run_option_entry_cycle(state: &AppState, now: DateTime<FixedOffset>) ->
     }
     if option_square_off_due(now) {
         process_option_square_off(state, now).await?;
-        close_lingering_expired_option_trades(state, now).await?;
+        close_lingering_expired_contract_trades(state, now).await?;
         return Ok(());
     }
     let mut indicators = None;
@@ -4908,6 +5113,34 @@ async fn session_is_open(
     Ok((!weekend, reason.into()))
 }
 
+async fn futures_runtime_is_open(
+    state: &AppState,
+    now: DateTime<FixedOffset>,
+) -> AppResult<(bool, String)> {
+    let date = now.date_naive();
+    let minute = now.hour() * 60 + now.minute();
+    let (day_open, day_reason) = session_is_open(state, date, "day").await?;
+    let (evening_open, evening_reason) = session_is_open(state, date, "evening").await?;
+    if day_open && (9 * 60..=15 * 60 + 20).contains(&minute) {
+        return Ok((true, String::new()));
+    }
+    if evening_open && (17 * 60..=23 * 60 + 25).contains(&minute) {
+        return Ok((true, String::new()));
+    }
+    let reason = if !day_open && !evening_open {
+        if !day_reason.is_empty() {
+            day_reason
+        } else if !evening_reason.is_empty() {
+            evening_reason
+        } else {
+            "market session is closed".into()
+        }
+    } else {
+        "market session is closed".into()
+    };
+    Ok((false, reason))
+}
+
 async fn mark_run_skipped(
     state: &AppState,
     instrument: &str,
@@ -4921,15 +5154,17 @@ async fn mark_run_skipped(
         .bind(Uuid::new_v4()).bind(STRATEGY_KEY).bind(instrument).bind(date).bind(session).bind(action).bind(scheduled_for).bind(reason)
         .execute(&state.db).await?;
     if changed.rows_affected() > 0 {
-        operational_alert(
-            state,
-            None,
-            instrument,
-            "session_skipped",
-            "warning",
-            &format!("{session} {action} skipped: {reason}"),
-        )
-        .await;
+        if reason != "Weekend" {
+            operational_alert(
+                state,
+                None,
+                instrument,
+                "session_skipped",
+                "warning",
+                &format!("{session} {action} skipped: {reason}"),
+            )
+            .await;
+        }
     }
     Ok(())
 }
@@ -4945,10 +5180,10 @@ async fn run_scheduled_action(
     sqlx::query("INSERT INTO strategy_scheduler_runs (id,strategy_key,instrument,trade_date,session_key,action,status,scheduled_for,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,NOW()) ON CONFLICT (strategy_key,instrument,trade_date,session_key,action) DO NOTHING")
         .bind(Uuid::new_v4()).bind(STRATEGY_KEY).bind(instrument).bind(date).bind(session).bind(action).bind(scheduled_for)
         .execute(&state.db).await?;
-    let claimed: Option<Uuid> = sqlx::query_scalar("UPDATE strategy_scheduler_runs SET status='running',attempts=attempts+1,started_at=NOW(),updated_at=NOW() WHERE strategy_key=$1 AND instrument=$2 AND trade_date=$3 AND session_key=$4 AND action=$5 AND status IN ('pending','failed') AND next_attempt_at<=NOW() RETURNING id")
+    let claimed: Option<(Uuid, i32)> = sqlx::query_as("UPDATE strategy_scheduler_runs SET status='running',attempts=attempts+1,started_at=NOW(),updated_at=NOW() WHERE strategy_key=$1 AND instrument=$2 AND trade_date=$3 AND session_key=$4 AND action=$5 AND status IN ('pending','failed') AND next_attempt_at<=NOW() RETURNING id,attempts")
         .bind(STRATEGY_KEY).bind(instrument).bind(date).bind(session).bind(action)
         .fetch_optional(&state.db).await?;
-    let Some(run_id) = claimed else {
+    let Some((run_id, attempts)) = claimed else {
         return Ok(());
     };
     let result = match action {
@@ -4994,9 +5229,12 @@ async fn run_scheduled_action(
                 )
                 .await;
             } else {
-                sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW()+INTERVAL '30 seconds',last_error=$2,updated_at=NOW() WHERE id=$1")
+                let delay_seconds = recoverable_retry_delay_seconds(&message, attempts);
+                let severity = retry_alert_severity(&message);
+                sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW()+($3::int * INTERVAL '1 second'),last_error=$2,updated_at=NOW() WHERE id=$1")
                     .bind(run_id)
                     .bind(&message)
+                    .bind(delay_seconds)
                     .execute(&state.db)
                     .await?;
                 operational_alert(
@@ -5004,8 +5242,10 @@ async fn run_scheduled_action(
                     None,
                     instrument,
                     "scheduler_retry",
-                    "error",
-                    &format!("{session} {action} failed; retrying: {message}"),
+                    severity,
+                    &format!(
+                        "{session} {action} failed; retrying in about {delay_seconds} seconds: {message}"
+                    ),
                 )
                 .await;
             }
@@ -5077,6 +5317,42 @@ fn is_terminal_scheduler_error(message: &str) -> bool {
     lower
         .split("; ")
         .all(|part| part.contains("demo balance is insufficient for the required margin"))
+}
+
+fn recoverable_retry_delay_seconds(message: &str, attempts: i32) -> i32 {
+    let lower = message.to_ascii_lowercase();
+    if angel::is_rate_limit_error(message) {
+        return 300;
+    }
+    if angel::is_authentication_error(message)
+        || lower.contains("no connected angel one session")
+        || lower.contains("broker session health is unsafe")
+    {
+        return 15 * 60;
+    }
+    if lower.contains("market data is temporarily unavailable")
+        || lower.contains("no fresh valid market price")
+        || lower.contains("shared market")
+        || lower.contains("temporarily unavailable")
+    {
+        return 5 * 60;
+    }
+    let exponential = 30_i32.saturating_mul(2_i32.saturating_pow(attempts.clamp(0, 6) as u32));
+    exponential.clamp(30, 30 * 60)
+}
+
+fn retry_alert_severity(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if angel::is_authentication_error(message)
+        || angel::is_rate_limit_error(message)
+        || lower.contains("no connected angel one session")
+        || lower.contains("market data is temporarily unavailable")
+        || lower.contains("no fresh valid market price")
+    {
+        "warning"
+    } else {
+        "error"
+    }
 }
 
 pub fn start(state: AppState) {
@@ -5165,11 +5441,11 @@ pub fn start(state: AppState) {
                 tracing::warn!(%error, "could not expire prior-day strategy orders");
             }
             if dispatched.insert(format!(
-                "{date}:option-expiry-checkpoint:{}",
+                "{date}:contract-expiry-checkpoint:{}",
                 now.format("%H%M")
-            )) && let Err(error) = close_lingering_expired_option_trades(&state, now).await
+            )) && let Err(error) = close_lingering_expired_contract_trades(&state, now).await
             {
-                tracing::warn!(%error, "could not close lingering expired option trades");
+                tracing::warn!(%error, "could not close lingering expired contract trades");
             }
             let mut contracts_ready = true;
             for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
@@ -5177,7 +5453,7 @@ pub fn start(state: AppState) {
                     .await
                     .ok()
                     .flatten()
-                    .is_some_and(|snapshot| has_contract_metadata(&snapshot));
+                    .is_some_and(|snapshot| has_valid_contract_metadata(&snapshot, date));
                 contracts_ready &= ready;
             }
             if !contracts_ready
@@ -5241,7 +5517,9 @@ pub fn start(state: AppState) {
             if (now.hour(), now.minute()) >= (8, 30) && (day_open || evening_open) {
                 for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
                     let snapshot = load_snapshot(&state, instrument, date).await.ok().flatten();
-                    let metadata_ready = snapshot.as_ref().is_some_and(has_contract_metadata);
+                    let metadata_ready = snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| has_valid_contract_metadata(snapshot, date));
                     let levels_ready = snapshot.is_some_and(|snapshot| {
                         snapshot.status == "ready"
                             && snapshot
@@ -5373,6 +5651,82 @@ pub fn refresh_after_broker_connect(state: AppState) {
             }
         }
     });
+}
+
+pub async fn admin_reload(state: &AppState) -> AppResult<Value> {
+    let now = ist_now();
+    let date = now.date_naive();
+    contract_master::invalidate_cache().await;
+    crate::market_ws::reset_strategy_feeds(state).await;
+    close_lingering_expired_contract_trades(state, now).await?;
+    sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW(),last_error=CONCAT(COALESCE(NULLIF(last_error,''), 'Admin reload requested'), '; admin reload requested'),updated_at=NOW() WHERE strategy_key=$1 AND trade_date=$2 AND status IN ('running','failed')")
+        .bind(STRATEGY_KEY)
+        .bind(date)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE strategy_reversal_intents SET status=CASE WHEN status='waiting' THEN 'failed' ELSE status END,next_attempt_at=NOW(),last_error=CONCAT(COALESCE(NULLIF(last_error,''), 'Admin reload requested'), '; admin reload requested'),updated_at=NOW() WHERE status IN ('pending','waiting','failed')")
+        .execute(&state.db)
+        .await?;
+
+    let mut snapshot_errors = Vec::new();
+    match ensure_supported_contract_metadata(state, date).await {
+        Ok(_) => {
+            if (now.hour(), now.minute()) >= (8, 30) {
+                for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
+                    if let Err(error) = create_snapshot(state, instrument, date).await {
+                        record_snapshot_failure(state, instrument, date, &error.to_string()).await;
+                        snapshot_errors.push(format!("{instrument}: {error}"));
+                    }
+                }
+            }
+        }
+        Err(error) => snapshot_errors.push(format!("contract metadata: {error}")),
+    }
+
+    let due_runs: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT instrument,session_key,action,scheduled_for
+         FROM strategy_scheduler_runs
+         WHERE strategy_key=$1
+           AND trade_date=$2
+           AND status IN ('pending','failed')
+           AND next_attempt_at<=NOW()
+         ORDER BY scheduled_for,action
+         LIMIT 50",
+    )
+    .bind(STRATEGY_KEY)
+    .bind(date)
+    .fetch_all(&state.db)
+    .await?;
+    let mut retried_runs = 0_usize;
+    let mut retry_errors = Vec::new();
+    for (instrument, session, action, scheduled_for) in due_runs {
+        if !is_futures_breakout_instrument(&instrument) {
+            continue;
+        }
+        let session: &'static str = match session.as_str() {
+            "day" => "day",
+            "evening" => "evening",
+            _ => continue,
+        };
+        if !matches!(action.as_str(), "target" | "stop" | "entry" | "gap_entry") {
+            continue;
+        }
+        let scheduled_for = scheduled_for.with_timezone(now.offset());
+        retried_runs += 1;
+        if let Err(error) =
+            run_scheduled_action(state, &instrument, date, session, &action, scheduled_for).await
+        {
+            retry_errors.push(format!("{instrument} {session} {action}: {error}"));
+        }
+    }
+    recover_sl2_reversal_intents(state).await?;
+    Ok(json!({
+        "detail":"Strategy reload completed.",
+        "date":date,
+        "retried_scheduler_runs":retried_runs,
+        "snapshot_errors":snapshot_errors,
+        "retry_errors":retry_errors
+    }))
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -6178,6 +6532,8 @@ struct Sl2ReversalIntent {
     lots: i32,
     entry_price: f64,
     order_session_key: String,
+    attempts: i32,
+    created_at: DateTime<Utc>,
 }
 
 enum Sl2ReversalOutcome {
@@ -6269,9 +6625,28 @@ fn snapshot_order_exit_levels(
     snapshot_exit_levels(snapshot, direction, entry_price, false)
 }
 
-#[cfg(test)]
 fn demo_margin_amount(quantity: i32, price: f64, margin_requirement_percent: f64) -> f64 {
     quantity as f64 * price * margin_requirement_percent / 100.0
+}
+
+async fn demo_margin_required(
+    state: &AppState,
+    user_id: Uuid,
+    snapshot: &Snapshot,
+    price: f64,
+    quantity: i32,
+) -> AppResult<f64> {
+    let margin_percent: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(u.margin_requirement_percent,g.margin_requirement_percent)::float8
+         FROM risk_limits g
+         LEFT JOIN risk_limits u ON u.user_id=$1
+         WHERE g.user_id IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+    let units = runtime_pnl_units(&snapshot.instrument, quantity, snapshot.lot_size);
+    Ok((units * price * margin_percent / 100.0).max(0.0))
 }
 
 #[cfg(test)]
@@ -6572,7 +6947,7 @@ async fn attempt_claimed_sl2_reversal(
     };
 
     let query = format!("{} WHERE id=$1", snapshot_select());
-    let snapshot: Snapshot = sqlx::query_as(&query)
+    let mut snapshot: Snapshot = sqlx::query_as(&query)
         .bind(intent.snapshot_id)
         .fetch_one(&state.db)
         .await?;
@@ -6580,6 +6955,13 @@ async fn attempt_claimed_sl2_reversal(
         return Ok(Sl2ReversalOutcome::Cancelled(
             "The reversal snapshot does not belong to Futures Breakout v3.".into(),
         ));
+    }
+    if !has_valid_contract_metadata(&snapshot, snapshot.trade_date)
+        && let Some(refreshed) =
+            force_refresh_futures_contract_snapshot(state, &intent.instrument, snapshot.trade_date)
+                .await?
+    {
+        snapshot = refreshed;
     }
     let runner = runner_for(state, intent.user_id, &intent.instrument).await?;
     place_strategy_order(
@@ -6605,7 +6987,7 @@ async fn attempt_claimed_sl2_reversal(
          FROM strategy_orders
          WHERE user_id=$1
            AND snapshot_id=$2
-           AND session_key=$3
+           AND session_key LIKE $3 || '%'
            AND role=$4
          ORDER BY created_at DESC
          LIMIT 1",
@@ -6638,6 +7020,27 @@ async fn attempt_claimed_sl2_reversal(
 }
 
 async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) -> AppResult<()> {
+    let now = ist_now();
+    let (market_open, market_reason) = futures_runtime_is_open(state, now).await?;
+    if !market_open {
+        sqlx::query(
+            "UPDATE strategy_reversal_intents
+             SET status='waiting',
+                 next_attempt_at=NOW()+INTERVAL '15 minutes',
+                 last_error=$2,
+                 updated_at=NOW()
+             WHERE source_trade_id=$1
+               AND status IN ('pending','waiting','failed')
+               AND next_attempt_at<=NOW()",
+        )
+        .bind(source_trade_id)
+        .bind(format!(
+            "SL2 reversal is paused until the Futures Breakout market session opens: {market_reason}"
+        ))
+        .execute(&state.db)
+        .await?;
+        return Ok(());
+    }
     let intent: Option<Sl2ReversalIntent> = sqlx::query_as(
         "UPDATE strategy_reversal_intents
          SET status='processing',
@@ -6646,7 +7049,7 @@ async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) ->
          WHERE source_trade_id=$1
            AND status IN ('pending','waiting','failed')
            AND next_attempt_at<=NOW()
-         RETURNING source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key",
+         RETURNING source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key,attempts,created_at",
     )
     .bind(source_trade_id)
     .fetch_optional(&state.db)
@@ -6664,6 +7067,34 @@ async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) ->
     .fetch_one(&state.db)
     .await?;
     let contract_label = contract_log_label(&intent.instrument, Some(&symbol));
+    let intent_date = intent.created_at.with_timezone(now.offset()).date_naive();
+    if intent_date < now.date_naive() {
+        let message = format!(
+            "The SL2 reversal for {contract_label} was not submitted on {intent_date}; it has been cancelled instead of placing a stale next-day reversal."
+        );
+        sqlx::query(
+            "UPDATE strategy_reversal_intents
+             SET status='cancelled',
+                 last_error=$2,
+                 updated_at=NOW()
+             WHERE source_trade_id=$1 AND status='processing'",
+        )
+        .bind(intent.source_trade_id)
+        .bind(&message)
+        .execute(&state.db)
+        .await?;
+        operational_alert(
+            state,
+            Some(intent.user_id),
+            &intent.instrument,
+            "sl2_reversal_stale_cancelled",
+            "warning",
+            &message,
+        )
+        .await;
+        append_user_log(state, intent.user_id, &message).await;
+        return Ok(());
+    }
     match attempt_claimed_sl2_reversal(state, &intent).await {
         Ok(Sl2ReversalOutcome::Waiting(message)) => {
             sqlx::query(
@@ -6772,16 +7203,19 @@ async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) ->
         }
         Err(error) => {
             let message = error.to_string();
+            let delay_seconds = recoverable_retry_delay_seconds(&message, intent.attempts);
+            let severity = retry_alert_severity(&message);
             let changed = sqlx::query(
                 "UPDATE strategy_reversal_intents
                  SET status='failed',
-                     next_attempt_at=NOW()+INTERVAL '30 seconds',
+                     next_attempt_at=NOW()+($3::int * INTERVAL '1 second'),
                      last_error=$2,
                      updated_at=NOW()
                  WHERE source_trade_id=$1 AND status='processing'",
             )
             .bind(intent.source_trade_id)
             .bind(&message)
+            .bind(delay_seconds)
             .execute(&state.db)
             .await?;
             if changed.rows_affected() > 0 {
@@ -6790,8 +7224,10 @@ async fn process_sl2_reversal_intent(state: &AppState, source_trade_id: Uuid) ->
                     Some(intent.user_id),
                     &intent.instrument,
                     "sl2_reversal_retry",
-                    "error",
-                    &format!("The full-lot SL2 reversal will retry automatically: {message}"),
+                    severity,
+                    &format!(
+                        "The full-lot SL2 reversal will retry automatically in about {delay_seconds} seconds: {message}"
+                    ),
                 )
                 .await;
                 return Err(error);
@@ -6858,6 +7294,33 @@ async fn recover_sl2_reversal_intents(state: &AppState) -> AppResult<()> {
             "error",
             &format!(
                 "The broker rejected or cancelled the full-lot SL2 reversal for trade {source_trade_id}."
+            ),
+        )
+        .await;
+    }
+    let stale: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "UPDATE strategy_reversal_intents i
+         SET status='cancelled',
+             last_error='The SL2 reversal was not submitted on the source trade day; stale next-day reversals are not safe.',
+             updated_at=NOW()
+         WHERE i.status IN ('pending','waiting','failed')
+           AND i.created_at < (
+               date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+               AT TIME ZONE 'Asia/Kolkata'
+           )
+         RETURNING i.source_trade_id,i.user_id,i.instrument",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (source_trade_id, user_id, instrument) in stale {
+        operational_alert(
+            state,
+            Some(user_id),
+            &instrument,
+            "sl2_reversal_stale_cancelled",
+            "warning",
+            &format!(
+                "The full-lot SL2 reversal for trade {source_trade_id} was cancelled because it became stale before a safe same-day submission."
             ),
         )
         .await;

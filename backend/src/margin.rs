@@ -64,6 +64,41 @@ fn parse_margin(value: &Value) -> Option<f64> {
         })
 }
 
+async fn persist_margin_estimate(
+    state: &AppState,
+    user_id: Uuid,
+    exchange: &str,
+    token: &str,
+    symbol: &str,
+    product_type: &str,
+    order_type: &str,
+    trade_type: &str,
+    lot_size: i32,
+    margin_per_lot: f64,
+    raw_response: &Value,
+) -> AppResult<()> {
+    let result = sqlx::query("INSERT INTO broker_margin_estimates (id,exchange,symbol_token,trading_symbol,product_type,order_type,trade_type,lot_size,margin_per_lot,raw_response,fetched_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (exchange,symbol_token,product_type,order_type,trade_type,lot_size) DO UPDATE SET trading_symbol=EXCLUDED.trading_symbol,margin_per_lot=EXCLUDED.margin_per_lot,raw_response=EXCLUDED.raw_response,fetched_by=EXCLUDED.fetched_by,fetched_at=NOW()")
+        .bind(Uuid::new_v4()).bind(exchange).bind(token).bind(symbol).bind(product_type).bind(order_type).bind(trade_type).bind(lot_size).bind(margin_per_lot).bind(raw_response).bind(user_id)
+        .execute(&state.db)
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate key value") => {
+            // Production once retained the pre-order_type unique constraint after
+            // a migration-name mismatch. Keep order placement alive while the
+            // corrective migration is applied by updating the legacy key row
+            // instead of surfacing a database error to the strategy loop.
+            sqlx::query("UPDATE broker_margin_estimates SET trading_symbol=$6,order_type=$7,margin_per_lot=$8,raw_response=$9,fetched_by=$10,fetched_at=NOW() WHERE exchange=$1 AND symbol_token=$2 AND product_type=$3 AND trade_type=$4 AND lot_size=$5")
+                .bind(exchange).bind(token).bind(product_type).bind(trade_type).bind(lot_size)
+                .bind(symbol).bind(order_type).bind(margin_per_lot).bind(raw_response).bind(user_id)
+                .execute(&state.db)
+                .await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn estimate(
     state: &AppState,
@@ -138,9 +173,20 @@ pub async fn estimate(
                 "order_type":order_type,
                 "broker_response":response
             });
-            sqlx::query("INSERT INTO broker_margin_estimates (id,exchange,symbol_token,trading_symbol,product_type,order_type,trade_type,lot_size,margin_per_lot,raw_response,fetched_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (exchange,symbol_token,product_type,order_type,trade_type,lot_size) DO UPDATE SET trading_symbol=EXCLUDED.trading_symbol,margin_per_lot=EXCLUDED.margin_per_lot,raw_response=EXCLUDED.raw_response,fetched_by=EXCLUDED.fetched_by,fetched_at=NOW()")
-                .bind(Uuid::new_v4()).bind(&exchange).bind(token).bind(symbol).bind(&product_type).bind(&order_type).bind(&trade_type).bind(lot_size).bind(margin_per_lot).bind(&raw_response).bind(user_id)
-                .execute(&state.db).await?;
+            persist_margin_estimate(
+                state,
+                user_id,
+                &exchange,
+                token,
+                symbol,
+                &product_type,
+                &order_type,
+                &trade_type,
+                lot_size,
+                margin_per_lot,
+                &raw_response,
+            )
+            .await?;
             return Ok(MarginEstimate {
                 margin_per_lot,
                 margin_required: margin_per_lot * lots as f64,

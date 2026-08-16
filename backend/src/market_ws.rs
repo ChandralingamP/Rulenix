@@ -12,6 +12,7 @@ use axum::{
     },
     response::Response,
 };
+use chrono::{Datelike, FixedOffset, Timelike, Utc, Weekday};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
@@ -22,6 +23,33 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message as AngelMessage, client::IntoClientRequest},
 };
+
+fn ist_minute_of_day() -> Option<(Weekday, u32)> {
+    let now = Utc::now().with_timezone(&FixedOffset::east_opt(19_800)?);
+    Some((now.weekday(), now.hour() * 60 + now.minute()))
+}
+
+fn exchange_feed_expected(exchange: &str) -> bool {
+    let Some((weekday, minute)) = ist_minute_of_day() else {
+        return true;
+    };
+    if matches!(weekday, Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
+    match exchange.to_ascii_uppercase().as_str() {
+        "NSE" | "NFO" | "BSE" | "BFO" => (9 * 60 + 15..=15 * 60 + 30).contains(&minute),
+        "MCX" => (9 * 60..=23 * 60 + 30).contains(&minute),
+        _ => true,
+    }
+}
+
+fn stale_threshold(exchange: &str) -> Duration {
+    if exchange.eq_ignore_ascii_case("MCX") {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(45)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,6 +242,9 @@ fn exchange_segment(exchange_type: u8) -> &'static str {
 
 pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: String) {
     let exchange = exchange.to_uppercase();
+    if !exchange_feed_expected(&exchange) {
+        return;
+    }
     {
         let mut requested = state.strategy_feed_tokens.lock().await;
         requested.entry(exchange.clone()).or_default().insert(token);
@@ -229,6 +260,9 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
         loop {
             let tokens = refresh_requested_tokens(&state, &exchange).await;
             if tokens.is_empty() {
+                break;
+            }
+            if !exchange_feed_expected(&exchange) {
                 break;
             }
             let rate_limited;
@@ -271,6 +305,11 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
             state.strategy_feeds.lock().await.remove(&exchange);
         }
     });
+}
+
+pub async fn reset_strategy_feeds(state: &AppState) {
+    state.strategy_feed_tokens.lock().await.clear();
+    state.strategy_feeds.lock().await.clear();
 }
 
 async fn refresh_requested_tokens(state: &AppState, exchange: &str) -> HashSet<String> {
@@ -328,10 +367,19 @@ async fn run_strategy_feed(
     let mut freshness = interval(Duration::from_secs(5));
     let mut subscriptions = interval(Duration::from_secs(5));
     let mut last_tick = Instant::now();
+    let freshness_threshold = stale_threshold(exchange);
     loop {
         tokio::select! {
             _=heartbeat.tick()=>sender.send(AngelMessage::Text("ping".into())).await?,
-            _=freshness.tick(), if last_tick.elapsed()>Duration::from_secs(30)=>anyhow::bail!("shared Angel One feed is stale (no tick for 30 seconds)"),
+            _=freshness.tick(), if last_tick.elapsed()>freshness_threshold=>{
+                if exchange_feed_expected(exchange) {
+                    anyhow::bail!(
+                        "shared Angel One feed is stale (no tick for {} seconds)",
+                        freshness_threshold.as_secs()
+                    );
+                }
+                return Ok(());
+            },
             _=subscriptions.tick()=> {
                 let desired = refresh_requested_tokens(state, exchange).await;
                 if desired.is_empty() { return Ok(()); }
