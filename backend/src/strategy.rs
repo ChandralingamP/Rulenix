@@ -7239,21 +7239,13 @@ fn snapshot_order_exit_levels(
     snapshot: &Snapshot,
     direction: &str,
     entry_price: f64,
-    reversal: bool,
+    _reversal: bool,
 ) -> AppResult<FuturesExitLevels> {
-    if reversal {
-        return snapshot_exit_levels(snapshot, direction, entry_price, true);
-    }
-    if snapshot.gap_plan_status.as_deref() == Some("READY")
-        && snapshot.entry_direction.as_deref() == Some(direction)
-    {
-        return Ok(FuturesExitLevels {
-            target: required_exit_level(snapshot.planned_target, "planned target")?,
-            sl1: required_exit_level(snapshot.planned_sl1, "planned initial stop loss")?,
-            sl2: required_exit_level(snapshot.planned_sl2, "planned continuation stop loss")?,
-        });
-    }
-    snapshot_exit_levels(snapshot, direction, entry_price, false)
+    // A stop entry can be filled away from the planned trigger, especially in
+    // demo mode where the fill uses the triggering tick LTP. TP1 must stay
+    // anchored to the actual fill price, not to the planned breakout level;
+    // otherwise a favorable gap can make TP1 only a few ticks away.
+    snapshot_exit_levels(snapshot, direction, entry_price, true)
 }
 
 fn demo_margin_amount(quantity: i32, price: f64, margin_requirement_percent: f64) -> f64 {
@@ -10086,6 +10078,61 @@ mod tests {
             futures_exit_levels_for_entry("SELL", 100.0, 90.0, 70.0, 95.0, 60.0).unwrap();
         assert!((crossed_sell.sl1 - 101.5).abs() < 1e-9);
         assert!((crossed_sell.sl2 - 101.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn initial_futures_target_is_anchored_to_actual_fill_price() {
+        let snapshot = Snapshot {
+            id: Uuid::new_v4(),
+            strategy_key: STRATEGY_KEY.into(),
+            instrument: "NATGASMINI".into(),
+            trade_date: NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+            status: "ready".into(),
+            error: None,
+            contract_token: Some("token".into()),
+            contract_symbol: Some("NATGASMINI25SEP26FUT".into()),
+            contract_expiry: Some(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap()),
+            lot_size: Some(250),
+            exchange_segment: "MCX".into(),
+            product_type: "CARRYFORWARD".into(),
+            execution_key: "default".into(),
+            underlying_token: String::new(),
+            candle_dates: Vec::new(),
+            highs: Vec::new(),
+            lows: Vec::new(),
+            hh2: Some(274.5),
+            ll2: Some(266.6),
+            hh4: Some(276.4),
+            ll4: Some(266.6),
+            buy_entry: Some(276.73168),
+            buy_target: Some(280.8826552),
+            buy_sl1: Some(266.28008),
+            buy_sl2: Some(266.28008),
+            sell_entry: Some(266.28008),
+            sell_target: Some(262.2858788),
+            sell_sl1: Some(274.8294),
+            sell_sl2: Some(276.73168),
+            previous_close: Some(269.7),
+            market_open: Some(267.3),
+            gap_direction: None,
+            entry_direction: None,
+            entry_source: Some("STANDARD".into()),
+            gap_plan_status: None,
+            opening_range_high: None,
+            opening_range_low: None,
+            planned_entry: None,
+            planned_target: None,
+            planned_sl1: None,
+            planned_sl2: None,
+            gap_planned_at: None,
+            fetched_at: Utc::now(),
+        };
+
+        let levels = snapshot_order_exit_levels(&snapshot, "SELL", 262.60, false).unwrap();
+        assert!((levels.target - 258.661).abs() < 1e-9);
+        assert!(levels.target < 262.20);
+        assert!((levels.sl1 - 274.8294).abs() < 1e-9);
+        assert!((levels.sl2 - 276.73168).abs() < 1e-9);
     }
 
     #[test]
