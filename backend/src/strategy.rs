@@ -57,6 +57,8 @@ const TSI_SHORT_PERIOD: usize = 13;
 const OPTION_TSI_ENTRY_THRESHOLD: f64 = 0.5;
 const SUPERTREND_ATR_PERIOD: usize = 7;
 const SUPERTREND_FACTOR: f64 = 2.0;
+const SUPERTREND_LOOKBACK_DAYS: i64 = 14;
+const SUPERTREND_SIGNAL_CATCHUP_MINUTES: i64 = 30;
 const SUPERTREND_SENSEX_DEFAULT_TARGET_POINTS: f64 = 40.0;
 const SUPERTREND_SENSEX_DEFAULT_STOP_POINTS: f64 = 25.0;
 const SUPERTREND_NIFTY_DEFAULT_TARGET_POINTS: f64 = 25.0;
@@ -697,6 +699,48 @@ fn supertrend_signal(points: &[SuperTrendPoint]) -> Option<SuperTrendSignal> {
         supertrend: latest.value,
         previous_direction: previous.direction,
         direction: latest.direction,
+    })
+}
+
+fn supertrend_signal_from_transition(
+    previous: &SuperTrendPoint,
+    latest: &SuperTrendPoint,
+) -> Option<SuperTrendSignal> {
+    if previous.direction == latest.direction {
+        return None;
+    }
+    let side = match (previous.direction, latest.direction) {
+        (SuperTrendDirection::Down, SuperTrendDirection::Up) => IndexOptionSide::Call,
+        (SuperTrendDirection::Up, SuperTrendDirection::Down) => IndexOptionSide::Put,
+        _ => return None,
+    };
+    Some(SuperTrendSignal {
+        side,
+        signal_at: latest.candle.at,
+        index_close: latest.candle.close,
+        supertrend: latest.value,
+        previous_direction: previous.direction,
+        direction: latest.direction,
+    })
+}
+
+fn recent_supertrend_signal(
+    points: &[SuperTrendPoint],
+    now: DateTime<FixedOffset>,
+) -> Option<SuperTrendSignal> {
+    let today = now.date_naive();
+    let latest_allowed = option_latest_completed_candle_time(now);
+    let catchup_from = latest_allowed - Duration::minutes(SUPERTREND_SIGNAL_CATCHUP_MINUTES);
+    points.windows(2).rev().find_map(|pair| {
+        let previous = pair.first()?;
+        let latest = pair.get(1)?;
+        if latest.candle.at.date() != today
+            || latest.candle.at > latest_allowed
+            || latest.candle.at < catchup_from
+        {
+            return None;
+        }
+        supertrend_signal_from_transition(previous, latest)
     })
 }
 
@@ -2952,6 +2996,7 @@ async fn cached_index_candles(
         })
         .unwrap_or(from_candle);
 
+    let mut fetch_error: Option<String> = None;
     if fetch_from <= to_candle
         && !shared_historical_cooldown_active(
             state,
@@ -2976,6 +3021,7 @@ async fn cached_index_candles(
                 cache_index_candles(state, config, &candles).await?;
             }
             Err(error) => {
+                let error_text = error.to_string();
                 if angel::is_rate_limit_error(&error.to_string()) {
                     activate_shared_historical_cooldown(
                         state,
@@ -2985,15 +3031,11 @@ async fn cached_index_candles(
                     )
                     .await;
                 }
-                let fresh_enough =
-                    max_cached.is_some_and(|cached| cached >= to_utc - Duration::minutes(10));
-                if !fresh_enough {
-                    return Err(error);
-                }
+                fetch_error = Some(error_text.clone());
                 tracing::warn!(
                     instrument = config.instrument,
-                    %error,
-                    "using recent cached index candles after Angel historical fetch failed"
+                    error = %error_text,
+                    "Angel historical fetch failed; falling back to cached index candles if available"
                 );
             }
         }
@@ -3001,10 +3043,27 @@ async fn cached_index_candles(
 
     let candles = load_cached_index_candles(state, config, from_utc, to_utc).await?;
     if candles.is_empty() {
-        return Err(AppError::BadRequest(format!(
-            "No cached or broker-returned {} candles are available for SuperTrend.",
-            config.instrument
-        )));
+        return Err(AppError::BadRequest(match fetch_error {
+            Some(error) => format!(
+                "No cached {} candles are available for SuperTrend after Angel historical fetch failed: {error}",
+                config.instrument
+            ),
+            None => format!(
+                "No cached or broker-returned {} candles are available for SuperTrend.",
+                config.instrument
+            ),
+        }));
+    }
+    if let Some(error) = fetch_error {
+        if let Some(latest) = candles.last() {
+            tracing::warn!(
+                instrument = config.instrument,
+                latest_candle = %latest.at,
+                requested_to = %to_candle,
+                %error,
+                "using cached index candles after Angel historical fetch failed"
+            );
+        }
     }
     Ok(candles)
 }
@@ -5150,17 +5209,14 @@ async fn process_supertrend_instrument(
     if runners.is_empty() {
         return Ok(());
     }
-    let candles = index_candles(state, config, Duration::days(7), now).await?;
+    let candles =
+        index_candles(state, config, Duration::days(SUPERTREND_LOOKBACK_DAYS), now).await?;
     let points = supertrend_points(&candles, SUPERTREND_ATR_PERIOD, SUPERTREND_FACTOR);
-    let Some(signal) = supertrend_signal(&points) else {
+    let Some(signal) = recent_supertrend_signal(&points, now) else {
         return Ok(());
     };
     let date = now.date_naive();
-    if signal.signal_at.date() != date
-        || candles
-            .last()
-            .is_none_or(|latest| latest.at != signal.signal_at)
-    {
+    if signal.signal_at.date() != date {
         return Ok(());
     }
     place_supertrend_entries_for_signal(state, config, &runners, signal, now).await
@@ -5312,11 +5368,26 @@ async fn run_supertrend_cycle(state: &AppState, now: DateTime<FixedOffset>) -> A
     if !option_entry_allowed(now) {
         return Ok(());
     }
+    let mut errors = Vec::new();
     for instrument in ["SENSEX", "NIFTY"] {
         let Some(config) = index_option_config(instrument) else {
             continue;
         };
-        process_supertrend_instrument(state, config, now).await?;
+        if let Err(error) = process_supertrend_instrument(state, config, now).await {
+            tracing::warn!(
+                instrument,
+                %error,
+                "SuperTrend instrument cycle failed; continuing with remaining instruments"
+            );
+            errors.push(format!("{instrument}: {error}"));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "SuperTrend cycle had {} non-fatal instrument error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )));
     }
     Ok(())
 }
@@ -6134,7 +6205,7 @@ pub fn start(state: AppState) {
                 });
             }
             if (OPTION_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE).contains(&minute_of_day)
-                && minute_of_day.is_multiple_of(5)
+                && minute_of_day % 5 == 1
                 && dispatched.insert(format!("{date}:supertrend-options:{}", now.format("%H%M")))
             {
                 let cloned = state.clone();
@@ -9425,6 +9496,84 @@ mod tests {
         assert_eq!(signal.side, IndexOptionSide::Call);
         assert_eq!(signal.direction, SuperTrendDirection::Up);
         assert_eq!(signal.signal_at, candles.last().unwrap().at);
+    }
+
+    #[test]
+    fn supertrend_recent_signal_catches_missed_flip_candle() {
+        let base = NaiveDate::from_ymd_opt(2026, 8, 17)
+            .unwrap()
+            .and_hms_opt(11, 35, 0)
+            .unwrap();
+        let candle = |minutes: i64, close: f64| IntradayCandle {
+            at: base + Duration::minutes(minutes),
+            open: close,
+            high: close + 2.0,
+            low: close - 2.0,
+            close,
+        };
+        let points = vec![
+            SuperTrendPoint {
+                candle: candle(0, 100.0),
+                value: 104.0,
+                direction: SuperTrendDirection::Down,
+            },
+            SuperTrendPoint {
+                candle: candle(5, 101.0),
+                value: 103.0,
+                direction: SuperTrendDirection::Down,
+            },
+            SuperTrendPoint {
+                candle: candle(10, 110.0),
+                value: 102.0,
+                direction: SuperTrendDirection::Up,
+            },
+            SuperTrendPoint {
+                candle: candle(15, 111.0),
+                value: 103.0,
+                direction: SuperTrendDirection::Up,
+            },
+        ];
+        let now = FixedOffset::east_opt(19_800)
+            .unwrap()
+            .from_local_datetime(&(base + Duration::minutes(21)))
+            .single()
+            .unwrap();
+        let signal = recent_supertrend_signal(&points, now).unwrap();
+        assert_eq!(signal.side, IndexOptionSide::Call);
+        assert_eq!(signal.signal_at, candle(10, 110.0).at);
+    }
+
+    #[test]
+    fn supertrend_recent_signal_ignores_stale_flip_candle() {
+        let base = NaiveDate::from_ymd_opt(2026, 8, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let candle = |minutes: i64, close: f64| IntradayCandle {
+            at: base + Duration::minutes(minutes),
+            open: close,
+            high: close + 2.0,
+            low: close - 2.0,
+            close,
+        };
+        let points = vec![
+            SuperTrendPoint {
+                candle: candle(0, 100.0),
+                value: 104.0,
+                direction: SuperTrendDirection::Down,
+            },
+            SuperTrendPoint {
+                candle: candle(5, 110.0),
+                value: 102.0,
+                direction: SuperTrendDirection::Up,
+            },
+        ];
+        let now = FixedOffset::east_opt(19_800)
+            .unwrap()
+            .from_local_datetime(&(base + Duration::minutes(45)))
+            .single()
+            .unwrap();
+        assert!(recent_supertrend_signal(&points, now).is_none());
     }
 
     #[test]
