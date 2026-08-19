@@ -48,7 +48,10 @@ At signal time the backend:
    - SENSEX from BFO
    - NIFTY from NFO
 4. Selects the strike nearest to the underlying LTP.
-5. Fetches selected option LTP and places a MARKET buy entry.
+5. Fetches the selected option LTP once for that instrument signal.
+6. Fans the same selected contract out to isolated concurrent per-user MARKET
+   buy entry tasks. Each user keeps their own lot, TP, SL, risk, margin, and
+   broker-session checks.
 
 ## User configuration
 
@@ -82,11 +85,32 @@ remaining active exit order.
 
 ## Trading window
 
-Entries and reversals run from 09:20 IST until before 15:20 IST.
+The scheduler evaluates SuperTrend on exact 5-minute boundaries from 09:15 IST
+until 15:20 IST. Entries and reversals are allowed from 09:15 IST until before
+15:20 IST. Only completed 5-minute candles are used.
 
 At/after 15:20 IST, the strategy attempts intraday square-off for open
 positions. Active protective orders are cancelled before square-off when
 possible. No new SuperTrend entries are submitted at or after 15:20 IST.
+
+## Runtime concurrency
+
+The backend uses Tokio asynchronous tasks; it does not reserve an operating-
+system thread for every user or instrument. The production container currently
+has two CPU cores, so async tasks are multiplexed over two Tokio worker threads.
+
+- One leader scheduler task dispatches the SuperTrend cycle.
+- SENSEX and NIFTY candle/signal evaluation is intentionally sequential to
+  avoid bursting Angel One's historical-data API.
+- A confirmed instrument signal performs one shared index/ATM-contract lookup.
+- Eligible users are then processed concurrently in isolated tasks. One user's
+  slow broker response or failure does not hold or cancel another user's task.
+- One shared market WebSocket task is used per active exchange (BFO/NFO), not
+  per user and not per token.
+- A per-user signal/session guard prevents the same closed-candle signal from
+  being entered twice during the recovery window.
+
+See [the SuperTrend runtime flowchart](supertrend-runtime-flow.svg).
 
 ## Backtesting
 

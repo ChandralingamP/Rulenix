@@ -45,6 +45,7 @@ const OPTION_MAX_PREMIUM: f64 = 290.0;
 const OPTION_TARGET_PREMIUM: f64 = 260.0;
 const OPTION_PRODUCT_TYPE: &str = "INTRADAY";
 const OPTION_ENTRY_START_MINUTE: u32 = 9 * 60 + 20;
+const SUPERTREND_ENTRY_START_MINUTE: u32 = 9 * 60 + 15;
 const OPTION_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
 const OPTION_SCHEDULER_END_MINUTE: u32 = 15 * 60 + 30;
 const FUTURES_EXPIRY_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
@@ -74,6 +75,12 @@ struct OptionContract {
     strike: f64,
     option_type: &'static str,
     premium: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SuperTrendMarketSelection {
+    contract: OptionContract,
+    underlying_ltp: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -986,6 +993,11 @@ fn option_minute_of_day(now: DateTime<FixedOffset>) -> u32 {
 fn option_entry_allowed(now: DateTime<FixedOffset>) -> bool {
     let minute = option_minute_of_day(now);
     (OPTION_ENTRY_START_MINUTE..OPTION_SQUARE_OFF_MINUTE).contains(&minute)
+}
+
+fn supertrend_entry_allowed(now: DateTime<FixedOffset>) -> bool {
+    let minute = option_minute_of_day(now);
+    (SUPERTREND_ENTRY_START_MINUTE..OPTION_SQUARE_OFF_MINUTE).contains(&minute)
 }
 
 fn option_square_off_due(now: DateTime<FixedOffset>) -> bool {
@@ -2480,17 +2492,13 @@ async fn select_supertrend_atm_option_contract(
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn supertrend_option_snapshot_for_signal(
+async fn select_supertrend_market_for_signal(
     state: &AppState,
     config: IndexOptionConfig,
     side: IndexOptionSide,
     date: NaiveDate,
     signal_at: NaiveDateTime,
-    user_id: Uuid,
-    target_points: f64,
-    stop_loss_points: f64,
-) -> AppResult<(Snapshot, f64, f64)> {
+) -> AppResult<SuperTrendMarketSelection> {
     let underlying = index_ltp(state, config).await?;
     let excluded_tokens = HashSet::new();
     let contracts = load_contract_master(state).await?;
@@ -2532,6 +2540,34 @@ async fn supertrend_option_snapshot_for_signal(
         contract.premium,
     )
     .await?;
+    emit_for(
+        state,
+        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+        None,
+        config.instrument,
+        "supertrend_atm_contract_selected",
+        json!({"symbol":contract.symbol,"token":contract.token,"expiry":contract.expiry,"strike":contract.strike,"option_type":contract.option_type,"premium":contract.premium,"underlying_ltp":underlying,"signal_at":signal_at}),
+    )
+    .await;
+    Ok(SuperTrendMarketSelection {
+        contract,
+        underlying_ltp: underlying,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supertrend_option_snapshot_for_signal(
+    state: &AppState,
+    config: IndexOptionConfig,
+    side: IndexOptionSide,
+    date: NaiveDate,
+    signal_at: NaiveDateTime,
+    user_id: Uuid,
+    target_points: f64,
+    stop_loss_points: f64,
+    selection: &SuperTrendMarketSelection,
+) -> AppResult<Snapshot> {
+    let contract = &selection.contract;
     let id = Uuid::new_v4();
     let option_instrument = config.option_instrument(side);
     let execution_key = format!(
@@ -2572,7 +2608,7 @@ async fn supertrend_option_snapshot_for_signal(
         .bind(buy_sl1)
         .bind(sell_target)
         .bind(sell_sl1)
-        .bind(underlying)
+        .bind(selection.underlying_ltp)
         .execute(&state.db)
         .await?;
     let query = format!(
@@ -2587,16 +2623,7 @@ async fn supertrend_option_snapshot_for_signal(
         .fetch_one(&state.db)
         .await?;
     snapshot.fetched_at = now;
-    emit_for(
-        state,
-        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
-        None,
-        config.instrument,
-        "supertrend_atm_contract_selected",
-        json!({"symbol":contract.symbol,"token":contract.token,"expiry":contract.expiry,"strike":contract.strike,"option_type":contract.option_type,"premium":contract.premium,"underlying_ltp":underlying,"signal_at":signal_at}),
-    )
-    .await;
-    Ok((snapshot, contract.premium, underlying))
+    Ok(snapshot)
 }
 
 async fn option_snapshot_for_signal(
@@ -5075,129 +5102,242 @@ async fn place_supertrend_entries_for_signal(
     signal: SuperTrendSignal,
     now: DateTime<FixedOffset>,
 ) -> AppResult<()> {
-    let mut errors = Vec::new();
-    for runner in runners {
-        if runner.target_points <= 0.0 || runner.stop_loss_points <= 0.0 {
-            errors.push(format!(
-                "{}: TP and SL points must be positive.",
-                runner.username
-            ));
-            continue;
-        }
-        if user_has_supertrend_side_exposure(state, runner.user_id, config.instrument, signal.side)
-            .await?
-        {
-            continue;
-        }
-        let opposite = signal.side.opposite();
-        if let Err(error) = cancel_supertrend_active_entries_for_side(
-            state,
-            runner.user_id,
-            config.instrument,
-            opposite,
-            "SuperTrend reversal confirmed; cancelling stale opposite entry.",
-        )
-        .await
-        {
-            errors.push(format!("{}: {error}", runner.username));
-            continue;
-        }
-        if let Err(error) = close_supertrend_open_trades_for_side(
-            state,
-            runner,
-            config,
-            opposite,
-            now,
-            "SuperTrend reversal confirmed.",
-        )
-        .await
-        {
-            errors.push(format!("{}: {error}", runner.username));
-            continue;
-        }
-        let (snapshot, execution_price, underlying_ltp) =
-            match supertrend_option_snapshot_for_signal(
-                state,
-                config,
-                signal.side,
-                signal.signal_at.date(),
-                signal.signal_at,
-                runner.user_id,
-                runner.target_points,
-                runner.stop_loss_points,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    errors.push(format!("{}: {error}", runner.username));
-                    continue;
-                }
-            };
-        if let Some(token) = snapshot.contract_token.clone() {
-            crate::market_ws::ensure_strategy_feed(
-                state.clone(),
-                snapshot.exchange_segment.clone(),
-                token,
+    let session = format!(
+        "st-{}-{}-{}-{}",
+        config.instrument,
+        signal.signal_at.format("%Y%m%d"),
+        signal.signal_at.format("%H%M"),
+        signal.side.option_type()
+    );
+    let user_ids: Vec<Uuid> = runners.iter().map(|runner| runner.user_id).collect();
+    let processed_user_ids: HashSet<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT user_id FROM (
+            SELECT user_id FROM strategy_orders
+            WHERE user_id=ANY($1)
+              AND session_key=$2
+              AND role IN ('BUY_ENTRY','SELL_ENTRY')
+              AND status<>'failed'
+            UNION ALL
+            SELECT user_id FROM strategy_events
+            WHERE user_id=ANY($1)
+              AND strategy_key=$3
+              AND event_type='supertrend_entry_skipped'
+              AND payload->>'session_key'=$2
+              AND payload->>'reason'='SAME_SIDE_POSITION_ALREADY_OPEN'
+         ) processed",
+    )
+    .bind(&user_ids)
+    .bind(&session)
+    .bind(SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let pending_runners: Vec<_> = runners
+        .iter()
+        .filter(|runner| !processed_user_ids.contains(&runner.user_id))
+        .cloned()
+        .collect();
+    if pending_runners.is_empty() {
+        return Ok(());
+    }
+    let selection = select_supertrend_market_for_signal(
+        state,
+        config,
+        signal.side,
+        signal.signal_at.date(),
+        signal.signal_at,
+    )
+    .await?;
+    crate::market_ws::ensure_strategy_feed(
+        state.clone(),
+        config.option_exchange.to_string(),
+        selection.contract.token.clone(),
+    )
+    .await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for runner in pending_runners {
+        let state = state.clone();
+        let selection = selection.clone();
+        let session = session.clone();
+        tasks.spawn(async move {
+            let user_id = runner.user_id;
+            let username = runner.username.clone();
+            let result = place_supertrend_entry_for_runner(
+                &state, config, &runner, signal, now, &session, &selection,
             )
             .await;
+            (user_id, username, result)
+        });
+    }
+
+    let mut errors = Vec::new();
+    let mut successes = 0_usize;
+    while let Some(task) = tasks.join_next().await {
+        match task {
+            Ok((_user_id, _username, Ok(placed))) => successes += usize::from(placed),
+            Ok((user_id, username, Err(error))) => {
+                let message = format!("{username}: {error}");
+                operational_alert_for(
+                    state,
+                    SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+                    Some(user_id),
+                    config.instrument,
+                    "supertrend_user_entry_failed",
+                    "error",
+                    &format!(
+                        "Your {} SuperTrend signal could not place an entry and will retry during the signal recovery window: {error}",
+                        config.instrument
+                    ),
+                )
+                .await;
+                errors.push(message);
+            }
+            Err(error) => errors.push(format!("SuperTrend user task failed: {error}")),
         }
-        let session = format!(
-            "st-{}-{}-{}-{}",
-            config.instrument,
-            signal.signal_at.format("%Y%m%d"),
-            signal.signal_at.format("%H%M"),
-            signal.side.option_type()
+    }
+    if !errors.is_empty() {
+        tracing::warn!(
+            instrument = config.instrument,
+            successes,
+            failures = errors.len(),
+            errors = ?errors,
+            "SuperTrend user fan-out completed with per-user failures"
         );
+    }
+    if successes == 0 && !errors.is_empty() {
+        return Err(AppError::BadRequest(errors.join("; ")));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn place_supertrend_entry_for_runner(
+    state: &AppState,
+    config: IndexOptionConfig,
+    runner: &SuperTrendRunner,
+    signal: SuperTrendSignal,
+    now: DateTime<FixedOffset>,
+    session: &str,
+    selection: &SuperTrendMarketSelection,
+) -> AppResult<bool> {
+    if runner.target_points <= 0.0 || runner.stop_loss_points <= 0.0 {
+        return Err(AppError::BadRequest(
+            "TP and SL points must be positive.".into(),
+        ));
+    }
+    let already_processed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM strategy_orders
+            WHERE user_id=$1 AND session_key=$2
+              AND role IN ('BUY_ENTRY','SELL_ENTRY')
+              AND status<>'failed'
+        )",
+    )
+    .bind(runner.user_id)
+    .bind(session)
+    .fetch_one(&state.db)
+    .await?;
+    if already_processed {
         emit_for(
             state,
             SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
             Some(runner.user_id),
             config.instrument,
-            "supertrend_signal",
-            json!({
-                "side":signal.side.option_type(),
-                "signal_at":signal.signal_at,
-                "index_close":signal.index_close,
-                "index_ltp":underlying_ltp,
-                "supertrend":signal.supertrend,
-                "previous_direction":signal.previous_direction.as_str(),
-                "direction":signal.direction.as_str(),
-                "option_execution_price":execution_price,
-                "target_points":runner.target_points,
-                "stop_loss_points":runner.stop_loss_points,
-                "atr_period":SUPERTREND_ATR_PERIOD,
-                "factor":SUPERTREND_FACTOR,
-            }),
+            "supertrend_entry_skipped",
+            json!({"signal_at":signal.signal_at,"side":signal.side.option_type(),"session_key":session,"reason":"SIGNAL_ALREADY_PROCESSED"}),
         )
         .await;
-        let base_runner = Runner::from(runner.clone());
-        if let Err(error) = place_strategy_order(
+        return Ok(false);
+    }
+
+    let opposite = signal.side.opposite();
+    cancel_supertrend_active_entries_for_side(
+        state,
+        runner.user_id,
+        config.instrument,
+        opposite,
+        "SuperTrend reversal confirmed; cancelling stale opposite entry.",
+    )
+    .await?;
+    close_supertrend_open_trades_for_side(
+        state,
+        runner,
+        config,
+        opposite,
+        now,
+        "SuperTrend reversal confirmed.",
+    )
+    .await?;
+    if user_has_supertrend_side_exposure(state, runner.user_id, config.instrument, signal.side)
+        .await?
+    {
+        emit_for(
             state,
-            &base_runner,
-            &snapshot,
-            &session,
-            NewOrder {
-                role: signal.side.entry_role(),
-                side: signal.side.entry_side(),
-                order_type: "MARKET",
-                lots: runner.lots,
-                price: execution_price,
-                trigger: None,
-                trade_id: None,
-                quantity: None,
-            },
+            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+            Some(runner.user_id),
+            config.instrument,
+            "supertrend_entry_skipped",
+            json!({"signal_at":signal.signal_at,"side":signal.side.option_type(),"session_key":session,"reason":"SAME_SIDE_POSITION_ALREADY_OPEN"}),
         )
-        .await
-        {
-            errors.push(format!("{}: {error}", runner.username));
-        }
+        .await;
+        return Ok(false);
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::BadRequest(errors.join("; ")))
-    }
+
+    let snapshot = supertrend_option_snapshot_for_signal(
+        state,
+        config,
+        signal.side,
+        signal.signal_at.date(),
+        signal.signal_at,
+        runner.user_id,
+        runner.target_points,
+        runner.stop_loss_points,
+        selection,
+    )
+    .await?;
+    emit_for(
+        state,
+        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+        Some(runner.user_id),
+        config.instrument,
+        "supertrend_signal",
+        json!({
+            "side":signal.side.option_type(),
+            "signal_at":signal.signal_at,
+            "index_close":signal.index_close,
+            "index_ltp":selection.underlying_ltp,
+            "supertrend":signal.supertrend,
+            "previous_direction":signal.previous_direction.as_str(),
+            "direction":signal.direction.as_str(),
+            "option_execution_price":selection.contract.premium,
+            "target_points":runner.target_points,
+            "stop_loss_points":runner.stop_loss_points,
+            "atr_period":SUPERTREND_ATR_PERIOD,
+            "factor":SUPERTREND_FACTOR,
+        }),
+    )
+    .await;
+    let base_runner = Runner::from(runner.clone());
+    place_strategy_order(
+        state,
+        &base_runner,
+        &snapshot,
+        session,
+        NewOrder {
+            role: signal.side.entry_role(),
+            side: signal.side.entry_side(),
+            order_type: "MARKET",
+            lots: runner.lots,
+            price: selection.contract.premium,
+            trigger: None,
+            trade_id: None,
+            quantity: None,
+        },
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn process_supertrend_instrument(
@@ -5365,7 +5505,7 @@ async fn run_supertrend_cycle(state: &AppState, now: DateTime<FixedOffset>) -> A
         close_lingering_expired_contract_trades(state, now).await?;
         return Ok(());
     }
-    if !option_entry_allowed(now) {
+    if !supertrend_entry_allowed(now) {
         return Ok(());
     }
     let mut errors = Vec::new();
@@ -6204,8 +6344,9 @@ pub fn start(state: AppState) {
                     }
                 });
             }
-            if (OPTION_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE).contains(&minute_of_day)
-                && minute_of_day % 5 == 1
+            if (SUPERTREND_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE)
+                .contains(&minute_of_day)
+                && minute_of_day.is_multiple_of(5)
                 && dispatched.insert(format!("{date}:supertrend-options:{}", now.format("%H%M")))
             {
                 let cloned = state.clone();
@@ -9470,6 +9611,22 @@ mod tests {
         assert_eq!(values[1], None);
         assert!((values[2].unwrap() - 2.0).abs() < 1e-12);
         assert!((values[3].unwrap() - (2.0 * 2.0 + 4.0) / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn supertrend_entry_window_is_0915_through_1519_ist() {
+        let offset = FixedOffset::east_opt(19_800).unwrap();
+        let at = |hour, minute| {
+            offset
+                .with_ymd_and_hms(2026, 8, 19, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        assert!(!supertrend_entry_allowed(at(9, 14)));
+        assert!(supertrend_entry_allowed(at(9, 15)));
+        assert!(supertrend_entry_allowed(at(15, 19)));
+        assert!(!supertrend_entry_allowed(at(15, 20)));
+        assert!(option_square_off_due(at(15, 20)));
     }
 
     #[test]
