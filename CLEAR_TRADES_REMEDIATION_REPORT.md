@@ -161,6 +161,8 @@ At `2026-08-24 18:30:02 UTC` (midnight IST), all three broker sessions were mark
 
 Cutover stopped before any service stop, directory swap, migration, or deployment. The prepared candidate directory and verified backup are retained for a controlled retry after all relevant Angel One accounts reconnect and the broker-flat audit passes.
 
+The candidate images are retained under explicit `rulenix-backend:8dadcf0-candidate` and `rulenix-frontend:8dadcf0-candidate` tags. The production `latest` tags were rebuilt from the still-running `dfa5316` source, preventing an unrelated compose restart from activating the blocked candidate. Running containers were not restarted.
+
 ## Final Status
 
 CLEAR CLOSED DEMO TRADES: PASS
