@@ -267,7 +267,6 @@ export default function ProfitLossPage() {
                   trade.strategy_name ||
                   {
                     futures_breakout_v3: "Futures Breakout v3",
-                    option_entry_v1: "Option Entry Strategy V1.0",
                     supertrend_index_options_v1:
                       "SuperTrend Index Options v1",
                   }[trade.strategy_key] ||

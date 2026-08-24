@@ -41,9 +41,6 @@ describe("App", () => {
           },
         });
       }
-      if (url === "/account/balance") {
-        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
-      }
       return Promise.resolve({
         data: {
           client_id: "TRADER01",
@@ -75,9 +72,6 @@ describe("App", () => {
             trading_mode: "demo",
           },
         });
-      }
-      if (url === "/account/balance") {
-        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
       }
       return Promise.resolve({
         data: {
@@ -114,9 +108,6 @@ describe("App", () => {
             trading_mode: "demo",
           },
         });
-      }
-      if (url === "/account/balance") {
-        return Promise.resolve({ data: { mode: "demo", balance: 200000 } });
       }
       return Promise.resolve({
         data: {
@@ -243,7 +234,6 @@ describe("App", () => {
       });
       expect(tradingDaySwitch).toHaveAttribute("aria-checked", "true");
     });
-    expect(axios.get.mock.calls.some(([url]) => url === "/account/balance")).toBe(false);
   });
 
   it("shows all global and per-user limits on the dedicated limits route", async () => {
@@ -256,7 +246,6 @@ describe("App", () => {
       max_daily_realized_loss: 1000000,
       max_daily_unrealized_loss: 1000000,
       max_price_age_seconds: 30,
-      margin_requirement_percent: 10,
     };
     axios.get.mockImplementation((url) => {
       if (url === "/auth/access/") {

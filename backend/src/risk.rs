@@ -24,7 +24,6 @@ pub struct Limits {
     pub max_daily_realized_loss: f64,
     pub max_daily_unrealized_loss: f64,
     pub max_price_age_seconds: i32,
-    pub margin_requirement_percent: f64,
 }
 
 #[derive(Debug)]
@@ -40,13 +39,11 @@ pub struct OrderRisk<'a> {
     pub quantity: i32,
     pub price: f64,
     pub trigger_price: Option<f64>,
-    pub margin_required: Option<f64>,
     pub idempotency_key: &'a str,
     pub snapshot_ready: bool,
     pub snapshot_current: bool,
     pub exchange_segment: &'a str,
     pub contract_token: &'a str,
-    pub live_margin_available: Option<f64>,
     pub live_reconciled: bool,
 }
 
@@ -121,7 +118,7 @@ fn evaluate_limits(limits: &Limits, projected: &Metrics) -> Option<(&'static str
 
 async fn effective_limits(tx: &mut Transaction<'_, Postgres>, user_id: Uuid) -> AppResult<Limits> {
     Ok(sqlx::query_as(
-        "SELECT COALESCE(u.max_lots,g.max_lots)::int4 max_lots,COALESCE(u.max_quantity,g.max_quantity)::int4 max_quantity,COALESCE(u.max_notional,g.max_notional)::float8 max_notional,COALESCE(u.max_open_positions,g.max_open_positions)::int4 max_open_positions,COALESCE(u.max_trades_per_day,g.max_trades_per_day)::int4 max_trades_per_day,COALESCE(u.max_daily_realized_loss,g.max_daily_realized_loss)::float8 max_daily_realized_loss,COALESCE(u.max_daily_unrealized_loss,g.max_daily_unrealized_loss)::float8 max_daily_unrealized_loss,COALESCE(u.max_price_age_seconds,g.max_price_age_seconds)::int4 max_price_age_seconds,COALESCE(u.margin_requirement_percent,g.margin_requirement_percent)::float8 margin_requirement_percent FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1 WHERE g.user_id IS NULL"
+        "SELECT COALESCE(u.max_lots,g.max_lots)::int4 max_lots,COALESCE(u.max_quantity,g.max_quantity)::int4 max_quantity,COALESCE(u.max_notional,g.max_notional)::float8 max_notional,COALESCE(u.max_open_positions,g.max_open_positions)::int4 max_open_positions,COALESCE(u.max_trades_per_day,g.max_trades_per_day)::int4 max_trades_per_day,COALESCE(u.max_daily_realized_loss,g.max_daily_realized_loss)::float8 max_daily_realized_loss,COALESCE(u.max_daily_unrealized_loss,g.max_daily_unrealized_loss)::float8 max_daily_unrealized_loss,COALESCE(u.max_price_age_seconds,g.max_price_age_seconds)::int4 max_price_age_seconds FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1 WHERE g.user_id IS NULL"
     ).bind(user_id).fetch_one(&mut **tx).await?)
 }
 
@@ -151,7 +148,7 @@ pub async fn assess_and_reserve(
     sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(order.user_id)
         .execute(&mut *tx)
         .await?;
@@ -174,7 +171,7 @@ pub async fn assess_and_reserve(
     }
 
     let limits = effective_limits(&mut tx, order.user_id).await?;
-    let protective = matches!(order.role, "TARGET" | "SL1" | "SL2");
+    let protective = matches!(order.role, "TARGET" | "SL1" | "SL2" | "EMERGENCY_CLOSE");
     let order_id = Uuid::new_v4();
     let mut code = "allowed";
     let mut message = "Order passed all risk checks.";
@@ -252,6 +249,23 @@ pub async fn assess_and_reserve(
                 "Order rejected: broker reconciliation is not healthy.",
             );
         }
+        if code == "allowed" && order.mode == "live" {
+            let unresolved_position: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM broker_position_incidents i JOIN strategy_market_snapshots s ON s.id=$4 WHERE i.user_id=$1 AND i.status IN ('open','operator_required') AND (i.incident_type='UNMAPPED_BROKER_POSITION' OR (i.exchange_segment=$2 AND i.contract_token=$3) OR (i.strategy_key=s.strategy_key AND split_part(i.instrument,'_',1)=split_part(s.instrument,'_',1))))",
+            )
+            .bind(order.user_id)
+            .bind(order.exchange_segment)
+            .bind(order.contract_token)
+            .bind(order.snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unresolved_position {
+                (code, message) = reject(
+                    "broker_position_mismatch",
+                    "Order rejected: broker/local position reconciliation requires attention.",
+                );
+            }
+        }
 
         let exposure: (i64, i64, f64, i64, i64, f64, f64) = sqlx::query_as(
             r#"
@@ -290,7 +304,7 @@ pub async fn assess_and_reserve(
             ),
             open AS (
                 SELECT
-                    COALESCE(SUM(total_lots), 0)::bigint lots,
+                    COALESCE(SUM(remaining_lots), 0)::bigint lots,
                     COALESCE(SUM(quantity), 0)::bigint quantity,
                     COALESCE(SUM(
                         COALESCE(last_price,entry_price) * CASE
@@ -385,50 +399,18 @@ pub async fn assess_and_reserve(
         {
             (code, message) = reason;
         }
-        let required_margin = order
-            .margin_required
-            .filter(|value| *value > 0.0)
-            .unwrap_or(
-                order_notional_units * order.price * limits.margin_requirement_percent / 100.0,
-            );
-        if code == "allowed" && order.mode == "demo" {
-            let demo_balance: Option<f64> = sqlx::query_scalar(
-                "SELECT demo_balance::float8 FROM user_profiles WHERE user_id=$1",
-            )
-            .bind(order.user_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if demo_balance.is_none_or(|value| value < required_margin) {
-                (code, message) = reject(
-                    "insufficient_margin",
-                    "Order rejected: demo balance is insufficient for the required margin.",
-                );
-            }
-        }
-        if code == "allowed"
-            && order.mode == "live"
-            && order
-                .live_margin_available
-                .is_none_or(|v| !v.is_finite() || v < required_margin)
-        {
-            (code, message) = reject(
-                "insufficient_margin",
-                "Order rejected: available broker margin is insufficient.",
-            );
-        }
     } else if code == "allowed" && protective {
         code = "protective_exit_allowed";
         message = "Protective exit passed safety validation.";
     }
 
-    let margin_required = order.margin_required.unwrap_or(0.0);
-    let values = json!({"limits":limits,"order":{"lots":order.lots,"quantity":order.quantity,"price":order.price,"role":order.role,"margin_required":margin_required},"projected":{"lots":metrics.lots,"quantity":metrics.quantity,"notional":metrics.notional,"open_positions":metrics.positions,"trades_today":metrics.trades_today,"realized_pnl":metrics.realized_pnl,"unrealized_pnl":metrics.unrealized_pnl},"health":{"global_kill":global_kill,"user_kill":user_kill,"account_safe":account_safe,"snapshot_ready":order.snapshot_ready,"snapshot_current":order.snapshot_current,"market_price_age_seconds":tick_age,"broker_reconciled":order.live_reconciled,"margin_available":order.live_margin_available}});
+    let values = json!({"limits":limits,"order":{"lots":order.lots,"quantity":order.quantity,"price":order.price,"role":order.role},"projected":{"lots":metrics.lots,"quantity":metrics.quantity,"notional":metrics.notional,"open_positions":metrics.positions,"trades_today":metrics.trades_today,"realized_pnl":metrics.realized_pnl,"unrealized_pnl":metrics.unrealized_pnl},"health":{"global_kill":global_kill,"user_kill":user_kill,"account_safe":account_safe,"snapshot_ready":order.snapshot_ready,"snapshot_current":order.snapshot_current,"market_price_age_seconds":tick_age,"broker_reconciled":order.live_reconciled}});
     let allowed = matches!(code, "allowed" | "protective_exit_allowed");
     let decision_id =
         persist_decision(&mut tx, order, order_id, allowed, code, message, &values).await?;
     if allowed {
-        sqlx::query("INSERT INTO strategy_orders (id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,trigger_price,margin_required,status,idempotency_key,risk_decision_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$15)")
-            .bind(order_id).bind(order.user_id).bind(order.snapshot_id).bind(order.trade_id).bind(order.session).bind(order.role).bind(order.side).bind(order.mode).bind(order.lots).bind(order.quantity).bind(order.price).bind(order.trigger_price).bind(margin_required).bind(order.idempotency_key).bind(decision_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO strategy_orders (id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,trigger_price,status,idempotency_key,risk_decision_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',$13,$14)")
+            .bind(order_id).bind(order.user_id).bind(order.snapshot_id).bind(order.trade_id).bind(order.session).bind(order.role).bind(order.side).bind(order.mode).bind(order.lots).bind(order.quantity).bind(order.price).bind(order.trigger_price).bind(order.idempotency_key).bind(decision_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     if allowed {
@@ -468,6 +450,11 @@ pub async fn cancel_pending_entries(
     user_id: Option<Uuid>,
     reason: &str,
 ) -> AppResult<Vec<(Uuid, Uuid, String, String, String, String)>> {
+    sqlx::query("UPDATE strategy_orders SET broker_status=$2,updated_at=NOW() WHERE role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('submitting','ambiguous','processing','cancelling') AND ($1::uuid IS NULL OR user_id=$1)")
+        .bind(user_id)
+        .bind(format!("{reason}; in-flight entry is reconciliation-only and will not be retried."))
+        .execute(&state.db)
+        .await?;
     let rows=sqlx::query_as("UPDATE strategy_orders SET status='cancelling',broker_status=$2,updated_at=NOW() WHERE role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitted','partially_filled') AND ($1::uuid IS NULL OR user_id=$1) RETURNING id,user_id,execution_mode,broker_order_id,role,order_type")
         .bind(user_id).bind(reason).fetch_all(&state.db).await?;
     Ok(rows)
@@ -484,7 +471,6 @@ pub struct LimitsUpdate {
     pub max_daily_realized_loss: Option<f64>,
     pub max_daily_unrealized_loss: Option<f64>,
     pub max_price_age_seconds: Option<i32>,
-    pub margin_requirement_percent: Option<f64>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -524,13 +510,10 @@ async fn update_limits(
         v.max_daily_realized_loss,
         v.max_daily_unrealized_loss,
         v.max_price_age_seconds.map(|x| x as f64),
-        v.margin_requirement_percent,
     ];
-    if vals.iter().flatten().any(|x| !x.is_finite() || *x <= 0.0)
-        || v.margin_requirement_percent.is_some_and(|x| x > 100.0)
-    {
+    if vals.iter().flatten().any(|x| !x.is_finite() || *x <= 0.0) {
         return Err(AppError::BadRequest(
-            "Risk limits must be positive finite values; margin percent cannot exceed 100.".into(),
+            "Risk limits must be positive finite values.".into(),
         ));
     }
     if user.is_none() && vals.iter().any(Option::is_none) {
@@ -540,7 +523,7 @@ async fn update_limits(
     }
     let mut tx = state.db.begin().await?;
     if let Some(user_id) = user {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
@@ -550,10 +533,10 @@ async fn update_limits(
             .await?;
     }
     if user.is_some() {
-        sqlx::query("INSERT INTO risk_limits (user_id,max_lots,max_quantity,max_notional,max_open_positions,max_trades_per_day,max_daily_realized_loss,max_daily_unrealized_loss,max_price_age_seconds,margin_requirement_percent,updated_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (user_id) WHERE user_id IS NOT NULL DO UPDATE SET max_lots=EXCLUDED.max_lots,max_quantity=EXCLUDED.max_quantity,max_notional=EXCLUDED.max_notional,max_open_positions=EXCLUDED.max_open_positions,max_trades_per_day=EXCLUDED.max_trades_per_day,max_daily_realized_loss=EXCLUDED.max_daily_realized_loss,max_daily_unrealized_loss=EXCLUDED.max_daily_unrealized_loss,max_price_age_seconds=EXCLUDED.max_price_age_seconds,margin_requirement_percent=EXCLUDED.margin_requirement_percent,updated_by=EXCLUDED.updated_by,updated_at=NOW()")
-        .bind(user).bind(v.max_lots).bind(v.max_quantity).bind(v.max_notional).bind(v.max_open_positions).bind(v.max_trades_per_day).bind(v.max_daily_realized_loss).bind(v.max_daily_unrealized_loss).bind(v.max_price_age_seconds).bind(v.margin_requirement_percent).bind(admin).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO risk_limits (user_id,max_lots,max_quantity,max_notional,max_open_positions,max_trades_per_day,max_daily_realized_loss,max_daily_unrealized_loss,max_price_age_seconds,updated_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (user_id) WHERE user_id IS NOT NULL DO UPDATE SET max_lots=EXCLUDED.max_lots,max_quantity=EXCLUDED.max_quantity,max_notional=EXCLUDED.max_notional,max_open_positions=EXCLUDED.max_open_positions,max_trades_per_day=EXCLUDED.max_trades_per_day,max_daily_realized_loss=EXCLUDED.max_daily_realized_loss,max_daily_unrealized_loss=EXCLUDED.max_daily_unrealized_loss,max_price_age_seconds=EXCLUDED.max_price_age_seconds,updated_by=EXCLUDED.updated_by,updated_at=NOW()")
+        .bind(user).bind(v.max_lots).bind(v.max_quantity).bind(v.max_notional).bind(v.max_open_positions).bind(v.max_trades_per_day).bind(v.max_daily_realized_loss).bind(v.max_daily_unrealized_loss).bind(v.max_price_age_seconds).bind(admin).execute(&mut *tx).await?;
     } else {
-        sqlx::query("UPDATE risk_limits SET max_lots=$1,max_quantity=$2,max_notional=$3,max_open_positions=$4,max_trades_per_day=$5,max_daily_realized_loss=$6,max_daily_unrealized_loss=$7,max_price_age_seconds=$8,margin_requirement_percent=$9,updated_by=$10,updated_at=NOW() WHERE user_id IS NULL").bind(v.max_lots).bind(v.max_quantity).bind(v.max_notional).bind(v.max_open_positions).bind(v.max_trades_per_day).bind(v.max_daily_realized_loss).bind(v.max_daily_unrealized_loss).bind(v.max_price_age_seconds).bind(v.margin_requirement_percent).bind(admin).execute(&mut *tx).await?;
+        sqlx::query("UPDATE risk_limits SET max_lots=$1,max_quantity=$2,max_notional=$3,max_open_positions=$4,max_trades_per_day=$5,max_daily_realized_loss=$6,max_daily_unrealized_loss=$7,max_price_age_seconds=$8,updated_by=$9,updated_at=NOW() WHERE user_id IS NULL").bind(v.max_lots).bind(v.max_quantity).bind(v.max_notional).bind(v.max_open_positions).bind(v.max_trades_per_day).bind(v.max_daily_realized_loss).bind(v.max_daily_unrealized_loss).bind(v.max_price_age_seconds).bind(admin).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -595,7 +578,7 @@ pub async fn update_kill(
     });
     let mut tx = state.db.begin().await?;
     if let Some(user_id) = user {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
@@ -648,7 +631,6 @@ mod tests {
             max_daily_realized_loss: 100.0,
             max_daily_unrealized_loss: 100.0,
             max_price_age_seconds: 30,
-            margin_requirement_percent: 10.0,
         }
     }
 

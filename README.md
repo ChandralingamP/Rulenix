@@ -192,7 +192,6 @@ live mode, and `user_profiles.trading_mode` stores the selected `demo` or
 | Operation | Signed-in owner | `can_administer` | `can_live_trade` | Selected mode |
 |---|---:|---:|---:|---:|
 | Read/change own account, P&L, logs, strategies | Yes | Not required | Not required | Either |
-| Top up/reset simulated balance | Yes | Not required | Not required | Demo |
 | Administer users or scheduler | Yes | Required | Not relevant | Either |
 | Grant/revoke live-trading permission | Yes | Required | Not relevant | Either |
 | Select live mode | Yes | Not relevant | Required | Explicit confirmation and valid connected broker required |
@@ -275,7 +274,7 @@ failure does not block other live users.
 Every demo and live order is reserved through the database-backed risk engine.
 Entry checks are serialized per user and cover lots, quantity, notional,
 positions, daily trades, realized/unrealized loss, current snapshots, fresh
-market ticks, account/session health, broker reconciliation, and live margin.
+market ticks, account/session health, and broker reconciliation.
 Each allow or rejection is stored in `risk_decisions` with its measured values.
 Global and per-user kill switches atomically stop new entries and cancel pending
 entries without cancelling TARGET, SL1, or SL2 protective exits. Staff can edit
@@ -312,7 +311,6 @@ otherwise reusable credentials.
 - `GET|PATCH|DELETE /api/auth/admin/users/`
 - `GET /api/home/status/`, `POST /api/home/connect/`, `PATCH /api/home/profile/`
 - `GET|PATCH /api/account/profile`, `POST /api/account/profile/request-otp`
-- `GET /api/account/balance`, `POST /api/account/balance/top-up`, `/reset`
 - `PUT /api/account/trading-mode`
 - `GET /api/pnl`, `/api/pnl/export`
 - `GET /api/logs/files/`, `/api/logs/content/`
@@ -326,13 +324,13 @@ otherwise reusable credentials.
 
 The header gear opens account settings. Username, email, mobile number, and
 Angel One Client ID changes are verified against an OTP sent to the current
-email address. Live accounts load available margin from Angel One `getRMS`;
-demo accounts start with ₹2,00,000 and support local top-up/reset controls.
-Demo orders are simulated from the shared live market feed and persisted in
-`strategy_orders`; fills create/update `trades`, realized P&L adjusts the demo
-balance, and submissions/fills/exits are written to the user's activity log.
+email address. Demo orders are simulated from the shared live market feed
+without a funds gate. Live orders are submitted directly to Angel One; broker
+rejections, including insufficient funds, are recorded and shown to the
+affected user. Orders and fills are persisted in `strategy_orders` and
+`trades`, and execution events are written to the user's activity log.
 
-Every account, balance, P&L, log, strategy, scheduler, administration, market
+Every account, P&L, log, strategy, scheduler, administration, market
 WebSocket, and strategy WebSocket route requires a valid session. Identity and
 roles come only from that session. Protected schemas reject legacy `username`
 and `admin_username` identity fields.
@@ -353,7 +351,6 @@ npm run build
 
 - Current project workflow: [project-workflow.md](docs/project-workflow.md)
 - Futures Breakout v3 strategy: [strategy-futures-breakout-v3.md](docs/strategy-futures-breakout-v3.md)
-- Option Entry Strategy V1.0: [strategy-option-entry-v1.md](docs/strategy-option-entry-v1.md)
 - SuperTrend Index Options v1: [strategy-supertrend-index-options-v1.md](docs/strategy-supertrend-index-options-v1.md)
 - Deployment and rollback: [deployment.md](docs/deployment.md)
 - TLS and secret injection: [production-security.md](docs/production-security.md)

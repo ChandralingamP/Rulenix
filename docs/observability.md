@@ -14,6 +14,7 @@ Never log credentials, cookies, authorization headers, MPINs, TOTPs, or broker t
 - Market feed age
 - Scheduler run counts
 - Order counts by status
+- Durable execution-intent counts and incomplete confirmed signals
 - Broker errors in the last 24 hours
 - Risk rejections in the last 24 hours
 - Unhealthy reconciliation records

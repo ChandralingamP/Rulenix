@@ -26,12 +26,6 @@ const adminNavItems = [
   { label: "System jobs", to: "/admin/jobs" },
 ];
 
-const balanceFormatter = new Intl.NumberFormat("en-IN", {
-  style: "currency",
-  currency: "INR",
-  maximumFractionDigits: 0,
-});
-
 export default function Layout({ children }) {
   const dispatch = useDispatch();
   const navigate = useNavigate();
@@ -46,8 +40,6 @@ export default function Layout({ children }) {
   const [tradingMode, setTradingMode] = useState("demo");
   const [sessionReady, setSessionReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [accountBalance, setAccountBalance] = useState(null);
-  const [balanceError, setBalanceError] = useState("");
   const brokerDetails = useSelector((state) => state.home.details);
   const isAdmin = permissions.administer_users;
   const brokerConnectionState = String(
@@ -65,24 +57,6 @@ export default function Layout({ children }) {
     }
     return items;
   }, [permissions.administer_users, permissions.backtesting]);
-
-  const loadAccountBalance = useCallback(async () => {
-    if (!username || permissions.administer_users) {
-      setAccountBalance(null);
-      setBalanceError("");
-      return;
-    }
-    try {
-      setBalanceError("");
-      const response = await apiClient.get("/account/balance");
-      setAccountBalance(response.data);
-    } catch (requestError) {
-      setAccountBalance(null);
-      setBalanceError(
-        requestError.response?.data?.detail || "Balance unavailable"
-      );
-    }
-  }, [permissions.administer_users, username]);
 
   const syncAccessStatus = useCallback(async () => {
     try {
@@ -122,10 +96,6 @@ export default function Layout({ children }) {
       }
     }
   }, [location.pathname, navigate]);
-
-  useEffect(() => {
-    if (sessionReady && !permissions.administer_users) loadAccountBalance();
-  }, [loadAccountBalance, permissions.administer_users, sessionReady]);
 
   useEffect(() => {
     if (sessionReady && username && !permissions.administer_users) {
@@ -319,19 +289,6 @@ export default function Layout({ children }) {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            {!isAdmin ? (
-              <div
-                className="rounded-full border border-slate-800 bg-slate-900/60 px-4 py-2 text-xs text-slate-300"
-                title={balanceError || "Available account balance"}
-              >
-                {tradingMode === "live" ? "Live" : "Demo"} balance{" "}
-                <span className="font-semibold text-white">
-                  {accountBalance
-                    ? balanceFormatter.format(Number(accountBalance.balance || 0))
-                    : "—"}
-                </span>
-              </div>
-            ) : null}
             <div className="rounded-full border border-slate-800 bg-slate-900/60 px-4 py-2 text-xs text-slate-300">
               Logged in as{" "}
               <span className="font-semibold text-white">
@@ -406,13 +363,11 @@ export default function Layout({ children }) {
           username={username}
           onClose={() => setSettingsOpen(false)}
           onProfileChanged={handleProfileChanged}
-          onBalanceChanged={setAccountBalance}
           permissions={permissions}
           tradingMode={tradingMode}
           onTradingModeChanged={(mode) => {
             setTradingMode(mode);
             syncAccessStatus();
-            loadAccountBalance();
           }}
         />
       ) : null}

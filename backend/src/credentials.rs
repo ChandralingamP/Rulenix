@@ -168,6 +168,18 @@ impl CredentialStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_isolated_test(db: PgPool) -> Self {
+        let material = STANDARD.encode([0_u8; 32]);
+        Self {
+            db,
+            cipher: Arc::new(
+                CredentialCipher::from_encoded(1, &format!("1:{material}"))
+                    .expect("deterministic test credential key must be valid"),
+            ),
+        }
+    }
+
     pub async fn load(&self, user_id: Uuid) -> AppResult<BrokerCredentials> {
         let rows: Vec<EncryptedCredentialRow> = sqlx::query_as(
             "SELECT secret_kind,key_version,nonce,ciphertext FROM broker_secrets WHERE user_id=$1",

@@ -39,11 +39,28 @@ pub struct Config {
     pub alert_webhook_url: Option<String>,
     pub alert_email_to: Option<String>,
     pub force_demo_trading: bool,
+    pub protection_ack_timeout_seconds: i64,
+    pub protection_max_attempts: i32,
+    pub ambiguous_order_timeout_seconds: i64,
+    pub margin_safety_buffer_percent: f64,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_isolated_test(database_url: &str, angel_api_base: &str) -> Self {
+        let mut config = Self::from_lookup(|key| match key {
+            "APP_ENV" => Some("test".into()),
+            "DATABASE_URL" => Some(database_url.into()),
+            "FORCE_DEMO_TRADING" => Some("false".into()),
+            _ => None,
+        })
+        .expect("isolated test configuration must be valid");
+        config.angel_api_base = angel_api_base.into();
+        config
     }
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
@@ -128,6 +145,22 @@ impl Config {
             alert_webhook_url: non_empty(&mut lookup, "ALERT_WEBHOOK_URL"),
             alert_email_to: non_empty(&mut lookup, "ALERT_EMAIL_TO"),
             force_demo_trading: parse_env(&mut lookup, "FORCE_DEMO_TRADING", false)?,
+            protection_ack_timeout_seconds: parse_env(
+                &mut lookup,
+                "PROTECTION_ACK_TIMEOUT_SECONDS",
+                30,
+            )?,
+            protection_max_attempts: parse_env(&mut lookup, "PROTECTION_MAX_ATTEMPTS", 3)?,
+            ambiguous_order_timeout_seconds: parse_env(
+                &mut lookup,
+                "AMBIGUOUS_ORDER_TIMEOUT_SECONDS",
+                120,
+            )?,
+            margin_safety_buffer_percent: parse_env(
+                &mut lookup,
+                "MARGIN_SAFETY_BUFFER_PERCENT",
+                10.0,
+            )?,
         };
         config.validate(&mut lookup)?;
         Ok(config)
@@ -158,6 +191,12 @@ impl Config {
             || self.login_lockout_base_seconds <= 0
             || self.login_lockout_max_seconds < self.login_lockout_base_seconds
             || self.max_request_body_bytes < 1024
+            || self.protection_ack_timeout_seconds < 10
+            || self.protection_max_attempts <= 0
+            || self.ambiguous_order_timeout_seconds < 30
+            || !self.margin_safety_buffer_percent.is_finite()
+            || self.margin_safety_buffer_percent < 0.0
+            || self.margin_safety_buffer_percent > 100.0
         {
             anyhow::bail!(
                 "security limits must be positive and MAX_REQUEST_BODY_BYTES must be at least 1024"

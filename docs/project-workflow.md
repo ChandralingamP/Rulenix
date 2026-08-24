@@ -3,7 +3,7 @@
 This document explains how the Rulenix application is organized and how data moves through the system. Strategy-specific trading rules are documented separately:
 
 - [Futures Breakout v3](strategy-futures-breakout-v3.md)
-- [Option Entry Strategy V1.0](strategy-option-entry-v1.md)
+- [SuperTrend Index Options v1](strategy-supertrend-index-options-v1.md)
 
 ## Purpose
 
@@ -24,7 +24,7 @@ Browser
   -> React pages call /api with session cookie + CSRF token
   -> Rust Axum backend validates session, role, request limits
   -> PostgreSQL stores users, configs, snapshots, orders, trades, logs, audits
-  -> Angel One SmartAPI is used for broker login, market data, quotes, margins, orders
+  -> Angel One SmartAPI is used for broker login, market data, quotes, and orders
   -> Strategy scheduler and WebSocket feeds run in backend background tasks
   -> Frontend receives current state through REST and live strategy/market WebSockets
 ```
@@ -137,7 +137,6 @@ Rulenix uses Angel One for:
 - REST historical candles.
 - REST market quotes/LTP.
 - SmartAPI WebSocket V2 live ticks.
-- Margin estimation.
 - Live order submission and reconciliation.
 
 Shared market-data helpers rotate through a small pool of connected Angel One sessions. This prevents one user's temporary rate limit from immediately blocking all shared strategy data. If a broker returns a rate-limit error, the system can try another usable session; invalid credentials are marked invalid.
@@ -161,7 +160,7 @@ The scheduler starts in `backend/src/strategy.rs`.
 The strategy engine currently exposes two strategy keys:
 
 - `futures_breakout_v3`
-- `option_entry_v1`
+- `supertrend_index_options_v1`
 
 Futures gap-entry behavior is part of `futures_breakout_v3`; it is not a separate strategy key.
 
@@ -191,11 +190,11 @@ Before new entries are accepted, the risk engine checks:
 - user trading mode and permissions
 - global/user kill switches
 - configured lots/quantity
-- margin/notional limits
+- notional limits
 - open positions and pending orders
 - daily trade/loss limits
 - fresh market ticks
-- broker health and live account margin when applicable
+- broker health and reconciliation when applicable
 
 Each allow/reject decision is written to `risk_decisions`. Staff can manage limits and kill switches from the Admin Risk page.
 
@@ -212,7 +211,6 @@ Backtesting stores:
 - historical candles in `backtest_market_candles`
 - run metadata and summaries in `backtest_runs`
 - trade rows in `backtest_trades`
-- legacy/optional option contract snapshots in `backtest_option_contracts`
 
 Backtesting data fetch is cache-first:
 
@@ -232,7 +230,9 @@ Fetch chunk sizes are interval-dependent:
 - `ONE_HOUR`: 365 days
 - `ONE_DAY`: 1900 days
 
-Option Entry Strategy V1.0 backtesting is removed. `/api/backtesting/run` rejects `option_entry_v1`; the Backtesting UI exposes Futures Breakout v3 only. Option Entry validation should use live/demo runtime events, selected contract snapshots, and trade/order history.
+The Backtesting UI exposes Futures Breakout v3. SuperTrend is validated through
+its live/demo runtime events, selected contract snapshots, and trade/order
+history.
 
 ## Database areas
 
@@ -242,7 +242,7 @@ Key table groups:
 - Strategies: `user_strategy_activations`, `user_strategy_configs`, `strategy_market_snapshots`, `strategy_orders`, `strategy_events`, `strategy_scheduler_runs`
 - Execution and P&L: `trades`, `broker_order_events`, `strategy_reversal_intents`
 - Risk/ops: `risk_limits`, `risk_kill_switches`, `risk_decisions`, `market_price_ticks`, `broker_reconciliation_health`, `market_calendar`
-- Backtesting: `backtest_market_candles`, `backtest_runs`, `backtest_trades`, `backtest_option_contracts`
+- Backtesting: `backtest_market_candles`, `backtest_runs`, `backtest_trades`
 - Audit/alerts: `audit_events`, `alert_delivery_attempts`
 
 ## Deployment workflow

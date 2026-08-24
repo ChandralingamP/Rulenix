@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, 
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS: u64 = 90;
@@ -126,6 +126,74 @@ async fn activate_cooldown(state: &AppState, api_key: &str, path: &str, seconds:
         .and_modify(|current| *current = (*current).max(until))
         .or_insert(until);
     tracing::warn!(path, seconds, "Angel One API cooldown activated");
+}
+
+async fn wait_for_request_capacity(
+    state: &AppState,
+    api_key: &str,
+    class: &str,
+    limits: &[(usize, StdDuration)],
+) {
+    let key = format!(
+        "{}:{class}",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(api_key.as_bytes()))
+    );
+    let longest_window = limits
+        .iter()
+        .map(|(_, window)| *window)
+        .max()
+        .unwrap_or_else(|| StdDuration::from_secs(1));
+    loop {
+        let now = Instant::now();
+        let wait = {
+            let mut histories = state.angel_request_history.lock().await;
+            let history = histories.entry(key.clone()).or_default();
+            while history
+                .front()
+                .is_some_and(|at| now.duration_since(*at) >= longest_window)
+            {
+                history.pop_front();
+            }
+            let mut wait = StdDuration::ZERO;
+            for (capacity, window) in limits {
+                let first_in_window = history
+                    .iter()
+                    .position(|at| now.duration_since(*at) < *window);
+                let count = first_in_window
+                    .map(|position| history.len() - position)
+                    .unwrap_or_default();
+                if count >= *capacity
+                    && let Some(position) = first_in_window
+                {
+                    let available_at = history[position] + *window;
+                    wait = wait.max(available_at.saturating_duration_since(now));
+                }
+            }
+            if wait.is_zero() {
+                history.push_back(now);
+            }
+            wait
+        };
+        if wait.is_zero() {
+            return;
+        }
+        tokio::time::sleep(wait + StdDuration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_order_capacity(state: &AppState, api_key: &str) {
+    // Keep headroom below Angel One's cumulative place/modify/cancel limits.
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "orders",
+        &[
+            (8, StdDuration::from_secs(1)),
+            (450, StdDuration::from_secs(60)),
+            (900, StdDuration::from_secs(60 * 60)),
+        ],
+    )
+    .await;
 }
 
 fn rate_limit_message(seconds: u64) -> String {
@@ -370,89 +438,6 @@ pub async fn create_session(
         .map_err(|_| AppError::BadRequest("Angel One returned malformed session tokens".into()))
 }
 
-fn numeric_value(value: Option<&Value>) -> Option<f64> {
-    value.and_then(|item| {
-        item.as_f64()
-            .or_else(|| item.as_str().and_then(|text| text.parse::<f64>().ok()))
-    })
-}
-
-pub async fn get_margin(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
-    let data = secure_json(
-        state,
-        reqwest::Method::GET,
-        "/rest/secure/angelbroking/user/v1/getRMS",
-        api_key,
-        jwt_token,
-        None,
-    )
-    .await?;
-    if data.is_null() {
-        return Err(AppError::BadRequest(
-            "Angel One returned no margin data.".into(),
-        ));
-    }
-    let available = numeric_value(data.get("availablecash"))
-        .or_else(|| numeric_value(data.get("availableCash")))
-        .or_else(|| numeric_value(data.get("net")))
-        .ok_or_else(|| {
-            AppError::BadRequest("Angel One margin response has no available balance.".into())
-        })?;
-    Ok(serde_json::json!({"available_balance":available,"provider_data":data}))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn calculate_margin(
-    state: &AppState,
-    api_key: &str,
-    jwt_token: &str,
-    exchange: &str,
-    product_type: &str,
-    token: &str,
-    quantity: i32,
-    order_type: &str,
-    trade_type: &str,
-) -> AppResult<Value> {
-    let body = margin_payload(
-        exchange,
-        product_type,
-        token,
-        quantity,
-        order_type,
-        trade_type,
-    );
-    secure_json(
-        state,
-        reqwest::Method::POST,
-        "/rest/secure/angelbroking/margin/v1/batch",
-        api_key,
-        jwt_token,
-        Some(body),
-    )
-    .await
-}
-
-fn margin_payload(
-    exchange: &str,
-    product_type: &str,
-    token: &str,
-    quantity: i32,
-    order_type: &str,
-    trade_type: &str,
-) -> Value {
-    json!({
-        "positions":[{
-            "exchange":exchange,
-            "orderType":order_type,
-            "qty":quantity.to_string(),
-            "price":"0",
-            "productType":product_type,
-            "token":token,
-            "tradeType":trade_type,
-        }]
-    })
-}
-
 pub async fn market_quote(
     state: &AppState,
     api_key: &str,
@@ -460,6 +445,19 @@ pub async fn market_quote(
     mode: &str,
     exchange_tokens: Value,
 ) -> AppResult<Value> {
+    // Quote requests may contain many tokens, so one conservative request per
+    // client per second is sufficient as the WebSocket fallback.
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "market-quote",
+        &[
+            (1, StdDuration::from_millis(1_050)),
+            (450, StdDuration::from_secs(60)),
+            (4_500, StdDuration::from_secs(60 * 60)),
+        ],
+    )
+    .await;
     secure_json(
         state,
         reqwest::Method::POST,
@@ -546,6 +544,17 @@ pub async fn get_candles_with_exchange_interval(
     from_date: &str,
     to_date: &str,
 ) -> AppResult<Value> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "historical-candles",
+        &[
+            (2, StdDuration::from_secs(1)),
+            (150, StdDuration::from_secs(60)),
+            (4_500, StdDuration::from_secs(60 * 60)),
+        ],
+    )
+    .await;
     let body = json!({
         "exchange":exchange,
         "symboltoken":token,
@@ -602,7 +611,7 @@ fn classify_transport(error: &reqwest::Error) -> BrokerErrorClass {
 }
 
 fn order_payload(order: &OrderRequest<'_>) -> Value {
-    let price = if order.order_type == "MARKET" {
+    let price = if matches!(order.order_type, "MARKET" | "STOPLOSS_MARKET") {
         0.0
     } else {
         order.price
@@ -627,6 +636,7 @@ pub async fn place_order(
     if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
         return Err(rate_limit_broker_error(seconds, None));
     }
+    wait_for_order_capacity(state, api_key).await;
     let body = order_payload(order);
     let response=state.http.post(format!("{}{path}",state.config.angel_api_base))
         .headers(authenticated_headers(state,api_key,jwt_token).map_err(|e|BrokerError{class:BrokerErrorClass::Authentication,status:None,code:"invalid_headers".into(),message:e.to_string(),diagnostic:String::new()})?)
@@ -693,6 +703,7 @@ pub async fn cancel_order(
     order_id: &str,
     variety: &str,
 ) -> AppResult<()> {
+    wait_for_order_capacity(state, api_key).await;
     secure_json(
         state,
         reqwest::Method::POST,
@@ -706,6 +717,13 @@ pub async fn cancel_order(
 }
 
 pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "order-book",
+        &[(1, StdDuration::from_millis(1_050))],
+    )
+    .await;
     secure_json(
         state,
         reqwest::Method::GET,
@@ -715,6 +733,73 @@ pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> App
         None,
     )
     .await
+}
+
+pub async fn positions(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "positions",
+        &[(1, StdDuration::from_millis(1_050))],
+    )
+    .await;
+    secure_json(
+        state,
+        reqwest::Method::GET,
+        "/rest/secure/angelbroking/order/v1/getPosition",
+        api_key,
+        jwt_token,
+        None,
+    )
+    .await
+}
+
+pub async fn rms_limits(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "rms-limits",
+        &[(2, StdDuration::from_millis(1_050))],
+    )
+    .await;
+    secure_json(
+        state,
+        reqwest::Method::GET,
+        "/rest/secure/angelbroking/user/v1/getRMS",
+        api_key,
+        jwt_token,
+        None,
+    )
+    .await
+}
+
+pub async fn margin_required(
+    state: &AppState,
+    api_key: &str,
+    jwt_token: &str,
+    position: Value,
+) -> AppResult<f64> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "margin-calculator",
+        &[(8, StdDuration::from_secs(1))],
+    )
+    .await;
+    let value = secure_json(
+        state,
+        reqwest::Method::POST,
+        "/rest/secure/angelbroking/margin/v1/batch",
+        api_key,
+        jwt_token,
+        Some(json!({"positions":[position]})),
+    )
+    .await?;
+    value
+        .get("totalMarginRequired")
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| AppError::BadRequest("Angel One returned invalid required margin.".into()))
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -1185,14 +1270,24 @@ mod tests {
     }
 
     #[test]
-    fn margin_payload_includes_required_order_type() {
-        let payload = margin_payload("MCX", "CARRYFORWARD", "123", 10, "STOPLOSS_LIMIT", "BUY");
-        let position = &payload["positions"][0];
-        assert_eq!(position["orderType"], "STOPLOSS_LIMIT");
-        assert_eq!(position["productType"], "CARRYFORWARD");
-        assert_eq!(position["tradeType"], "BUY");
-        assert_eq!(position["token"], "123");
-        assert_eq!(position["qty"], "10");
+    fn stoploss_market_payload_has_zero_limit_and_keeps_trigger() {
+        let order = OrderRequest {
+            symbol: "NIFTY26AUG25000CE",
+            token: "123",
+            exchange: "NFO",
+            product_type: "INTRADAY",
+            side: "SELL",
+            order_type: "STOPLOSS_MARKET",
+            quantity: 75,
+            price: 100.25,
+            trigger_price: Some(100.0),
+            client_order_id: "RXSTOPMARKET",
+        };
+        let payload = order_payload(&order);
+        assert_eq!(payload["variety"], "STOPLOSS");
+        assert_eq!(payload["ordertype"], "STOPLOSS_MARKET");
+        assert_eq!(payload["price"], "0.00");
+        assert_eq!(payload["triggerprice"], "100.00");
     }
 
     #[tokio::test]

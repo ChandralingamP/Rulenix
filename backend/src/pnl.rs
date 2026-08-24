@@ -67,7 +67,6 @@ const TRADE_ROWS_SQL: &str = r#"
         strategy_key,
         CASE strategy_key
             WHEN 'futures_breakout_v3' THEN 'Futures Breakout v3'
-            WHEN 'option_entry_v1' THEN 'Option Entry Strategy V1.0'
             WHEN 'supertrend_index_options_v1' THEN 'SuperTrend Index Options v1'
             ELSE COALESCE(NULLIF(strategy_key,''),'Manual')
         END AS strategy_name,
@@ -188,7 +187,7 @@ pub async fn list(
     let records = rows(&state, user_id, &mode, page_size, (page - 1) * page_size).await?;
     let total_pages = ((count + page_size - 1) / page_size).max(1);
     Ok(Json(
-        json!({"results":records,"page":page,"page_size":page_size,"total_pages":total_pages,"total_records":count,"total_profit":total,"total_margin":0,"total_brokerage":0,"total_net_profit":total,"mode":mode}),
+        json!({"results":records,"page":page,"page_size":page_size,"total_pages":total_pages,"total_records":count,"total_profit":total,"total_brokerage":0,"total_net_profit":total,"mode":mode}),
     ))
 }
 

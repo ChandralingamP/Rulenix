@@ -109,7 +109,7 @@ struct SessionSnapshot {
 }
 
 async fn lock_user(transaction: &mut Transaction<'_, Postgres>, user_id: Uuid) -> AppResult<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(user_id)
         .execute(&mut **transaction)
         .await?;
@@ -415,14 +415,6 @@ async fn refresh_tokens(state: &AppState, snapshot: &SessionSnapshot) -> AppResu
             Ok(false)
         }
     }
-}
-
-pub(crate) async fn refresh_broker_session_now(state: &AppState, user_id: Uuid) -> AppResult<bool> {
-    let snapshot = session_snapshot(state, user_id).await?;
-    if snapshot.credentials.api_key.is_empty() || snapshot.credentials.refresh_token.is_empty() {
-        return Ok(false);
-    }
-    refresh_tokens(state, &snapshot).await
 }
 
 async fn maintain_user_session(state: &AppState, user_id: Uuid) -> AppResult<()> {

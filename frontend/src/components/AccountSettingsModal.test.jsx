@@ -23,9 +23,7 @@ describe("AccountSettingsModal trading mode", () => {
   afterEach(cleanup);
   beforeEach(() => {
     vi.clearAllMocks();
-    apiClient.get.mockImplementation((url) => Promise.resolve({
-      data: url === "/account/profile" ? profile : { mode: "demo", balance: 200000 },
-    }));
+    apiClient.get.mockResolvedValue({ data: profile });
   });
 
   it("requires explicit confirmation before requesting live mode", async () => {
@@ -34,7 +32,7 @@ describe("AccountSettingsModal trading mode", () => {
     apiClient.put.mockResolvedValue({
       data: { detail: "Trading mode changed to live.", trading_mode: "live", profile: { ...profile, trading_mode: "live" } },
     });
-    render(<AccountSettingsModal open username="TRADER01" permissions={{ live_trading: true }} tradingMode="demo" onClose={() => {}} onProfileChanged={() => {}} onBalanceChanged={() => {}} onTradingModeChanged={changed} />);
+    render(<AccountSettingsModal open username="TRADER01" permissions={{ live_trading: true }} tradingMode="demo" onClose={() => {}} onProfileChanged={() => {}} onTradingModeChanged={changed} />);
 
     const liveButton = await screen.findByRole("button", { name: "Switch to live" });
     expect(liveButton).toBeDisabled();
@@ -46,10 +44,10 @@ describe("AccountSettingsModal trading mode", () => {
   });
 
   it("does not offer live confirmation without server permission", async () => {
-    apiClient.get.mockImplementation((url) => Promise.resolve({
-      data: url === "/account/profile" ? { ...profile, permissions: { administer_users: false, live_trading: false } } : { mode: "demo", balance: 200000 },
-    }));
-    render(<AccountSettingsModal open username="TRADER01" permissions={{ live_trading: false }} tradingMode="demo" onClose={() => {}} onProfileChanged={() => {}} onBalanceChanged={() => {}} onTradingModeChanged={() => {}} />);
+    apiClient.get.mockResolvedValue({
+      data: { ...profile, permissions: { administer_users: false, live_trading: false } },
+    });
+    render(<AccountSettingsModal open username="TRADER01" permissions={{ live_trading: false }} tradingMode="demo" onClose={() => {}} onProfileChanged={() => {}} onTradingModeChanged={() => {}} />);
     expect(await screen.findByText(/requires permission from an authorized administrator/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Switch to live" })).toBeDisabled();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();

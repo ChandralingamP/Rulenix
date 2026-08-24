@@ -29,6 +29,8 @@ pub(crate) struct MasterContract {
     pub strike: String,
     #[serde(deserialize_with = "string_from_any")]
     pub lotsize: String,
+    #[serde(default, deserialize_with = "string_from_any")]
+    pub tick_size: String,
     #[serde(deserialize_with = "string_from_any")]
     pub instrumenttype: String,
     #[serde(deserialize_with = "string_from_any")]
@@ -100,10 +102,34 @@ pub(crate) async fn load(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>
     Ok(contracts)
 }
 
+/// Protective/closing orders may use the most recently validated master when
+/// the daily download is temporarily unavailable. New entries must keep using
+/// `load`, which fails closed unless today's master is available.
+pub(crate) async fn load_allow_stale(state: &AppState) -> AppResult<Arc<Vec<MasterContract>>> {
+    match load(state).await {
+        Ok(contracts) => Ok(contracts),
+        Err(error) => {
+            let cache = MASTER_CACHE.get_or_init(|| Mutex::new(None));
+            if let Some((cache_date, contracts)) = cache.lock().await.as_ref() {
+                tracing::warn!(%cache_date, %error, "using cached contract master for protective/closing order");
+                Ok(contracts.clone())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 pub(crate) async fn invalidate_cache() {
     if let Some(cache) = MASTER_CACHE.get() {
         *cache.lock().await = None;
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn set_isolated_test_cache(contracts: Vec<MasterContract>) {
+    let cache = MASTER_CACHE.get_or_init(|| Mutex::new(None));
+    *cache.lock().await = Some((ist_date(), Arc::new(contracts)));
 }
 
 #[cfg(test)]
@@ -119,6 +145,7 @@ mod tests {
             "expiry": "30NOV2026",
             "strike": 0,
             "lotsize": 5,
+            "tick_size": "5.000000",
             "instrumenttype": "FUTCOM",
             "exch_seg": "MCX"
         }))
@@ -127,5 +154,6 @@ mod tests {
         assert_eq!(contract.token, "123");
         assert_eq!(contract.lotsize, "5");
         assert_eq!(contract.strike, "0");
+        assert_eq!(contract.tick_size, "5.000000");
     }
 }

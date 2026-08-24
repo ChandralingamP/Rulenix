@@ -1,5 +1,4 @@
 use crate::{
-    angel,
     auth::{AuthUser, create_otp, valid_email, valid_username, verify_otp},
     error::{AppError, AppResult},
     state::AppState,
@@ -15,8 +14,6 @@ use sqlx::FromRow;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
-const INITIAL_DEMO_BALANCE: f64 = 200_000.0;
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileOtpRequest {}
@@ -30,16 +27,6 @@ pub struct ProfileChange {
     pub mobile_number: String,
     pub client_id: String,
 }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TopUpRequest {
-    pub amount: f64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BalanceAction {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,12 +46,11 @@ struct AccountRecord {
     brokerage_user_id: Option<String>,
     mobile_number: Option<String>,
     last_token_status: Option<String>,
-    demo_balance: Option<f64>,
 }
 
 async fn account(state: &AppState, user_id: Uuid) -> AppResult<AccountRecord> {
     sqlx::query_as(
-        "SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo') AS trading_mode,p.brokerage_user_id,p.mobile_number,p.last_token_status,p.demo_balance::float8 AS demo_balance \
+        "SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,COALESCE(p.trading_mode,'demo') AS trading_mode,p.brokerage_user_id,p.mobile_number,p.last_token_status \
          FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1",
     )
     .bind(user_id)
@@ -166,7 +152,7 @@ pub async fn update_profile(
     .await?;
 
     let mut transaction = state.db.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(current.id)
         .execute(&mut *transaction)
         .await?;
@@ -305,7 +291,7 @@ pub async fn update_trading_mode(
         input.confirm_live.unwrap_or(false),
     )?;
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
@@ -364,103 +350,9 @@ pub async fn update_trading_mode(
     })))
 }
 
-pub async fn get_balance(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-) -> AppResult<Json<Value>> {
-    let record = account(&state, user.id).await?;
-    if record.trading_mode == "demo" {
-        return Ok(Json(json!({
-            "mode":"demo",
-            "balance":record.demo_balance.unwrap_or(INITIAL_DEMO_BALANCE),
-            "currency":"INR",
-        })));
-    }
-    if !record.can_live_trade {
-        return Err(AppError::Forbidden(
-            "Live-trading permission has been revoked.".into(),
-        ));
-    }
-    let credentials = state.credentials.load(user.id).await?;
-    if credentials.api_key.is_empty() {
-        return Err(AppError::BadRequest(
-            "Add an Angel One API key before loading live balance.".into(),
-        ));
-    }
-    if credentials.jwt_token.is_empty() {
-        return Err(AppError::BadRequest(
-            "Connect your Angel One session before loading live balance.".into(),
-        ));
-    }
-    let margin = angel::get_margin(&state, &credentials.api_key, &credentials.jwt_token).await?;
-    Ok(Json(json!({
-        "mode":"live",
-        "balance":margin["available_balance"],
-        "currency":"INR",
-        "provider":"Angel One",
-    })))
-}
-
-pub async fn top_up_demo(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(input): Json<TopUpRequest>,
-) -> AppResult<Json<Value>> {
-    if !input.amount.is_finite() || input.amount <= 0.0 || input.amount > 10_000_000.0 {
-        return Err(AppError::BadRequest(
-            "Top-up must be between ₹1 and ₹1,00,00,000.".into(),
-        ));
-    }
-    let record = account(&state, user.id).await?;
-    if record.trading_mode != "demo" {
-        return Err(AppError::Forbidden(
-            "Live balances can only be changed through Angel One.".into(),
-        ));
-    }
-    sqlx::query(
-        "INSERT INTO user_profiles (user_id,brokerage_user_id,api_key,mobile_number,demo_balance) VALUES ($1,'','','',200000.00+$2) \
-         ON CONFLICT (user_id) DO UPDATE SET demo_balance=user_profiles.demo_balance+$2,updated_at=NOW()",
-    )
-    .bind(record.id)
-    .bind(input.amount)
-    .execute(&state.db)
-    .await?;
-    get_balance(State(state), Extension(user)).await
-}
-
-pub async fn reset_demo(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(_input): Json<BalanceAction>,
-) -> AppResult<Json<Value>> {
-    let record = account(&state, user.id).await?;
-    if record.trading_mode != "demo" {
-        return Err(AppError::Forbidden(
-            "Live balances can only be changed through Angel One.".into(),
-        ));
-    }
-    sqlx::query(
-        "INSERT INTO user_profiles (user_id,brokerage_user_id,api_key,mobile_number,demo_balance) VALUES ($1,'','','',$2) \
-         ON CONFLICT (user_id) DO UPDATE SET demo_balance=$2,updated_at=NOW()",
-    )
-    .bind(record.id)
-    .bind(INITIAL_DEMO_BALANCE)
-    .execute(&state.db)
-    .await?;
-    get_balance(State(state), Extension(user)).await
-}
-
 #[cfg(test)]
 mod security_tests {
     use super::*;
-
-    #[test]
-    fn account_mutations_reject_client_asserted_identity() {
-        let result = serde_json::from_value::<TopUpRequest>(
-            json!({"username":"ANOTHER_USER","amount":100.0}),
-        );
-        assert!(result.is_err());
-    }
 
     #[test]
     fn live_mode_requires_permission_confirmation_and_valid_broker() {

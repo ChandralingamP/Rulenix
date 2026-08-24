@@ -67,7 +67,6 @@ const initialState = {
   totalPages: 1,
   totalRecords: 0,
   totalProfit: 0,
-  totalMargin: 0,
   totalBrokerage: 0,
   totalNetProfit: 0,
   exporting: false,
@@ -113,7 +112,6 @@ const pnlSlice = createSlice({
           const numeric = Number(value);
           return Number.isFinite(numeric) ? numeric : 0;
         };
-        state.totalMargin = parseAmount(action.payload.total_margin ?? 0);
         state.totalBrokerage = parseAmount(action.payload.total_brokerage ?? 0);
         state.totalNetProfit = parseAmount(
           action.payload.total_net_profit ?? 0

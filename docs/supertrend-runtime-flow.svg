@@ -50,11 +50,11 @@
   <path d="M430 655 H940 V670" class="arrow"/>
   <path d="M430 655 H1250 V670" class="arrow"/>
   <rect x="490" y="670" width="280" height="174" class="box" fill="url(#success)" stroke="#34d399"/>
-  <text x="515" y="704" class="label">User task A</text><text x="515" y="734" class="small">Own lots / TP / SL</text><text x="515" y="759" class="small">Own risk + margin</text><text x="515" y="784" class="small">Own broker session</text><text x="515" y="817" class="count">Concurrent</text>
+  <text x="515" y="704" class="label">User task A</text><text x="515" y="734" class="small">Own lots / TP / SL</text><text x="515" y="759" class="small">Own risk controls</text><text x="515" y="784" class="small">Own broker session</text><text x="515" y="817" class="count">Concurrent</text>
   <rect x="800" y="670" width="280" height="174" class="box" fill="url(#success)" stroke="#34d399"/>
-  <text x="825" y="704" class="label">User task B</text><text x="825" y="734" class="small">Own lots / TP / SL</text><text x="825" y="759" class="small">Own risk + margin</text><text x="825" y="784" class="small">Own broker session</text><text x="825" y="817" class="count">Concurrent</text>
+  <text x="825" y="704" class="label">User task B</text><text x="825" y="734" class="small">Own lots / TP / SL</text><text x="825" y="759" class="small">Own risk controls</text><text x="825" y="784" class="small">Own broker session</text><text x="825" y="817" class="count">Concurrent</text>
   <rect x="1110" y="670" width="280" height="174" class="box" fill="url(#success)" stroke="#34d399"/>
-  <text x="1135" y="704" class="label">User task C</text><text x="1135" y="734" class="small">Own lots / TP / SL</text><text x="1135" y="759" class="small">Own risk + margin</text><text x="1135" y="784" class="small">Own broker session</text><text x="1135" y="817" class="count">Concurrent</text>
+  <text x="1135" y="704" class="label">User task C</text><text x="1135" y="734" class="small">Own lots / TP / SL</text><text x="1135" y="759" class="small">Own risk controls</text><text x="1135" y="784" class="small">Own broker session</text><text x="1135" y="817" class="count">Concurrent</text>
   <text x="490" y="875" class="small">A failed/slow user reports a user-specific alert; successful users are not rolled back or blocked.</text>
 
   <rect x="55" y="940" width="1490" height="130" class="lane"/>

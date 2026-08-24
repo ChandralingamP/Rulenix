@@ -47,19 +47,9 @@ function tradeSymbolLabel(trade, fallback) {
   );
 }
 
-function tradeEntryReason(trade, strategyKey) {
+function tradeEntryReason(trade) {
   const reason = trade?.levels?.entry_reason;
   if (reason === "SL2_REVERSAL") return "SL2 reversal";
-  if (strategyKey === "option_entry_v1") {
-    const assumedSide = trade?.levels?.assumed_option_side;
-    const optionType = trade?.levels?.assumed_option_type || trade?.levels?.option_type;
-    if (assumedSide && optionType) {
-      return `Option signal: ${assumedSide} / ${optionType}`;
-    }
-    if (optionType === "CE") return "Option signal: CALL / CE";
-    if (optionType === "PE") return "Option signal: PUT / PE";
-    return "Option signal";
-  }
   if (trade?.levels?.entry_source === "OPENING_RANGE") {
     return "15 min gap breakout";
   }
@@ -470,7 +460,7 @@ export default function BacktestingPage() {
                           <td className="px-4 py-3 align-top">
                             <p className="font-semibold text-white">{trade.direction}</p>
                             <p className="mt-1 text-xs text-sky-300">
-                              {tradeEntryReason(trade, latestRun?.strategy_key)}
+                              {tradeEntryReason(trade)}
                             </p>
                           </td>
                           <td className="max-w-[240px] truncate px-4 py-3 align-top text-slate-300">

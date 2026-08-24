@@ -56,6 +56,17 @@ pub async fn metrics(
         "SELECT COALESCE(jsonb_object_agg(status,total),'{}'::jsonb) FROM (SELECT status,COUNT(*) AS total FROM strategy_orders GROUP BY status) counts",
     )
     .await?;
+    let execution_intents = json_rows(
+        &state,
+        "SELECT COALESCE(jsonb_object_agg(status,total),'{}'::jsonb) FROM (SELECT status,COUNT(*) AS total FROM strategy_execution_intents WHERE created_at>NOW()-INTERVAL '24 hours' GROUP BY status) counts",
+    )
+    .await?;
+    let incomplete_signals_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM strategy_signals WHERE (signal_at AT TIME ZONE 'Asia/Kolkata')::date=(NOW() AT TIME ZONE 'Asia/Kolkata')::date AND status IN ('dispatching','partial','failed')",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
     let risk_rejections: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM risk_decisions WHERE allowed=FALSE AND created_at>NOW()-INTERVAL '24 hours'",
     )
@@ -79,6 +90,8 @@ pub async fn metrics(
         "market_feed_age_seconds":market_feed_age_seconds,
         "scheduler_runs_today":scheduler_runs,
         "orders":orders,
+        "execution_intents_24h":execution_intents,
+        "incomplete_signals_today":incomplete_signals_today,
         "risk_rejections_24h":risk_rejections,
         "broker_errors_24h":broker_errors_24h,
         "reconciliation_unhealthy":reconciliation_unhealthy,

@@ -48,29 +48,24 @@ Targets:
 - Buy target: `entry * 1.015`
 - Sell target: `entry * 0.985`
 
-Stops:
+Stops (the executable max/min formulas are authoritative):
 
-- Buy main stop: `entry * 0.985`
-- Buy SL1 technical stop: `LL2 * 0.9988`
-- Buy SL2 technical stop: `LL4 * 0.9988`
-- Sell main stop: `entry * 1.015`
-- Sell SL1 technical stop: `HH2 * 1.0012`
-- Sell SL2 technical stop: `HH4 * 1.0012`
-
-The final stop level is constrained so it stays on the correct side of the entry. If a technical stop is not useful, the main 1.5% stop is used.
+- Buy SL1: `MAX(entry * 0.985, LL2 * 0.9988)`
+- Buy SL2: `MAX(entry * 0.985, LL4 * 0.9988)`
+- Sell SL1: `MIN(entry * 1.015, HH2 * 1.0012)`
+- Sell SL2: `MIN(entry * 1.015, HH4 * 1.0012)`
 
 ## Gap-entry behavior
 
-At the day session open, the strategy compares market open with the previous close:
+BUY and SELL are evaluated independently. Previous-day close is retained as market context only; it never selects trade direction.
 
-- Gap up: entry direction is BUY.
-- Gap down: entry direction is SELL.
-- Flat: both standard BUY and SELL entries are allowed.
+- `buy_missed = session_open >= BUY_ENTRY`
+- `sell_missed = session_open <= SELL_ENTRY`
 
-If the market already opened beyond the standard entry level, the standard trigger is considered jumped. In that case, the strategy waits for the completed 09:00-09:15 IST range:
+If a side already opened beyond its standard entry level, that side's trigger is considered jumped. The strategy waits for the completed 09:00-09:15 IST range for the missed side:
 
-- Gap-up opening-range entry: `opening_range_high * 1.0012`
-- Gap-down opening-range entry: `opening_range_low * 0.9988`
+- Missed BUY opening-range entry: `opening_range_high * 1.0012`
+- Missed SELL opening-range entry: `opening_range_low * 0.9988`
 
 This produces an `OPENING_RANGE` entry source. Otherwise the source is `STANDARD`.
 
@@ -89,7 +84,7 @@ Evening session:
 - 17:00 IST: carry/refresh target orders for open trades.
 - 17:10 IST: carry/refresh stop orders and place entries.
 
-Each scheduled action has a 15-minute catch-up window after restart. Transient failures retry every 30 seconds. Terminal margin errors are skipped and recorded.
+Each scheduled action has a 15-minute catch-up window after restart. Transient failures retry every 30 seconds.
 
 ## User activation/configuration
 
@@ -112,9 +107,11 @@ For each configured runner, the backend places STOPLOSS_LIMIT entry orders:
 - `BUY_ENTRY` for buy triggers.
 - `SELL_ENTRY` for sell triggers.
 
-Before order creation, the risk engine checks permissions, kill switches, position/order limits, margin, fresh ticks, and broker/session health.
+Before order creation, the risk engine checks permissions, kill switches, position/order limits, fresh ticks, and broker/session health.
 
-One user failing risk/margin/broker validation does not make successful users retry or roll back their already submitted orders.
+Normal entry quantity must equal configured lots multiplied by the current Angel One contract-master lot size. Limit and trigger prices are normalized to tick size and checked against the token's current Angel One FULL-quote lower/upper circuit limits. A missing authoritative price band blocks a new live entry.
+
+One user failing risk or broker validation does not make successful users retry or roll back their already submitted orders.
 
 ## Exit management
 
@@ -166,7 +163,7 @@ Demo:
 
 - Strategy orders are stored locally.
 - Shared live market feed ticks simulate fills.
-- Demo balance and P&L are updated locally.
+- Demo P&L is updated locally.
 
 Live:
 
@@ -174,6 +171,7 @@ Live:
 - Stable client order IDs/tags are used.
 - Ambiguous submissions are reconciled instead of blindly retried.
 - Partial fills update cumulative filled/processed quantities.
+- Every partial fill delta receives an exact stop slice; database coverage checks prevent total active stop coverage from exceeding local exposure.
 - Broker events are stored for audit.
 
 Both modes persist into `strategy_orders` and `trades`.
@@ -235,5 +233,5 @@ Per-lot point-value multipliers:
 
 - Keep MCX holiday/session data in `market_calendar` updated when exchange calendars change.
 - Do not manually cancel protective exits unless replacing them with equivalent protection.
-- If a live user is skipped while others execute, inspect risk decisions, broker token health, margin estimate, and broker order events for that user.
+- If a live user is skipped while others execute, inspect risk decisions, broker token health, and broker order events for that user.
 - If backtest trade counts change with lots, first check target split/runner behavior and same-side duplicate guards.

@@ -67,8 +67,8 @@ describe("ProfitLossPage exit audit", () => {
       status: "closed",
       direction: "BUY",
       quantity: 20,
-      strategy_key: "option_entry_v1",
-      strategy_name: "Option Entry Strategy V1.0",
+      strategy_key: "supertrend_index_options_v1",
+      strategy_name: "SuperTrend Index Options v1",
       instrument_label: "SENSEX_CE",
       contract_symbol: "SENSEX26AUGCE",
       entry_price: 250,
@@ -78,6 +78,6 @@ describe("ProfitLossPage exit audit", () => {
     }]);
 
     expect(await screen.findByText("Market closed (3:20 PM)")).toBeInTheDocument();
-    expect(screen.getByText("Option Entry Strategy V1.0")).toBeInTheDocument();
+    expect(screen.getByText("SuperTrend Index Options v1")).toBeInTheDocument();
   });
 });

@@ -30,7 +30,6 @@ struct TradeEmailRow {
 fn strategy_name(key: &str) -> &'static str {
     match key {
         strategy::STRATEGY_KEY => "Futures Breakout v3",
-        strategy::OPTION_ENTRY_STRATEGY_KEY => "Option Entry v1",
         strategy::SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY => "SuperTrend Index Options v1",
         _ => "Rulenix Strategy",
     }

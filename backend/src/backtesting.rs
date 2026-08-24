@@ -9,9 +9,8 @@ use crate::{
     },
     state::AppState,
     strategy::{
-        FuturesGapDirection, OPTION_ENTRY_STRATEGY_KEY, STRATEGY_KEY,
-        SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY, futures_exit_levels_for_entry,
-        futures_gap_direction, futures_gap_entry_was_jumped, futures_opening_range_entry,
+        FuturesMissedEntryPlan, STRATEGY_KEY, SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
+        futures_exit_levels_for_entry, futures_missed_entry_plan, futures_opening_range_entries,
     },
 };
 use axum::{
@@ -80,8 +79,6 @@ pub(crate) struct ContractSelection {
     pub token: String,
     pub symbol: String,
     pub lot_size: i32,
-    pub buy_margin_per_lot: Option<f64>,
-    pub sell_margin_per_lot: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -112,8 +109,6 @@ struct TradeResult {
     exit_price: f64,
     lots: i32,
     quantity: i32,
-    margin_per_lot: f64,
-    margin_used: f64,
     realized_pnl: f64,
     exit_reason: String,
     levels: Value,
@@ -145,8 +140,6 @@ struct Position {
     lot_size: i32,
     remaining_lots: i32,
     pnl_multiplier_per_lot: f64,
-    margin_per_lot: f64,
-    margin_used: f64,
     realized_pnl: f64,
     target_done: bool,
     levels: Levels,
@@ -176,13 +169,14 @@ struct EntryAudit {
 
 #[derive(Debug, Clone)]
 struct EntryPlan {
-    gap: FuturesGapDirection,
-    direction: &'static str,
-    source: &'static str,
+    missed: FuturesMissedEntryPlan,
+    buy_source: &'static str,
+    sell_source: &'static str,
     previous_close: f64,
     opening: OpeningRange,
     levels: Levels,
-    available_minute: u32,
+    buy_available_minute: u32,
+    sell_available_minute: u32,
 }
 
 #[derive(Debug, FromRow)]
@@ -408,8 +402,6 @@ fn select_contract(
                 token: contract.token.clone(),
                 symbol: contract.symbol.clone(),
                 lot_size,
-                buy_margin_per_lot: None,
-                sell_margin_per_lot: None,
             })
         })
 }
@@ -454,8 +446,6 @@ async fn cached_contract(
             token,
             symbol,
             lot_size,
-            buy_margin_per_lot: None,
-            sell_margin_per_lot: None,
         }));
     }
     let snapshot = sqlx::query_as::<_, (String, String, i32)>(
@@ -470,8 +460,6 @@ async fn cached_contract(
         token,
         symbol,
         lot_size,
-        buy_margin_per_lot: None,
-        sell_margin_per_lot: None,
     }))
 }
 
@@ -764,23 +752,6 @@ fn pnl_multiplier_per_lot(instrument: &str) -> f64 {
     futures_pnl_multiplier_per_lot(instrument)
 }
 
-fn futures_margin_per_lot(
-    entry_price: f64,
-    instrument: &str,
-    margin_requirement_percent: f64,
-) -> f64 {
-    entry_price * pnl_multiplier_per_lot(instrument) * margin_requirement_percent / 100.0
-}
-
-async fn effective_margin_requirement(state: &AppState, user_id: Uuid) -> AppResult<f64> {
-    Ok(sqlx::query_scalar(
-        "SELECT COALESCE(u.margin_requirement_percent,g.margin_requirement_percent,10.0)::float8 FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1 WHERE g.user_id IS NULL",
-    )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await?)
-}
-
 fn candle_date(candle_time: DateTime<Utc>) -> NaiveDate {
     candle_time.with_timezone(&ist_offset()).date_naive()
 }
@@ -886,7 +857,6 @@ fn open_position(
     lots: i32,
     lot_size: i32,
     pnl_multiplier_per_lot: f64,
-    margin_per_lot: f64,
     levels: Levels,
 ) -> Position {
     Position {
@@ -901,8 +871,6 @@ fn open_position(
         lot_size,
         remaining_lots: lots,
         pnl_multiplier_per_lot,
-        margin_per_lot,
-        margin_used: margin_per_lot * lots as f64,
         realized_pnl: 0.0,
         target_done: false,
         levels,
@@ -943,37 +911,43 @@ fn build_entry_plan(
     previous_close: f64,
     opening: OpeningRange,
 ) -> Option<EntryPlan> {
-    let gap = futures_gap_direction(previous_close, opening.market_open)?;
-    let jumped = futures_gap_entry_was_jumped(
-        gap,
-        opening.market_open,
-        levels.buy_entry,
-        levels.sell_entry,
-    )?;
-    let direction = gap.entry_direction();
-    if jumped {
-        let entry = futures_opening_range_entry(gap, opening.high, opening.low)?;
-        let levels = levels_for_entry_price(levels, direction, entry)?;
-        Some(EntryPlan {
-            gap,
-            direction,
-            source: "OPENING_RANGE",
-            previous_close,
-            opening,
-            levels,
-            available_minute: 9 * 60 + 15,
-        })
-    } else {
-        Some(EntryPlan {
-            gap,
-            direction,
-            source: "STANDARD",
-            previous_close,
-            opening,
-            levels,
-            available_minute: 9 * 60 + 10,
-        })
+    let missed =
+        futures_missed_entry_plan(opening.market_open, levels.buy_entry, levels.sell_entry)?;
+    let (recovered_buy, recovered_sell) =
+        futures_opening_range_entries(missed, opening.high, opening.low)?;
+    let mut effective = levels;
+    if let Some(entry) = recovered_buy {
+        effective = levels_for_entry_price(effective, "BUY", entry)?;
     }
+    if let Some(entry) = recovered_sell {
+        effective = levels_for_entry_price(effective, "SELL", entry)?;
+    }
+    Some(EntryPlan {
+        missed,
+        buy_source: if missed.buy_missed {
+            "OPENING_RANGE"
+        } else {
+            "STANDARD"
+        },
+        sell_source: if missed.sell_missed {
+            "OPENING_RANGE"
+        } else {
+            "STANDARD"
+        },
+        previous_close,
+        opening,
+        levels: effective,
+        buy_available_minute: if missed.buy_missed {
+            9 * 60 + 15
+        } else {
+            9 * 60 + 10
+        },
+        sell_available_minute: if missed.sell_missed {
+            9 * 60 + 15
+        } else {
+            9 * 60 + 10
+        },
+    })
 }
 
 fn close_position(
@@ -1058,8 +1032,6 @@ fn close_position(
         exit_price,
         lots: position.lots,
         quantity,
-        margin_per_lot: position.margin_per_lot,
-        margin_used: position.margin_used,
         realized_pnl: pnl,
         exit_reason: reason.into(),
         levels: audit_levels,
@@ -1196,9 +1168,6 @@ fn simulate(
     instrument: &str,
     lot_size: i32,
     lots: i32,
-    margin_requirement_percent: f64,
-    buy_margin_per_lot: Option<f64>,
-    sell_margin_per_lot: Option<f64>,
 ) -> (Vec<TradeResult>, Value) {
     let levels_by_date = build_daily_levels(daily);
     let previous_closes = build_previous_closes(daily);
@@ -1208,7 +1177,6 @@ fn simulate(
     let mut equity: f64 = 0.0;
     let mut peak: f64 = 0.0;
     let mut max_drawdown: f64 = 0.0;
-    let mut max_open_margin_used: f64 = 0.0;
     let mut breakout_entry_days: HashSet<NaiveDate> = HashSet::new();
     let mut reversal_entry_keys: HashSet<(NaiveDate, &'static str, i64)> = HashSet::new();
 
@@ -1245,19 +1213,6 @@ fn simulate(
                                         direction,
                                         trade.exit_price,
                                     )?;
-                                    let margin_per_lot = if direction == "BUY" {
-                                        buy_margin_per_lot
-                                    } else {
-                                        sell_margin_per_lot
-                                    }
-                                    .filter(|value| value.is_finite() && *value > 0.0)
-                                    .unwrap_or_else(|| {
-                                        futures_margin_per_lot(
-                                            trade.exit_price,
-                                            instrument,
-                                            margin_requirement_percent,
-                                        )
-                                    });
                                     reversal_entry_keys.insert(key);
                                     Some(open_position(
                                         candle,
@@ -1268,7 +1223,6 @@ fn simulate(
                                         trade.lots,
                                         lot_size,
                                         pnl_multiplier,
-                                        margin_per_lot,
                                         levels,
                                     ))
                                 })
@@ -1285,12 +1239,6 @@ fn simulate(
         }
         still_open.extend(reversals);
         positions = still_open;
-        max_open_margin_used = max_open_margin_used.max(
-            positions
-                .iter()
-                .map(|position| position.margin_used)
-                .sum::<f64>(),
-        );
 
         let Some(session_key) = entry_session(candle.candle_time) else {
             continue;
@@ -1314,11 +1262,10 @@ fn simulate(
         };
         let local = candle.candle_time.with_timezone(&ist_offset());
         let minute = local.hour() * 60 + local.minute();
-        if session_key.1 == "day" && minute < plan.available_minute {
-            continue;
-        }
-        let buy = plan.direction != "SELL" && candle.high_price >= plan.levels.buy_entry;
-        let sell = plan.direction != "BUY" && candle.low_price <= plan.levels.sell_entry;
+        let buy = (session_key.1 != "day" || minute >= plan.buy_available_minute)
+            && candle.high_price >= plan.levels.buy_entry;
+        let sell = (session_key.1 != "day" || minute >= plan.sell_available_minute)
+            && candle.low_price <= plan.levels.sell_entry;
         if !buy && !sell {
             continue;
         }
@@ -1342,15 +1289,6 @@ fn simulate(
             breakout_entry_days.insert(entry_day);
             continue;
         }
-        let margin_per_lot = if direction == "BUY" {
-            buy_margin_per_lot
-        } else {
-            sell_margin_per_lot
-        }
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or_else(|| {
-            futures_margin_per_lot(entry_price, instrument, margin_requirement_percent)
-        });
         breakout_entry_days.insert(entry_day);
         let original_entry = if direction == "BUY" {
             levels.buy_entry
@@ -1366,13 +1304,16 @@ fn simulate(
             lots,
             lot_size,
             pnl_multiplier,
-            margin_per_lot,
             plan.levels,
         );
         opened.entry_audit = Some(EntryAudit {
-            gap_direction: plan.gap.as_str(),
+            gap_direction: plan.missed.as_str(),
             entry_direction: direction.into(),
-            entry_source: plan.source,
+            entry_source: if direction == "BUY" {
+                plan.buy_source
+            } else {
+                plan.sell_source
+            },
             previous_close: plan.previous_close,
             market_open: plan.opening.market_open,
             opening_range_high: plan.opening.high,
@@ -1381,12 +1322,6 @@ fn simulate(
             effective_entry: entry_price,
         });
         positions.push(opened);
-        max_open_margin_used = max_open_margin_used.max(
-            positions
-                .iter()
-                .map(|position| position.margin_used)
-                .sum::<f64>(),
-        );
     }
 
     if let Some(last) = intraday.last() {
@@ -1432,21 +1367,6 @@ fn simulate(
     } else {
         gross_loss / losses as f64
     };
-    let initial_margin_per_lot = trades
-        .first()
-        .map(|trade| trade.margin_per_lot)
-        .unwrap_or(0.0);
-    let initial_margin = trades.first().map(|trade| trade.margin_used).unwrap_or(0.0);
-    let max_margin_per_lot = trades
-        .iter()
-        .map(|trade| trade.margin_per_lot)
-        .reduce(f64::max)
-        .unwrap_or(0.0);
-    let max_margin_used = trades
-        .iter()
-        .map(|trade| trade.margin_used)
-        .reduce(f64::max)
-        .unwrap_or(0.0);
     let summary = json!({
         "strategy_key": STRATEGY_KEY,
         "strategy_name": "Futures Breakout v3",
@@ -1477,13 +1397,7 @@ fn simulate(
         "pnl_multiplier_per_lot": pnl_multiplier,
         "pnl_model": "futures_price_points_x_contract_value_x_lots",
         "entry_frequency": "one_breakout_entry_per_trading_day_plus_sl2_reversals",
-        "gap_entry_rule": "gap_direction_only; jumped_entries_use_completed_09:00_09:15_range_with_0.12_percent_buffer",
-        "margin_requirement_percent": margin_requirement_percent,
-        "initial_margin_per_lot": initial_margin_per_lot,
-        "initial_margin": initial_margin,
-        "max_margin_per_lot": max_margin_per_lot,
-        "max_single_trade_margin_used": max_margin_used,
-        "max_margin_used": max_open_margin_used,
+        "gap_entry_rule": "each_side_independent; session_open_beyond_that_side_uses_completed_09:00_09:15_range_with_0.12_percent_buffer",
         "buy_trades": trades.iter().filter(|trade| trade.direction == "BUY").count(),
         "sell_trades": trades.iter().filter(|trade| trade.direction == "SELL").count(),
     });
@@ -1519,12 +1433,6 @@ pub async fn run(
             "Lots must be a positive integer.".into(),
         ));
     }
-    if strategy_key == OPTION_ENTRY_STRATEGY_KEY {
-        return Err(AppError::BadRequest(
-            "Option Entry Strategy V1.0 backtesting has been removed. Use live/demo strategy monitoring for Option Entry; backtesting is available only for Futures Breakout v3."
-                .into(),
-        ));
-    }
     if strategy_key == SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY {
         return Err(AppError::BadRequest(
             "SuperTrend Index Options v1 is a live/demo option strategy. Use runtime events and trade history for validation; backtesting is available only for Futures Breakout v3."
@@ -1551,41 +1459,6 @@ pub async fn run(
         )));
     }
     let contract = current_contract(&state, &instrument).await?;
-    let buy_margin = crate::margin::estimate(
-        &state,
-        user.id,
-        &credentials.api_key,
-        &credentials.jwt_token,
-        &contract.exchange,
-        "CARRYFORWARD",
-        &contract.token,
-        &contract.symbol,
-        "STOPLOSS_LIMIT",
-        "BUY",
-        contract.lot_size,
-        input.lots,
-    )
-    .await?;
-    let sell_margin = crate::margin::estimate(
-        &state,
-        user.id,
-        &credentials.api_key,
-        &credentials.jwt_token,
-        &contract.exchange,
-        "CARRYFORWARD",
-        &contract.token,
-        &contract.symbol,
-        "STOPLOSS_LIMIT",
-        "SELL",
-        contract.lot_size,
-        input.lots,
-    )
-    .await?;
-    let contract = ContractSelection {
-        buy_margin_per_lot: Some(buy_margin.margin_per_lot),
-        sell_margin_per_lot: Some(sell_margin.margin_per_lot),
-        ..contract
-    };
     let to_time = latest_completed_backtest_time(Utc::now());
     let from_time = to_time - Duration::days(i64::from(input.lookback_months) * 31);
     let warmup_from = from_time - Duration::days(20);
@@ -1668,7 +1541,6 @@ pub async fn run(
     }
     let opening_ranges =
         build_opening_ranges(opening_candles.as_deref().unwrap_or(intraday.as_slice()));
-    let margin_requirement_percent = effective_margin_requirement(&state, user.id).await?;
     let (trades, mut summary) = simulate(
         &intraday,
         &daily,
@@ -1676,30 +1548,12 @@ pub async fn run(
         &instrument,
         contract.lot_size,
         input.lots,
-        margin_requirement_percent,
-        contract.buy_margin_per_lot,
-        contract.sell_margin_per_lot,
     );
     summary["daily_candles"] = json!(daily.len());
     summary["interval_candles"] = json!(intraday.len());
     summary["opening_range_candles"] =
         json!(opening_candles.as_ref().map_or(intraday.len(), Vec::len));
     summary["opening_range_days"] = json!(opening_ranges.len());
-    summary["buy_margin_per_lot"] = json!(buy_margin.margin_per_lot);
-    summary["sell_margin_per_lot"] = json!(sell_margin.margin_per_lot);
-    summary["calculator_margin_per_lot"] =
-        json!(buy_margin.margin_per_lot.max(sell_margin.margin_per_lot));
-    if summary
-        .get("initial_margin_per_lot")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0)
-        <= 0.0
-    {
-        summary["initial_margin_per_lot"] =
-            json!(buy_margin.margin_per_lot.max(sell_margin.margin_per_lot));
-        summary["initial_margin"] =
-            json!(buy_margin.margin_per_lot.max(sell_margin.margin_per_lot) * input.lots as f64);
-    }
     let run_id = Uuid::new_v4();
     let data_points = daily_stats.data_points
         + interval_stats.data_points
@@ -2194,9 +2048,11 @@ mod tests {
             high: 106.0,
             low: 104.0,
         };
-        let replacement =
-            futures_opening_range_entry(FuturesGapDirection::Up, opening.high, opening.low)
-                .unwrap();
+        let plan = futures_missed_entry_plan(opening.market_open, 103.1236, 89.892).unwrap();
+        let replacement = futures_opening_range_entries(plan, opening.high, opening.low)
+            .unwrap()
+            .0
+            .unwrap();
         let intraday = vec![
             timed_candle(5, 3, 40, 105.0, 106.0, 104.0, 105.5),
             timed_candle(
@@ -2217,9 +2073,6 @@ mod tests {
             "GOLDTEN",
             10,
             1,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
 
         assert_eq!(trades.len(), 1);
@@ -2229,7 +2082,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 1, 5, 3, 45, 0).single().unwrap()
         );
         assert!((trades[0].entry_price - replacement).abs() < 1e-9);
-        assert_eq!(trades[0].levels["gap_direction"], "UP");
+        assert_eq!(trades[0].levels["gap_direction"], "BUY_MISSED");
         assert_eq!(trades[0].levels["entry_source"], "OPENING_RANGE");
         assert_eq!(trades[0].levels["previous_close"], 99.0);
         assert_eq!(trades[0].levels["market_open"], 105.0);
@@ -2250,9 +2103,11 @@ mod tests {
             high: 86.0,
             low: 84.0,
         };
-        let replacement =
-            futures_opening_range_entry(FuturesGapDirection::Down, opening.high, opening.low)
-                .unwrap();
+        let plan = futures_missed_entry_plan(opening.market_open, 103.1236, 89.892).unwrap();
+        let replacement = futures_opening_range_entries(plan, opening.high, opening.low)
+            .unwrap()
+            .1
+            .unwrap();
         let intraday = vec![
             timed_candle(5, 3, 40, 85.0, 86.0, 84.0, 84.5),
             timed_candle(
@@ -2273,9 +2128,6 @@ mod tests {
             "GOLDTEN",
             10,
             1,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
 
         assert_eq!(trades.len(), 1);
@@ -2285,7 +2137,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 1, 5, 3, 45, 0).single().unwrap()
         );
         assert!((trades[0].entry_price - replacement).abs() < 1e-9);
-        assert_eq!(trades[0].levels["gap_direction"], "DOWN");
+        assert_eq!(trades[0].levels["gap_direction"], "SELL_MISSED");
         assert_eq!(trades[0].levels["entry_source"], "OPENING_RANGE");
     }
 
@@ -2347,9 +2199,6 @@ mod tests {
                 "GOLDTEN",
                 10,
                 lots,
-                10.0,
-                Some(12.0),
-                Some(12.0),
             )
         };
 
@@ -2425,9 +2274,6 @@ mod tests {
             "GOLDTEN",
             10,
             3,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
         assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].exit_reason, "SL2");
@@ -2448,7 +2294,6 @@ mod tests {
         assert_eq!(summary["trades"], 2);
         assert_eq!(summary["sl2_reversals"], 1);
         assert_eq!(summary["sl2_reversal_lots"], 3);
-        assert_eq!(summary["initial_margin_per_lot"], 12.0);
     }
 
     #[test]
@@ -2456,15 +2301,16 @@ mod tests {
         let daily = vec![
             candle(1, 150.0, 170.0, 140.0, 160.0),
             candle(2, 150.0, 160.0, 141.0, 150.0),
-            candle(3, 145.0, 150.0, 142.0, 146.0),
-            candle(4, 146.0, 151.0, 143.0, 147.0),
-            candle(5, 147.0, 152.0, 144.0, 148.0),
+            candle(3, 145.0, 169.0, 142.0, 146.0),
+            candle(4, 146.0, 169.0, 143.0, 147.0),
+            candle(5, 147.0, 169.0, 144.0, 148.0),
         ];
         let levels =
-            calculate(&[170.0, 160.0, 150.0, 151.0], &[140.0, 141.0, 142.0, 143.0]).unwrap();
+            calculate(&[170.0, 160.0, 169.0, 169.0], &[140.0, 141.0, 142.0, 143.0]).unwrap();
         let reversal = levels_for_entry_price(levels, "SELL", levels.buy_sl2).unwrap();
-        assert!((levels.buy_sl2 - levels.sell_entry).abs() < 1e-9);
-        assert!(levels.sell_sl1 > levels.buy_sl2);
+        assert!(
+            (levels.buy_sl2 - (levels.buy_entry * 0.985).max(levels.ll4 * 0.9988)).abs() < 1e-9
+        );
         assert!(reversal.sell_sl1 > levels.buy_sl2);
         let intraday = vec![
             candle(
@@ -2511,9 +2357,6 @@ mod tests {
             "GOLDTEN",
             10,
             3,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
 
         assert_eq!(trades[1].levels["entry_reason"], "SL2_REVERSAL");
@@ -2537,17 +2380,6 @@ mod tests {
         assert_eq!(pnl_multiplier_per_lot("SILVERM"), 5.0);
         assert_eq!(pnl_multiplier_per_lot("SILVERMIC"), 1.0);
         assert_eq!(pnl_multiplier_per_lot("NATGASMINI"), 250.0);
-        assert_eq!(futures_margin_per_lot(100_000.0, "GOLDM", 10.0), 100_000.0);
-        assert_eq!(futures_margin_per_lot(100_000.0, "GOLDTEN", 10.0), 10_000.0);
-        assert_eq!(futures_margin_per_lot(100_000.0, "SILVERM", 10.0), 50_000.0);
-        assert_eq!(
-            futures_margin_per_lot(100_000.0, "SILVERMIC", 10.0),
-            10_000.0
-        );
-        assert_eq!(
-            futures_margin_per_lot(100_000.0, "NATGASMINI", 10.0),
-            2_500_000.0
-        );
     }
 
     #[test]
@@ -2600,9 +2432,6 @@ mod tests {
             "GOLDTEN",
             10,
             3,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
         let reversals = trades
             .iter()
@@ -2662,7 +2491,6 @@ mod tests {
             2,
             10,
             1.0,
-            12.0,
             reversal_levels,
         );
         let next_date = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
@@ -2731,9 +2559,6 @@ mod tests {
             "GOLDTEN",
             10,
             3,
-            10.0,
-            Some(12.0),
-            Some(12.0),
         );
 
         assert_eq!(trades.len(), 2);
@@ -2781,9 +2606,6 @@ mod tests {
             "GOLDTEN",
             10,
             1,
-            10.0,
-            Some(13_218.0),
-            Some(13_218.0),
         );
         let expected = levels.buy_target - levels.buy_entry;
         assert_eq!(trades.len(), 1);
@@ -2843,9 +2665,6 @@ mod tests {
             "GOLDTEN",
             10,
             1,
-            10.0,
-            Some(13_218.0),
-            Some(13_218.0),
         );
         assert_eq!(trades.len(), 1);
         assert_eq!(

@@ -12,7 +12,6 @@ mod home;
 mod instruments;
 mod jobs;
 mod logs;
-mod margin;
 mod market_ws;
 mod models;
 mod notifications;
@@ -195,10 +194,14 @@ async fn main() -> Result<()> {
         strategy_events,
         strategy_feeds: Default::default(),
         strategy_feed_tokens: Default::default(),
+        live_index_candles: Default::default(),
+        strategy_tick_sequences: Default::default(),
         session_checks: Default::default(),
         angel_api_cooldowns: Default::default(),
+        angel_request_history: Default::default(),
         shared_historical_cooldowns: Default::default(),
         shared_market_cursor: Default::default(),
+        strategy_execution_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         credentials: credential_store,
         abuse_prevention: Default::default(),
     };
@@ -252,9 +255,6 @@ async fn main() -> Result<()> {
             "/account/profile/request-otp",
             post(account::request_profile_otp),
         )
-        .route("/account/balance", get(account::get_balance))
-        .route("/account/balance/top-up", post(account::top_up_demo))
-        .route("/account/balance/reset", post(account::reset_demo))
         .route(
             "/account/trading-mode",
             axum::routing::put(account::update_trading_mode),
@@ -294,6 +294,14 @@ async fn main() -> Result<()> {
             get(strategy::status).put(strategy::update),
         )
         .route("/strategies", get(strategy::catalog))
+        .route(
+            "/strategies/admin/executions",
+            get(strategy::admin_execution_report),
+        )
+        .route(
+            "/strategies/admin/executions/retry",
+            post(strategy::admin_retry_execution_intent),
+        )
         .route(
             "/strategies/{strategy_key}/activation",
             axum::routing::put(strategy::update_activation),

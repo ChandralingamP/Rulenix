@@ -1017,7 +1017,7 @@ pub async fn update_user(
             .fetch_optional(&mut *tx)
             .await?;
     let changed_id = changed_id.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(changed_id)
         .execute(&mut *tx)
         .await?;
@@ -1110,7 +1110,7 @@ pub async fn delete_user(
             .fetch_optional(&mut *tx)
             .await?;
     let target_id = target_id.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(target_id)
         .execute(&mut *tx)
         .await?;
@@ -1164,7 +1164,7 @@ pub async fn clear_user_trade_logs(
             .await?;
     let (target_id, username) =
         target.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(target_id)
         .execute(&mut *tx)
         .await?;

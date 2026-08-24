@@ -10,7 +10,6 @@ const RISK_FIELDS = [
   ["max_daily_realized_loss", "Daily realized loss"],
   ["max_daily_unrealized_loss", "Daily unrealized loss"],
   ["max_price_age_seconds", "Price age (seconds)"],
-  ["margin_requirement_percent", "Margin required (%)"],
 ];
 
 function LimitFields({ draft, onChange, prefix }) {
