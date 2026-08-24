@@ -1,107 +1,30 @@
--- Remove Option Entry v1 without affecting Futures Breakout v3 or
--- SuperTrend Index Options v1.
-DELETE FROM strategy_execution_intents
-WHERE strategy_key = 'option_entry_v1';
+-- Retire Option Entry v1 and the legacy persisted margin model from active
+-- application use without destroying their historical records.
+--
+-- The executable strategy/router no longer dispatches `option_entry_v1`, and
+-- current live margin validation uses Angel One RMS plus the broker margin
+-- endpoint. Database history is intentionally retained in place so original
+-- identifiers, timestamps, broker references, fills, P&L, and foreign-key
+-- relationships remain queryable and auditable.
+--
+-- Do not delete legacy rows or drop legacy tables/columns here. They are
+-- historical compatibility storage. A future archival migration, if ever
+-- needed, must copy and verify every relationship before changing this schema.
 
-DELETE FROM strategy_signals
-WHERE strategy_key = 'option_entry_v1';
+COMMENT ON TABLE broker_margin_estimates IS
+    'Historical broker margin estimates retained for audit compatibility; active entries use live Angel One margin and RMS validation.';
 
--- Unlink the decision first because strategy_orders.risk_decision_id references
--- risk_decisions without ON DELETE CASCADE. The decision itself retains order_id,
--- so it can be removed safely after the order row is gone.
-UPDATE strategy_orders orders
-SET risk_decision_id = NULL
-WHERE orders.snapshot_id IN (
-    SELECT id FROM strategy_market_snapshots
-    WHERE strategy_key = 'option_entry_v1'
-);
+COMMENT ON TABLE backtest_option_contracts IS
+    'Historical Option Entry v1 contract snapshots retained for reproducible backtest and audit history; not used by active execution.';
 
-WITH deleted_orders AS (
-    DELETE FROM strategy_orders orders
-    WHERE orders.snapshot_id IN (
-        SELECT id FROM strategy_market_snapshots
-        WHERE strategy_key = 'option_entry_v1'
-    )
-    RETURNING orders.id
-)
-DELETE FROM risk_decisions decisions
-USING deleted_orders
-WHERE decisions.order_id = deleted_orders.id;
+COMMENT ON COLUMN strategy_orders.margin_required IS
+    'Historical estimated margin captured by retired execution paths; retained for order audit compatibility.';
 
-DELETE FROM strategy_reversal_intents
-WHERE snapshot_id IN (
-    SELECT id FROM strategy_market_snapshots
-    WHERE strategy_key = 'option_entry_v1'
-);
+COMMENT ON COLUMN trades.margin_required IS
+    'Historical estimated margin captured by retired execution paths; retained for trade and P&L audit compatibility.';
 
-DELETE FROM trades
-WHERE strategy_key = 'option_entry_v1';
+COMMENT ON COLUMN user_profiles.demo_balance IS
+    'Historical demo-account balance retained for audit compatibility; no longer used as an active entry funds gate.';
 
-DELETE FROM strategy_market_snapshots
-WHERE strategy_key = 'option_entry_v1';
-
-DELETE FROM strategy_events
-WHERE strategy_key = 'option_entry_v1';
-
-DELETE FROM strategy_scheduler_runs
-WHERE strategy_key = 'option_entry_v1';
-
-DELETE FROM user_strategy_configs
-WHERE strategy_key = 'option_entry_v1';
-
-DELETE FROM user_strategy_activations
-WHERE strategy_key = 'option_entry_v1';
-
-DELETE FROM backtest_runs
-WHERE strategy_key = 'option_entry_v1';
-
-DROP TABLE IF EXISTS backtest_option_contracts;
-
--- Remove margin calculation caches, persisted amounts, simulated funds, and
--- the obsolete risk-limit input. Live insufficient-funds errors now come from
--- the actual Angel One order response; demo entries have no funds gate.
-DROP TABLE IF EXISTS broker_margin_estimates;
-
-ALTER TABLE strategy_orders
-    DROP COLUMN IF EXISTS margin_required;
-
-ALTER TABLE trades
-    DROP COLUMN IF EXISTS margin_required;
-
-ALTER TABLE user_profiles
-    DROP COLUMN IF EXISTS demo_balance;
-
-ALTER TABLE risk_limits
-    DROP COLUMN IF EXISTS margin_requirement_percent;
-
-UPDATE risk_decisions
-SET values = values
-    #- '{order,margin_required}'
-    #- '{health,margin_available}'
-    #- '{limits,margin_requirement_percent}'
-WHERE values #> '{order,margin_required}' IS NOT NULL
-   OR values #> '{health,margin_available}' IS NOT NULL
-   OR values #> '{limits,margin_requirement_percent}' IS NOT NULL;
-
-UPDATE backtest_runs
-SET summary = summary
-    - 'margin_requirement_percent'
-    - 'initial_margin_per_lot'
-    - 'initial_margin'
-    - 'max_margin_per_lot'
-    - 'max_single_trade_margin_used'
-    - 'max_margin_used'
-    - 'buy_margin_per_lot'
-    - 'sell_margin_per_lot'
-    - 'calculator_margin_per_lot'
-WHERE summary ?| ARRAY[
-    'margin_requirement_percent',
-    'initial_margin_per_lot',
-    'initial_margin',
-    'max_margin_per_lot',
-    'max_single_trade_margin_used',
-    'max_margin_used',
-    'buy_margin_per_lot',
-    'sell_margin_per_lot',
-    'calculator_margin_per_lot'
-];
+COMMENT ON COLUMN risk_limits.margin_requirement_percent IS
+    'Historical risk-limit input retained for audit compatibility; active live entries use broker-reported margin and RMS funds.';

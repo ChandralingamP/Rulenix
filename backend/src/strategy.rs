@@ -10527,6 +10527,20 @@ mod tests {
         Ok(())
     }
 
+    async fn apply_raw_migration_file(
+        db: &sqlx::PgPool,
+        file_name: &str,
+    ) -> Result<(), sqlx::Error> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(file_name);
+        let sql = std::fs::read_to_string(path).expect("migration SQL must be readable");
+        let mut transaction = db.begin().await?;
+        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn isolated_test_state() -> AppState {
         isolated_test_state_with_broker("https://127.0.0.1:9").await
     }
@@ -12032,6 +12046,320 @@ mod tests {
                 "serialized fills must not create duplicate protection intent"
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CREATE DATABASE on an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn removed_legacy_features_preserve_active_and_inactive_history() {
+        let base = isolated_test_database_url();
+        let admin_url = database_url_for_name(&base, "postgres");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("isolated PostgreSQL admin database must be reachable");
+        let suffix = &Uuid::new_v4().simple().to_string()[..12];
+        let database_name = format!("rulenix_test_history_{suffix}");
+        sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
+            .execute(&admin)
+            .await
+            .expect("disposable history database must be creatable");
+
+        let database_url = database_url_for_name(&base, &database_name);
+        let db = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("disposable history database must be reachable");
+        apply_raw_migrations_through(&db, "20260819000000_durable_signal_fanout.sql")
+            .await
+            .expect("schema immediately before the retirement migration must apply");
+
+        let active_user = Uuid::new_v4();
+        let inactive_user = Uuid::new_v4();
+        let active_snapshot = Uuid::new_v4();
+        let inactive_snapshot = Uuid::new_v4();
+        let active_trade = Uuid::new_v4();
+        let inactive_trade = Uuid::new_v4();
+        let active_order = Uuid::new_v4();
+        let inactive_order = Uuid::new_v4();
+        let active_decision = Uuid::new_v4();
+        let inactive_decision = Uuid::new_v4();
+        let active_signal = Uuid::new_v4();
+        let inactive_signal = Uuid::new_v4();
+        let backtest_run = Uuid::new_v4();
+
+        for (id, username, email) in [
+            (active_user, "legacy-active", "legacy-active@example.test"),
+            (
+                inactive_user,
+                "legacy-inactive",
+                "legacy-inactive@example.test",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,'test-only')",
+            )
+            .bind(id)
+            .bind(username)
+            .bind(email)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO user_profiles(user_id,demo_balance) VALUES($1,$2)")
+                .bind(id)
+                .bind(if id == active_user {
+                    187654.25
+                } else {
+                    204321.75
+                })
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        for (user_id, active) in [(active_user, true), (inactive_user, false)] {
+            sqlx::query("INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots) VALUES($1,'option_entry_v1','NIFTY',$2,1)")
+                .bind(user_id).bind(active).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active,activated_at,deactivated_at) VALUES($1,'option_entry_v1',$2,NOW()-INTERVAL '30 days',CASE WHEN $2 THEN NULL ELSE NOW()-INTERVAL '2 days' END)")
+                .bind(user_id).bind(active).execute(&db).await.unwrap();
+        }
+
+        for (snapshot_id, trade_date, token, symbol) in [
+            (active_snapshot, "2026-08-20", "26001", "NIFTY26AUG25000CE"),
+            (
+                inactive_snapshot,
+                "2026-07-20",
+                "25001",
+                "NIFTY26JUL24500PE",
+            ),
+        ] {
+            sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token) VALUES($1,'option_entry_v1','NIFTY',$2::date,'ready','',$3,$4,$2::date+7,50,'NFO','INTRADAY',$5,'99926000')")
+                .bind(snapshot_id).bind(trade_date).bind(token).bind(symbol)
+                .bind(format!("legacy-{token}"))
+                .execute(&db).await.unwrap();
+        }
+
+        for (trade_id, user_id, snapshot_id, status, external_entry, margin, pnl) in [
+            (
+                active_trade,
+                active_user,
+                active_snapshot,
+                "open",
+                "BROKER-ACTIVE-ENTRY",
+                32145.50,
+                125.75,
+            ),
+            (
+                inactive_trade,
+                inactive_user,
+                inactive_snapshot,
+                "closed",
+                "BROKER-HISTORIC-ENTRY",
+                29876.25,
+                -84.50,
+            ),
+        ] {
+            sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,exit_price,last_price,pnl,entry_datetime,exit_datetime,instrument_label,contract_symbol,external_entry_id,external_exit_id,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,margin_required) VALUES($1,$2,'live',$4,'BUY',50,100.25,CASE WHEN $4='closed' THEN 98.56 ELSE NULL END,102.75,$7,NOW()-INTERVAL '3 days',CASE WHEN $4='closed' THEN NOW()-INTERVAL '2 days' ELSE NULL END,'NIFTY',$5,$6,CASE WHEN $4='closed' THEN 'BROKER-HISTORIC-EXIT' ELSE '' END,'preservation fixture','option_entry_v1',$3,1,CASE WHEN $4='open' THEN 1 ELSE 0 END,$8)")
+                .bind(trade_id).bind(user_id).bind(snapshot_id).bind(status).bind(if status == "open" { "NIFTY26AUG25000CE" } else { "NIFTY26JUL24500PE" }).bind(external_entry).bind(pnl).bind(margin)
+                .execute(&db).await.unwrap();
+        }
+
+        for (decision_id, user_id, margin) in [
+            (active_decision, active_user, 32145.50),
+            (inactive_decision, inactive_user, 29876.25),
+        ] {
+            sqlx::query("INSERT INTO risk_decisions(id,user_id,order_id,execution_mode,order_role,allowed,reason_code,message,values) VALUES($1,$2,NULL,'live','BUY_ENTRY',TRUE,'ALLOWED','legacy decision',jsonb_build_object('order',jsonb_build_object('margin_required',$3),'health',jsonb_build_object('margin_available',50000)))")
+                .bind(decision_id).bind(user_id).bind(margin)
+                .execute(&db).await.unwrap();
+        }
+
+        for (order_id, user_id, snapshot_id, trade_id, decision_id, broker_id, margin) in [
+            (
+                active_order,
+                active_user,
+                active_snapshot,
+                active_trade,
+                active_decision,
+                "ANGEL-ACTIVE-ORDER",
+                32145.50,
+            ),
+            (
+                inactive_order,
+                inactive_user,
+                inactive_snapshot,
+                inactive_trade,
+                inactive_decision,
+                "ANGEL-HISTORIC-ORDER",
+                29876.25,
+            ),
+        ] {
+            sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,lots,quantity,price,status,broker_order_id,broker_status,idempotency_key,client_order_id,filled_quantity,processed_quantity,average_fill_price,filled_price,filled_at,risk_decision_id,margin_required) VALUES($1,$2,$3,$4,$5,'BUY_ENTRY','BUY','live',1,50,100.25,'filled',$7,'complete',$6,$8,50,50,100.25,100.25,NOW()-INTERVAL '3 days',$9,$10)")
+                .bind(order_id).bind(user_id).bind(snapshot_id).bind(trade_id)
+                .bind(format!("legacy-{}", &order_id.simple().to_string()[..8]))
+                .bind(format!("legacy-idempotency-{order_id}"))
+                .bind(broker_id)
+                .bind(format!("RX{}", &order_id.simple().to_string()[..18]).to_uppercase())
+                .bind(decision_id).bind(margin)
+                .execute(&db).await.unwrap();
+            sqlx::query("UPDATE risk_decisions SET order_id=$1 WHERE id=$2")
+                .bind(order_id)
+                .bind(decision_id)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO broker_order_events(order_id,user_id,from_state,to_state,event_type,broker_order_id,diagnostic,broker_payload) VALUES($1,$2,'submitted','filled','reconciled_fill',$3,'historical fill retained',jsonb_build_object('filledshares','50','averageprice','100.25'))")
+                .bind(order_id).bind(user_id).bind(broker_id).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO strategy_events(user_id,strategy_key,instrument,event_type,payload) VALUES($1,'option_entry_v1','NIFTY','legacy_fill',jsonb_build_object('order_id',$2::text,'broker_order_id',$3))")
+                .bind(user_id).bind(order_id).bind(broker_id).execute(&db).await.unwrap();
+        }
+
+        for (signal_id, user_id, snapshot_id, trade_id, order_id, session) in [
+            (
+                active_signal,
+                active_user,
+                active_snapshot,
+                active_trade,
+                active_order,
+                "legacy-active-signal",
+            ),
+            (
+                inactive_signal,
+                inactive_user,
+                inactive_snapshot,
+                inactive_trade,
+                inactive_order,
+                "legacy-inactive-signal",
+            ),
+        ] {
+            sqlx::query("INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,snapshot_id,signal_type,status,expected_users,payload) VALUES($1,'option_entry_v1','NIFTY',$2,NOW()-INTERVAL '3 days',$3,'OPTION_ENTRY','completed',1,'{}')")
+                .bind(signal_id).bind(session).bind(snapshot_id).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO strategy_execution_intents(id,signal_id,user_id,snapshot_id,trade_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,quantity,price,status,strategy_order_id,completed_at) VALUES($1,$2,$3,$4,$5,'option_entry_v1','NIFTY',$6,'ENTRY','BUY_ENTRY','BUY','MARKET',1,50,100.25,'completed',$7,NOW()-INTERVAL '3 days')")
+                .bind(Uuid::new_v4()).bind(signal_id).bind(user_id).bind(snapshot_id).bind(trade_id).bind(session).bind(order_id)
+                .execute(&db).await.unwrap();
+        }
+
+        sqlx::query("INSERT INTO strategy_reversal_intents(source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key,status) VALUES($1,$2,$3,'NIFTY','BUY','SELL',1,98.50,'legacy-reversal','completed')")
+            .bind(inactive_trade).bind(inactive_user).bind(inactive_snapshot).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO broker_margin_estimates(id,exchange,symbol_token,trading_symbol,product_type,order_type,trade_type,lot_size,margin_per_lot,raw_response,fetched_by) VALUES($1,'NFO','26001','NIFTY26AUG25000CE','INTRADAY','MARKET','BUY',50,32145.50,jsonb_build_object('legacy',TRUE),$2)")
+            .bind(Uuid::new_v4()).bind(active_user).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO backtest_option_contracts(id,snapshot_date,instrument,side,exchange,symbol_token,trading_symbol,expiry_date,strike_price,lot_size) VALUES($1,'2026-07-20','NIFTY','CE','NFO','25001','NIFTY26JUL24500CE','2026-07-30',24500,50)")
+            .bind(Uuid::new_v4()).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO backtest_runs(id,user_id,strategy_key,instrument,trading_symbol,symbol_token,interval_key,lookback_months,from_time,to_time,lots,lot_size,status,summary,data_points) VALUES($1,$2,'option_entry_v1','NIFTY','NIFTY-I','99926000','FIVE_MINUTE',1,NOW()-INTERVAL '30 days',NOW(),1,50,'completed',jsonb_build_object('initial_margin',29876.25,'max_margin_used',32145.50),100)")
+            .bind(backtest_run).bind(inactive_user).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO backtest_trades(id,run_id,trade_date,direction,entry_time,entry_price,exit_time,exit_price,lots,quantity,realized_pnl,exit_reason,levels) VALUES($1,$2,'2026-07-20','BUY',NOW()-INTERVAL '4 days',100.25,NOW()-INTERVAL '3 days',98.56,1,50,-84.50,'STOP',jsonb_build_object('broker_reference','BACKTEST-HISTORY'))")
+            .bind(Uuid::new_v4()).bind(backtest_run).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO audit_events(event_type,actor_user_id,target_user_id,summary,metadata) VALUES('legacy_option_entry',$1,$2,'historical audit retained',jsonb_build_object('strategy_key','option_entry_v1'))")
+            .bind(active_user).bind(inactive_user).execute(&db).await.unwrap();
+
+        let counts_sql = "SELECT jsonb_build_object(
+            'users',(SELECT COUNT(*) FROM users WHERE id IN ($1,$2)),
+            'profiles',(SELECT COUNT(*) FROM user_profiles WHERE user_id IN ($1,$2)),
+            'configs',(SELECT COUNT(*) FROM user_strategy_configs WHERE strategy_key='option_entry_v1'),
+            'activations',(SELECT COUNT(*) FROM user_strategy_activations WHERE strategy_key='option_entry_v1'),
+            'snapshots',(SELECT COUNT(*) FROM strategy_market_snapshots WHERE strategy_key='option_entry_v1'),
+            'trades',(SELECT COUNT(*) FROM trades WHERE strategy_key='option_entry_v1'),
+            'orders',(SELECT COUNT(*) FROM strategy_orders WHERE snapshot_id IN ($3,$4)),
+            'fills',(SELECT COUNT(*) FROM broker_order_events WHERE order_id IN ($5,$6)),
+            'events',(SELECT COUNT(*) FROM strategy_events WHERE strategy_key='option_entry_v1'),
+            'signals',(SELECT COUNT(*) FROM strategy_signals WHERE strategy_key='option_entry_v1'),
+            'intents',(SELECT COUNT(*) FROM strategy_execution_intents WHERE strategy_key='option_entry_v1'),
+            'reversals',(SELECT COUNT(*) FROM strategy_reversal_intents WHERE snapshot_id IN ($3,$4)),
+            'backtest_runs',(SELECT COUNT(*) FROM backtest_runs WHERE strategy_key='option_entry_v1'),
+            'backtest_trades',(SELECT COUNT(*) FROM backtest_trades WHERE run_id=$7),
+            'contracts',(SELECT COUNT(*) FROM backtest_option_contracts),
+            'margin_estimates',(SELECT COUNT(*) FROM broker_margin_estimates),
+            'audit_events',(SELECT COUNT(*) FROM audit_events WHERE event_type='legacy_option_entry'))";
+        let before: Value = sqlx::query_scalar(counts_sql)
+            .bind(active_user)
+            .bind(inactive_user)
+            .bind(active_snapshot)
+            .bind(inactive_snapshot)
+            .bind(active_order)
+            .bind(inactive_order)
+            .bind(backtest_run)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        apply_raw_migration_file(&db, "20260823000000_remove_margin_and_option_entry.sql")
+            .await
+            .expect("history-preserving retirement migration must apply");
+
+        let after: Value = sqlx::query_scalar(counts_sql)
+            .bind(active_user)
+            .bind(inactive_user)
+            .bind(active_snapshot)
+            .bind(inactive_snapshot)
+            .bind(active_order)
+            .bind(inactive_order)
+            .bind(backtest_run)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "retirement migration must preserve every historical category"
+        );
+        assert_eq!(after["trades"], 2);
+        assert_eq!(after["orders"], 2);
+        assert_eq!(after["snapshots"], 2);
+        assert_eq!(after["events"], 2);
+
+        let relationships: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM strategy_orders o JOIN trades t ON t.id=o.trade_id JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE s.strategy_key='option_entry_v1'),
+                (SELECT COUNT(*) FROM broker_order_events e JOIN strategy_orders o ON o.id=e.order_id WHERE o.id IN ($1,$2)),
+                (SELECT COUNT(*) FROM strategy_execution_intents i JOIN strategy_signals s ON s.id=i.signal_id JOIN strategy_orders o ON o.id=i.strategy_order_id WHERE i.strategy_key='option_entry_v1'),
+                (SELECT COUNT(*) FROM risk_decisions d JOIN strategy_orders o ON o.risk_decision_id=d.id WHERE o.id IN ($1,$2))",
+        )
+        .bind(active_order).bind(inactive_order).fetch_one(&db).await.unwrap();
+        assert_eq!(relationships, (2, 2, 2, 2));
+
+        let preserved_values: (String, String, String, String, f64, f64) = sqlx::query_as(
+            "SELECT
+                (SELECT external_entry_id FROM trades WHERE id=$1),
+                (SELECT external_exit_id FROM trades WHERE id=$2),
+                (SELECT broker_order_id FROM strategy_orders WHERE id=$3),
+                (SELECT broker_order_id FROM strategy_orders WHERE id=$4),
+                (SELECT margin_required FROM trades WHERE id=$1),
+                (SELECT pnl::double precision FROM trades WHERE id=$2)",
+        )
+        .bind(active_trade)
+        .bind(inactive_trade)
+        .bind(active_order)
+        .bind(inactive_order)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(preserved_values.0, "BROKER-ACTIVE-ENTRY");
+        assert_eq!(preserved_values.1, "BROKER-HISTORIC-EXIT");
+        assert_eq!(preserved_values.2, "ANGEL-ACTIVE-ORDER");
+        assert_eq!(preserved_values.3, "ANGEL-HISTORIC-ORDER");
+        assert!((preserved_values.4 - 32145.50).abs() < 1e-9);
+        assert!((preserved_values.5 - (-84.50)).abs() < 1e-9);
+
+        apply_raw_migration_file(&db, "20260823010000_execution_safety_lifecycle.sql")
+            .await
+            .unwrap();
+        apply_raw_migration_file(&db, "20260823020000_p0_execution_safety.sql")
+            .await
+            .unwrap();
+        let application_history_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades t JOIN strategy_orders o ON o.trade_id=t.id JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.user_id IN ($1,$2) AND t.strategy_key='option_entry_v1' AND s.strategy_key='option_entry_v1'",
+        )
+        .bind(active_user).bind(inactive_user).fetch_one(&db).await.unwrap();
+        assert_eq!(
+            application_history_rows, 2,
+            "historical application query must work after all pending migrations"
+        );
+
+        db.close().await;
+        sqlx::query(&format!("DROP DATABASE \"{database_name}\" WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("disposable history database cleanup must succeed");
+        admin.close().await;
     }
 
     #[tokio::test]
