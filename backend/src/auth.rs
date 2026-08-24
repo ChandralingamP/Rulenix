@@ -1,4 +1,5 @@
 use crate::{
+    angel,
     error::{AppError, AppResult},
     models::AdminUser,
     state::AppState,
@@ -28,7 +29,7 @@ use rand::{Rng, RngCore, rngs::OsRng as TokenRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::net::SocketAddr;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -1148,6 +1149,144 @@ pub async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClearTradeBrokerState {
+    open_positions: usize,
+    nonterminal_orders: usize,
+}
+
+fn broker_items<'a>(value: &'a Value, label: &str) -> AppResult<&'a [Value]> {
+    match value {
+        Value::Null => Ok(&[]),
+        Value::Array(items) => Ok(items),
+        _ => Err(AppError::BadRequest(format!(
+            "Clear Trades stopped because Angel One returned an invalid {label} response."
+        ))),
+    }
+}
+
+fn broker_number(item: &Value, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        item.get(*name).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+                .filter(|number| number.is_finite())
+        })
+    })
+}
+
+fn inspect_clear_trade_broker_state(
+    order_book: &Value,
+    positions: &Value,
+) -> AppResult<ClearTradeBrokerState> {
+    let mut state = ClearTradeBrokerState::default();
+    for position in broker_items(positions, "position-book")? {
+        let net_quantity = broker_number(position, &["netqty", "netQty"]).ok_or_else(|| {
+            AppError::BadRequest(
+                "Clear Trades stopped because an Angel One position omitted a valid net quantity."
+                    .into(),
+            )
+        })?;
+        if net_quantity != 0.0 {
+            state.open_positions += 1;
+        }
+    }
+    for order in broker_items(order_book, "order-book")? {
+        let status = order
+            .get("status")
+            .or_else(|| order.get("orderstatus"))
+            .or_else(|| order.get("orderStatus"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            status.as_str(),
+            "complete" | "completed" | "filled" | "rejected" | "cancelled" | "canceled"
+        ) {
+            // Unknown or missing states are intentionally treated as active.
+            state.nonterminal_orders += 1;
+        }
+    }
+    Ok(state)
+}
+
+fn require_clear_trade_safety(
+    global_kill_enabled: bool,
+    broker: &ClearTradeBrokerState,
+) -> AppResult<()> {
+    if !global_kill_enabled {
+        return Err(AppError::BadRequest(
+            "Clear Trades requires the global kill switch to be enabled.".into(),
+        ));
+    }
+    if broker.open_positions > 0 {
+        return Err(AppError::BadRequest(format!(
+            "Clear Trades stopped because Angel One reports {} open position(s) for this user.",
+            broker.open_positions
+        )));
+    }
+    if broker.nonterminal_orders > 0 {
+        return Err(AppError::BadRequest(format!(
+            "Clear Trades stopped because Angel One reports {} nonterminal order(s) for this user.",
+            broker.nonterminal_orders
+        )));
+    }
+    Ok(())
+}
+
+async fn inspect_user_broker_state_for_clear(
+    state: &AppState,
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> AppResult<ClearTradeBrokerState> {
+    let broker_linked: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM user_profiles
+             WHERE user_id=$1 AND BTRIM(brokerage_user_id)<>''
+         ) OR EXISTS(
+             SELECT 1 FROM broker_secrets WHERE user_id=$1
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !broker_linked {
+        return Ok(ClearTradeBrokerState::default());
+    }
+
+    let credentials = state
+        .credentials
+        .load_in_transaction(transaction, user_id)
+        .await?;
+    if credentials.api_key.trim().is_empty() || credentials.jwt_token.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Clear Trades stopped because this user's live broker state cannot be verified. Reconnect Angel One and retry while the global kill switch remains enabled."
+                .into(),
+        ));
+    }
+    let order_book = angel::order_book(state, &credentials.api_key, &credentials.jwt_token)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%user_id, %error, "Clear Trades broker order-book gate failed");
+            AppError::BadRequest(
+                "Clear Trades stopped because the user's Angel One order book could not be verified."
+                    .into(),
+            )
+        })?;
+    let positions = angel::positions(state, &credentials.api_key, &credentials.jwt_token)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%user_id, %error, "Clear Trades broker position-book gate failed");
+            AppError::BadRequest(
+                "Clear Trades stopped because the user's Angel One positions could not be verified."
+                    .into(),
+            )
+        })?;
+    inspect_clear_trade_broker_state(&order_book, &positions)
+}
+
 pub async fn clear_user_trade_logs(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthUser>,
@@ -1164,10 +1303,24 @@ pub async fn clear_user_trade_logs(
             .await?;
     let (target_id, username) =
         target.ok_or_else(|| AppError::NotFound("User not found.".into()))?;
+    // Match live submission's global-then-user lock order. The shared global
+    // lock prevents the kill switch from being disabled until this maintenance
+    // transaction finishes; the exclusive user lock prevents a concurrent
+    // submission or account mutation for the affected user.
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
         .bind(target_id)
         .execute(&mut *tx)
         .await?;
+    let global_kill_enabled: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT enabled FROM risk_kill_switches WHERE user_id IS NULL),FALSE)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let broker = inspect_user_broker_state_for_clear(&state, &mut tx, target_id).await?;
+    require_clear_trade_safety(global_kill_enabled, &broker)?;
     let open_trades: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM trades WHERE user_id=$1 AND status='open'",
     )
@@ -1206,7 +1359,7 @@ pub async fn clear_user_trade_logs(
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
             summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"preserved_open_trades":open_trades,"preserved_active_orders":active_orders}),
+            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"preserved_open_trades":open_trades,"preserved_active_orders":active_orders,"broker_open_positions":broker.open_positions,"broker_nonterminal_orders":broker.nonterminal_orders,"global_kill_switch":true}),
         },
     )
     .await
@@ -1220,7 +1373,10 @@ pub async fn clear_user_trade_logs(
         "deleted_backtest_runs":deleted_backtest_runs,
         "deleted_backtest_trades":deleted_backtest_trades,
         "preserved_open_trades":open_trades,
-        "preserved_active_orders":active_orders
+        "preserved_active_orders":active_orders,
+        "broker_open_positions":broker.open_positions,
+        "broker_nonterminal_orders":broker.nonterminal_orders,
+        "global_kill_switch":true
     })))
 }
 
@@ -1331,5 +1487,50 @@ mod security_tests {
             "username":"trader", "password":"Very-Strong-93!", "is_admin":true
         }));
         assert!(login.is_err());
+    }
+
+    #[test]
+    fn clear_trade_broker_gate_accepts_only_authoritative_flat_state() {
+        let flat = inspect_clear_trade_broker_state(
+            &json!([
+                {"status":"complete"},
+                {"orderstatus":"rejected"},
+                {"orderStatus":"cancelled"}
+            ]),
+            &json!([
+                {"netqty":"0"},
+                {"netQty":0}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(flat, ClearTradeBrokerState::default());
+        assert!(require_clear_trade_safety(true, &flat).is_ok());
+
+        let active = inspect_clear_trade_broker_state(
+            &json!([{"status":"trigger pending"}, {}]),
+            &json!([{"netqty":"25"}]),
+        )
+        .unwrap();
+        assert_eq!(active.open_positions, 1);
+        assert_eq!(active.nonterminal_orders, 2);
+        assert!(require_clear_trade_safety(true, &active).is_err());
+    }
+
+    #[test]
+    fn clear_trade_gate_depends_on_global_kill_not_force_demo_mode() {
+        let flat = ClearTradeBrokerState::default();
+        assert!(require_clear_trade_safety(true, &flat).is_ok());
+        assert!(matches!(
+            require_clear_trade_safety(false, &flat),
+            Err(AppError::BadRequest(message))
+                if message.contains("global kill switch")
+        ));
+    }
+
+    #[test]
+    fn clear_trade_broker_gate_fails_closed_on_malformed_positions() {
+        assert!(inspect_clear_trade_broker_state(&Value::Null, &json!([{}])).is_err());
+        assert!(inspect_clear_trade_broker_state(&json!({}), &Value::Null).is_err());
+        assert!(inspect_clear_trade_broker_state(&Value::Null, &Value::Null).is_ok());
     }
 }

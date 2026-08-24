@@ -329,7 +329,7 @@ export default function AdminUsersPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
           <div role="dialog" aria-modal="true" aria-labelledby="clear-trade-logs-title" className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
             <h2 id="clear-trade-logs-title" className="text-lg font-semibold text-white">Clear trade logs for {pendingClearLogs.username}?</h2>
-            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently removes this user&apos;s closed P&amp;L trade history and saved backtest runs. Open positions and active broker orders are preserved. This action cannot be undone.</p>
+            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently removes this user&apos;s closed P&amp;L trade history and saved backtest runs. The global kill switch must be enabled, and Angel One must confirm that this user has no open position or nonterminal order. Open application records are preserved. This action cannot be undone.</p>
             <div className="mt-6 flex justify-end gap-3">
               <button type="button" disabled={Boolean(clearingLogsUser)} onClick={() => setPendingClearLogs(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
               <button type="button" disabled={Boolean(clearingLogsUser)} onClick={confirmClearLogs} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{clearingLogsUser ? "Clearing..." : "Clear trade logs"}</button>
