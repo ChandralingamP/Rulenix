@@ -45,6 +45,9 @@ pub struct OrderRisk<'a> {
     pub exchange_segment: &'a str,
     pub contract_token: &'a str,
     pub live_reconciled: bool,
+    /// Origin time of a durable entry signal. Demo entries at or before the
+    /// user's latest Admin Clear Trades boundary are stale and fail closed.
+    pub originated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +155,22 @@ pub async fn assess_and_reserve(
         .bind(order.user_id)
         .execute(&mut *tx)
         .await?;
+    if order.mode == "demo"
+        && let Some(originated_at) = order.originated_at
+    {
+        let reset_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT demo_state_reset_at FROM user_profiles WHERE user_id=$1")
+                .bind(order.user_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        if reset_at.is_some_and(|reset_at| originated_at <= reset_at) {
+            return Err(AppError::BadRequest(
+                "Stale demo execution rejected because its signal predates the latest Admin Clear Trades reset."
+                    .into(),
+            ));
+        }
+    }
     let existing: Option<(Uuid, String, String)> = sqlx::query_as(
         "SELECT id,status,broker_order_id FROM strategy_orders WHERE idempotency_key=$1",
     )

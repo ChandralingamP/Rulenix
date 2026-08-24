@@ -1321,21 +1321,7 @@ pub async fn clear_user_trade_logs(
     .await?;
     let broker = inspect_user_broker_state_for_clear(&state, &mut tx, target_id).await?;
     require_clear_trade_safety(global_kill_enabled, &broker)?;
-    let open_trades: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM trades WHERE user_id=$1 AND status='open'",
-    )
-    .bind(target_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let active_orders: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')")
-        .bind(target_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let deleted_trades = sqlx::query("DELETE FROM trades WHERE user_id=$1 AND status='closed'")
-        .bind(target_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let cleared = clear_user_demo_trade_state(&mut tx, target_id).await?;
     let deleted_backtest_trades: i64 = sqlx::query_scalar(
         "SELECT COUNT(trade.id)::bigint FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id WHERE run.user_id=$1",
     )
@@ -1359,7 +1345,7 @@ pub async fn clear_user_trade_logs(
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
             summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":deleted_trades,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"preserved_open_trades":open_trades,"preserved_active_orders":active_orders,"broker_open_positions":broker.open_positions,"broker_nonterminal_orders":broker.nonterminal_orders,"global_kill_switch":true}),
+            metadata: json!({"username":username,"deleted_trades":cleared.deleted_trades,"deleted_demo_trades":cleared.deleted_demo_trades,"deleted_demo_orders":cleared.deleted_demo_orders,"deleted_demo_intents":cleared.deleted_demo_intents,"deleted_demo_events":cleared.deleted_demo_events,"deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,"deleted_orphan_signals":cleared.deleted_orphan_signals,"deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"broker_open_positions":broker.open_positions,"broker_nonterminal_orders":broker.nonterminal_orders,"global_kill_switch":true}),
         },
     )
     .await
@@ -1367,17 +1353,175 @@ pub async fn clear_user_trade_logs(
         tracing::warn!(%error, "could not write trade-log clearing audit event");
     }
     Ok(Json(json!({
-        "detail":"Trade logs cleared successfully.",
+        "detail":"Trading state cleared successfully.",
         "username":username,
-        "deleted_trades":deleted_trades,
+        "deleted_trades":cleared.deleted_trades,
+        "deleted_demo_trades":cleared.deleted_demo_trades,
+        "deleted_demo_orders":cleared.deleted_demo_orders,
+        "deleted_demo_intents":cleared.deleted_demo_intents,
+        "deleted_demo_events":cleared.deleted_demo_events,
+        "deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,
+        "deleted_orphan_signals":cleared.deleted_orphan_signals,
+        "deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,
         "deleted_backtest_runs":deleted_backtest_runs,
         "deleted_backtest_trades":deleted_backtest_trades,
-        "preserved_open_trades":open_trades,
-        "preserved_active_orders":active_orders,
         "broker_open_positions":broker.open_positions,
         "broker_nonterminal_orders":broker.nonterminal_orders,
         "global_kill_switch":true
     })))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClearedDemoTradeState {
+    pub deleted_trades: u64,
+    pub deleted_demo_trades: u64,
+    pub deleted_demo_orders: u64,
+    pub deleted_demo_intents: u64,
+    pub deleted_demo_events: u64,
+    pub deleted_demo_risk_decisions: u64,
+    pub deleted_orphan_signals: u64,
+    pub deleted_orphan_snapshots: u64,
+}
+
+/// Remove only disposable per-user demo execution state. The caller must hold
+/// the global shared risk lock and the user's exclusive advisory lock and must
+/// have completed the authoritative live-broker flat/order-free gate.
+pub(crate) async fn clear_user_demo_trade_state(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> AppResult<ClearedDemoTradeState> {
+    let reset_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE user_profiles SET demo_state_reset_at=clock_timestamp(),updated_at=NOW() WHERE user_id=$1 RETURNING demo_state_reset_at",
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let demo_trade_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM trades WHERE user_id=$1 AND execution_mode='demo' FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let demo_order_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo' FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let candidate_snapshot_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT snapshot_id FROM strategy_orders WHERE id=ANY($1::uuid[])
+         UNION
+         SELECT DISTINCT strategy_snapshot_id FROM trades WHERE id=ANY($2::uuid[]) AND strategy_snapshot_id IS NOT NULL",
+    )
+    .bind(&demo_order_ids)
+    .bind(&demo_trade_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let removed_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "DELETE FROM strategy_execution_intents i
+         USING strategy_signals s
+         WHERE i.signal_id=s.id AND i.user_id=$1
+           AND (
+             i.strategy_order_id=ANY($2::uuid[])
+             OR i.trade_id=ANY($3::uuid[])
+             OR (i.action='ENTRY' AND s.signal_at<=$4 AND i.strategy_order_id IS NULL AND i.trade_id IS NULL)
+           )
+         RETURNING i.signal_id",
+    )
+    .bind(user_id)
+    .bind(&demo_order_ids)
+    .bind(&demo_trade_ids)
+    .bind(reset_at)
+    .fetch_all(&mut **tx)
+    .await?;
+    let deleted_demo_intents = removed_signal_ids.len() as u64;
+    sqlx::query("DELETE FROM strategy_reversal_intents WHERE user_id=$1 AND source_trade_id=ANY($2::uuid[])")
+        .bind(user_id)
+        .bind(&demo_trade_ids)
+        .execute(&mut **tx)
+        .await?;
+    let demo_trade_text = demo_trade_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    let demo_order_text = demo_order_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    let deleted_demo_events = sqlx::query(
+        "DELETE FROM strategy_events
+         WHERE user_id=$1 AND (
+           payload->>'mode'='demo'
+           OR payload->>'execution_mode'='demo'
+           OR payload->>'trade_id'=ANY($2::text[])
+           OR payload->>'order_id'=ANY($3::text[])
+         )",
+    )
+    .bind(user_id)
+    .bind(&demo_trade_text)
+    .bind(&demo_order_text)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let deleted_demo_orders =
+        sqlx::query("DELETE FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    let deleted_demo_risk_decisions =
+        sqlx::query("DELETE FROM risk_decisions WHERE user_id=$1 AND execution_mode='demo'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    let deleted_demo_trades =
+        sqlx::query("DELETE FROM trades WHERE user_id=$1 AND execution_mode='demo'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    // Preserve the endpoint's established closed-history behavior for live
+    // trades. Open live records are never removed by this demo reset.
+    let deleted_closed_live_trades = sqlx::query(
+        "DELETE FROM trades WHERE user_id=$1 AND execution_mode='live' AND status='closed'",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let deleted_orphan_signals = sqlx::query(
+        "DELETE FROM strategy_signals s
+         WHERE s.id=ANY($1::uuid[])
+           AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.signal_id=s.id)",
+    )
+    .bind(&removed_signal_ids)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let deleted_orphan_snapshots = sqlx::query(
+        "DELETE FROM strategy_market_snapshots s
+         WHERE s.id=ANY($1::uuid[])
+           AND NOT EXISTS (SELECT 1 FROM strategy_orders o WHERE o.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.strategy_snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_reversal_intents r WHERE r.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_signals signal WHERE signal.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.snapshot_id=s.id)",
+    )
+    .bind(&candidate_snapshot_ids)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(ClearedDemoTradeState {
+        deleted_trades: deleted_demo_trades + deleted_closed_live_trades,
+        deleted_demo_trades,
+        deleted_demo_orders,
+        deleted_demo_intents,
+        deleted_demo_events,
+        deleted_demo_risk_decisions,
+        deleted_orphan_signals,
+        deleted_orphan_snapshots,
+    })
 }
 
 #[cfg(test)]

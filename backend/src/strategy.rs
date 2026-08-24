@@ -2744,6 +2744,7 @@ struct PreparedExecutionIntent {
 #[derive(Debug, Clone, FromRow)]
 struct ExecutionIntent {
     id: Uuid,
+    signal_id: Uuid,
     user_id: Uuid,
     snapshot_id: Option<Uuid>,
     trade_id: Option<Uuid>,
@@ -2763,7 +2764,7 @@ struct ExecutionIntent {
 }
 
 fn execution_intent_columns() -> &'static str {
-    "id,user_id,snapshot_id,trade_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,quantity,price,trigger_price,attempts,expires_at"
+    "id,signal_id,user_id,snapshot_id,trade_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,quantity,price,trigger_price,attempts,expires_at"
 }
 
 fn intent_static_role(value: &str) -> Option<&'static str> {
@@ -2999,10 +3000,16 @@ async fn execute_entry_intent(state: &AppState, intent: ExecutionIntent) {
         let role = intent_static_role(&intent.role).ok_or_else(|| AppError::BadRequest("Execution intent has an invalid role.".into()))?;
         let side = intent_static_side(&intent.side).ok_or_else(|| AppError::BadRequest("Execution intent has an invalid side.".into()))?;
         let order_type = intent_static_order_type(&intent.order_type).ok_or_else(|| AppError::BadRequest("Execution intent has an invalid order type.".into()))?;
-        place_strategy_order(state, &runner, &snapshot, &intent.session_key, NewOrder {
+        let signal_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT signal_at FROM strategy_signals WHERE id=$1",
+        )
+        .bind(intent.signal_id)
+        .fetch_one(&state.db)
+        .await?;
+        place_strategy_order_for_signal(state, &runner, &snapshot, &intent.session_key, NewOrder {
             role, side, order_type, lots: intent.lots, price: intent.price,
             trigger: intent.trigger_price, trade_id: intent.trade_id, quantity: intent.quantity,
-        }).await?;
+        }, signal_at).await?;
         let order: Option<(Uuid, String, String)> = sqlx::query_as(
             "SELECT id,status,broker_status FROM strategy_orders WHERE user_id=$1 AND role=$2 AND (session_key=$3 OR session_key LIKE $3 || ':%') ORDER BY created_at DESC LIMIT 1",
         )
@@ -3373,7 +3380,29 @@ pub(crate) async fn place_strategy_order(
     runner: &Runner,
     snapshot: &Snapshot,
     session: &str,
+    order: NewOrder,
+) -> AppResult<()> {
+    place_strategy_order_inner(state, runner, snapshot, session, order, None).await
+}
+
+async fn place_strategy_order_for_signal(
+    state: &AppState,
+    runner: &Runner,
+    snapshot: &Snapshot,
+    session: &str,
+    order: NewOrder,
+    signal_at: DateTime<Utc>,
+) -> AppResult<()> {
+    place_strategy_order_inner(state, runner, snapshot, session, order, Some(signal_at)).await
+}
+
+async fn place_strategy_order_inner(
+    state: &AppState,
+    runner: &Runner,
+    snapshot: &Snapshot,
+    session: &str,
     mut order: NewOrder,
+    originated_at: Option<DateTime<Utc>>,
 ) -> AppResult<()> {
     let protective = matches!(order.role, "TARGET" | "SL1" | "SL2" | "EMERGENCY_CLOSE");
     if snapshot.strategy_key == STRATEGY_KEY && matches!(order.role, "BUY_ENTRY" | "SELL_ENTRY") {
@@ -3623,6 +3652,7 @@ pub(crate) async fn place_strategy_order(
             exchange_segment: &snapshot.exchange_segment,
             contract_token: token,
             live_reconciled,
+            originated_at,
         },
     )
     .await
@@ -13635,5 +13665,347 @@ mod tests {
         assert!(!entry_intent_retryable(
             "Order rejected by the user kill switch"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_clear_trades_removes_running_demo_graph_and_fences_stale_execution() {
+        let state = isolated_test_state().await;
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+        let snapshot_a = Uuid::new_v4();
+        let snapshot_b = Uuid::new_v4();
+        for (user_id, username) in [(user_a, "clear-a"), (user_b, "clear-b")] {
+            sqlx::query(
+                "INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,'test-only')",
+            )
+            .bind(user_id)
+            .bind(username)
+            .bind(format!("{username}@example.test"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+                .bind(user_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots) VALUES($1,$2,'GOLDTEN',TRUE,1)")
+                .bind(user_id)
+                .bind(STRATEGY_KEY)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active,activated_at) VALUES($1,$2,TRUE,NOW())")
+                .bind(user_id)
+                .bind(STRATEGY_KEY)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        for (snapshot_id, token, key) in [
+            (snapshot_a, "clear-token-a", "clear-a"),
+            (snapshot_b, "clear-token-b", "clear-b"),
+        ] {
+            sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,buy_entry,buy_target,buy_sl1,buy_sl2,sell_entry,sell_target,sell_sl1,sell_sl2) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready',$3,$4,CURRENT_DATE+30,10,'MCX','CARRYFORWARD',$5,101,102,99,98,89,88,91,92)")
+                .bind(snapshot_id)
+                .bind(STRATEGY_KEY)
+                .bind(token)
+                .bind(format!("GOLDTEN-{key}"))
+                .bind(key)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let buy_trade = Uuid::new_v4();
+        let sell_trade = Uuid::new_v4();
+        let closed_trade = Uuid::new_v4();
+        let live_open_trade = Uuid::new_v4();
+        let live_closed_trade = Uuid::new_v4();
+        for (trade_id, mode, status, direction, snapshot_id, user_id) in [
+            (buy_trade, "demo", "open", "BUY", snapshot_a, user_a),
+            (sell_trade, "demo", "open", "SELL", snapshot_a, user_a),
+            (closed_trade, "demo", "closed", "BUY", snapshot_a, user_a),
+            (live_open_trade, "live", "open", "BUY", snapshot_b, user_a),
+            (
+                live_closed_trade,
+                "live",
+                "closed",
+                "SELL",
+                snapshot_b,
+                user_a,
+            ),
+            (Uuid::new_v4(), "demo", "open", "SELL", snapshot_b, user_b),
+        ] {
+            sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,exit_datetime,instrument_label,contract_symbol,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,sl2_price,safety_status) VALUES($1,$2,$3,$4,$5,10,100,100,0,NOW(),CASE WHEN $4='closed' THEN NOW() END,'GOLDTEN','GOLDTEN-TEST',$6,$7,1,CASE WHEN $4='open' THEN 1 ELSE 0 END,102,99,98,CASE WHEN $3='demo' THEN 'DEMO' WHEN $4='closed' THEN 'CLOSED' ELSE 'PROTECTED' END)")
+                .bind(trade_id)
+                .bind(user_id)
+                .bind(mode)
+                .bind(status)
+                .bind(direction)
+                .bind(STRATEGY_KEY)
+                .bind(snapshot_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let demo_orders = [
+            (
+                Uuid::new_v4(),
+                Some(buy_trade),
+                "BUY_ENTRY",
+                "BUY",
+                "partially_filled",
+                5,
+                0,
+            ),
+            (
+                Uuid::new_v4(),
+                Some(buy_trade),
+                "SL1",
+                "SELL",
+                "submitted",
+                10,
+                0,
+            ),
+            (
+                Uuid::new_v4(),
+                Some(buy_trade),
+                "TARGET",
+                "SELL",
+                "submitted",
+                10,
+                0,
+            ),
+            (
+                Uuid::new_v4(),
+                Some(sell_trade),
+                "SELL_ENTRY",
+                "SELL",
+                "pending",
+                10,
+                0,
+            ),
+            (
+                Uuid::new_v4(),
+                Some(closed_trade),
+                "BUY_ENTRY",
+                "BUY",
+                "filled",
+                10,
+                10,
+            ),
+        ];
+        for (index, (order_id, trade_id, role, side, status, filled, processed)) in
+            demo_orders.iter().enumerate()
+        {
+            sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,trigger_price,status,broker_order_id,idempotency_key,client_order_id,filled_quantity,processed_quantity) VALUES($1,$2,$3,$4,$5,$6,$7,'STOPLOSS_LIMIT','demo',1,10,100,100,$8,$9,$10,$11,$12,$13)")
+                .bind(order_id).bind(user_a).bind(snapshot_a).bind(trade_id)
+                .bind(format!("clear-session-{index}")).bind(role).bind(side).bind(status)
+                .bind(format!("DEMO-{order_id}")).bind(format!("clear-key-{index}"))
+                .bind(format!("CLEAR{index}")).bind(filled).bind(processed)
+                .execute(&state.db).await.unwrap();
+        }
+        let user_b_order = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,status,broker_order_id,idempotency_key,client_order_id) VALUES($1,$2,$3,'user-b','SELL_ENTRY','SELL','STOPLOSS_LIMIT','demo',1,10,90,'submitted',$4,$5,'USERB')")
+            .bind(user_b_order).bind(user_b).bind(snapshot_b).bind(format!("DEMO-{user_b_order}")).bind(format!("user-b-{user_b_order}"))
+            .execute(&state.db).await.unwrap();
+        let old_signal = Uuid::new_v4();
+        let old_signal_at = Utc::now() - Duration::minutes(5);
+        sqlx::query("INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,snapshot_id,signal_type,status,expected_users) VALUES($1,$2,'GOLDTEN','clear-old',$3,$4,'ENTRY','dispatching',1)")
+            .bind(old_signal).bind(STRATEGY_KEY).bind(old_signal_at).bind(snapshot_a)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO strategy_execution_intents(id,signal_id,user_id,snapshot_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,price,status) VALUES($1,$2,$3,$4,$5,'GOLDTEN','clear-old','ENTRY','BUY_ENTRY','BUY','STOPLOSS_LIMIT',1,101,'claimed')")
+            .bind(Uuid::new_v4()).bind(old_signal).bind(user_a).bind(snapshot_a).bind(STRATEGY_KEY)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO strategy_events(user_id,strategy_key,instrument,event_type,payload) VALUES($1,$2,'GOLDTEN','position_opened',jsonb_build_object('trade_id',$3::text,'mode','demo'))")
+            .bind(user_a).bind(STRATEGY_KEY).bind(buy_trade).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO risk_decisions(id,user_id,execution_mode,order_role,allowed,reason_code,message) VALUES($1,$2,'demo','BUY_ENTRY',TRUE,'allowed','demo fixture')")
+            .bind(Uuid::new_v4()).bind(user_a).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE,reason='clear test'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let mut tx = state.db.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
+            .bind(user_a)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let race_state = state.clone();
+        let stale_race = tokio::spawn(async move {
+            risk::assess_and_reserve(
+                &race_state,
+                &risk::OrderRisk {
+                    user_id: user_a,
+                    snapshot_id: snapshot_b,
+                    trade_id: None,
+                    session: "stale-racing",
+                    role: "BUY_ENTRY",
+                    side: "BUY",
+                    mode: "demo",
+                    lots: 1,
+                    quantity: 10,
+                    price: 101.0,
+                    trigger_price: Some(101.0),
+                    idempotency_key: "stale-racing",
+                    snapshot_ready: true,
+                    snapshot_current: true,
+                    exchange_segment: "MCX",
+                    contract_token: "clear-token-b",
+                    live_reconciled: true,
+                    originated_at: Some(old_signal_at),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_a)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let stale_race_error = stale_race
+            .await
+            .unwrap()
+            .expect_err("an execution waiting at the user lock must be fenced by the reset");
+        assert!(
+            stale_race_error
+                .to_string()
+                .contains("predates the latest Admin Clear Trades reset")
+        );
+        assert_eq!(cleared.deleted_demo_trades, 3);
+        assert_eq!(cleared.deleted_demo_orders, 5);
+        assert_eq!(cleared.deleted_demo_intents, 1);
+        assert_eq!(cleared.deleted_demo_events, 1);
+        assert_eq!(cleared.deleted_demo_risk_decisions, 1);
+        assert_eq!(cleared.deleted_orphan_signals, 1);
+        assert_eq!(cleared.deleted_orphan_snapshots, 1);
+        let remaining_demo: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_execution_intents WHERE user_id=$1),(SELECT COUNT(*) FROM risk_decisions WHERE user_id=$1 AND execution_mode='demo')")
+            .bind(user_a).fetch_one(&state.db).await.unwrap();
+        assert_eq!(remaining_demo, (0, 0, 0, 0));
+        let live_preserved: (i64, i64) = sqlx::query_as("SELECT COUNT(*) FILTER (WHERE status='open'),COUNT(*) FILTER (WHERE status='closed') FROM trades WHERE user_id=$1 AND execution_mode='live'")
+            .bind(user_a).fetch_one(&state.db).await.unwrap();
+        assert_eq!(live_preserved, (1, 0));
+        let user_b_state: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo')")
+            .bind(user_b).fetch_one(&state.db).await.unwrap();
+        assert_eq!(user_b_state, (1, 1));
+        let preserved_configuration: (String, bool, bool) = sqlx::query_as("SELECT p.trading_mode,c.enabled,a.is_active FROM user_profiles p JOIN user_strategy_configs c ON c.user_id=p.user_id JOIN user_strategy_activations a ON a.user_id=p.user_id AND a.strategy_key=c.strategy_key WHERE p.user_id=$1")
+            .bind(user_a).fetch_one(&state.db).await.unwrap();
+        assert_eq!(preserved_configuration, ("demo".into(), true, true));
+
+        reconcile_live(&state).await.unwrap();
+        let after_reconcile: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'",
+        )
+        .bind(user_a)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(after_reconcile, 0);
+
+        sqlx::query("UPDATE risk_kill_switches SET enabled=FALSE")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let stale = risk::assess_and_reserve(
+            &state,
+            &risk::OrderRisk {
+                user_id: user_a,
+                snapshot_id: snapshot_b,
+                trade_id: None,
+                session: "stale-old",
+                role: "BUY_ENTRY",
+                side: "BUY",
+                mode: "demo",
+                lots: 1,
+                quantity: 10,
+                price: 101.0,
+                trigger_price: Some(101.0),
+                idempotency_key: "stale-old",
+                snapshot_ready: true,
+                snapshot_current: true,
+                exchange_segment: "MCX",
+                contract_token: "clear-token-b",
+                live_reconciled: true,
+                originated_at: Some(old_signal_at),
+            },
+        )
+        .await
+        .expect_err("pre-reset signal must remain fenced after the kill switch is later disabled");
+        assert!(
+            stale
+                .to_string()
+                .contains("predates the latest Admin Clear Trades reset")
+        );
+        let reset_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT demo_state_reset_at FROM user_profiles WHERE user_id=$1")
+                .bind(user_a)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX','clear-token-b',101,NOW()) ON CONFLICT(exchange_segment,contract_token) DO UPDATE SET price=EXCLUDED.price,received_at=NOW()")
+            .execute(&state.db).await.unwrap();
+        let fresh = risk::assess_and_reserve(
+            &state,
+            &risk::OrderRisk {
+                user_id: user_a,
+                snapshot_id: snapshot_b,
+                trade_id: None,
+                session: "fresh-new",
+                role: "BUY_ENTRY",
+                side: "BUY",
+                mode: "demo",
+                lots: 1,
+                quantity: 10,
+                price: 101.0,
+                trigger_price: Some(101.0),
+                idempotency_key: "fresh-new",
+                snapshot_ready: true,
+                snapshot_current: true,
+                exchange_segment: "MCX",
+                contract_token: "clear-token-b",
+                live_reconciled: true,
+                originated_at: Some(reset_at + Duration::milliseconds(1)),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            fresh.is_some(),
+            "a genuinely new post-reset signal remains eligible"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_clear_trades_rolls_back_atomically() {
+        let state = isolated_test_state().await;
+        let user_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let trade_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash) VALUES($1,'clear-rollback','clear-rollback@example.test','test-only')")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,lot_size) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','rollback-token','ROLLBACK',10)")
+            .bind(snapshot_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','BUY',10,100,100,0,NOW(),'GOLDTEN',$3,$4,1,1,'DEMO')")
+            .bind(trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
+        let mut tx = state.db.begin().await.unwrap();
+        crate::auth::clear_user_demo_trade_state(&mut tx, user_id)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let state_after_rollback: (i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),demo_state_reset_at FROM user_profiles WHERE user_id=$1")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(state_after_rollback, (1, None));
     }
 }
