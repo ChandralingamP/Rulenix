@@ -3,4 +3,3 @@
 -- after the maintenance transaction commits.
 ALTER TABLE user_profiles
     ADD COLUMN IF NOT EXISTS demo_state_reset_at TIMESTAMPTZ;
-
