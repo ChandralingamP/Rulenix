@@ -13865,7 +13865,7 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_a)
+        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_a, true)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -13983,6 +13983,44 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_clear_trades_without_broker_verification_clears_demo_and_preserves_live() {
+        let state = isolated_test_state().await;
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash) VALUES($1,'clear-unverified','clear-unverified@example.test','test-only')")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,strategy_key,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','BUY',10,100,100,0,NOW(),'GOLDTEN',$3,1,1,'DEMO'),($4,$2,'live','closed','BUY',10,100,101,10,NOW()-INTERVAL '2 days','NIFTY','option_entry_v1',1,0,'CLOSED')")
+            .bind(Uuid::new_v4()).bind(user_id).bind(STRATEGY_KEY).bind(Uuid::new_v4())
+            .execute(&state.db).await.unwrap();
+
+        let mut tx = state.db.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_id, false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(cleared.deleted_demo_trades, 1);
+        assert_eq!(cleared.deleted_closed_live_trades, 0);
+        let remaining: (i64, i64) = sqlx::query_as("SELECT COUNT(*) FILTER (WHERE execution_mode='demo'),COUNT(*) FILTER (WHERE execution_mode='live' AND status='closed') FROM trades WHERE user_id=$1")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(remaining, (0, 1));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn admin_clear_trades_rolls_back_atomically() {
         let state = isolated_test_state().await;
         let user_id = Uuid::new_v4();
@@ -14000,7 +14038,7 @@ mod tests {
         sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','BUY',10,100,100,0,NOW(),'GOLDTEN',$3,$4,1,1,'DEMO')")
             .bind(trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
         let mut tx = state.db.begin().await.unwrap();
-        crate::auth::clear_user_demo_trade_state(&mut tx, user_id)
+        crate::auth::clear_user_demo_trade_state(&mut tx, user_id, true)
             .await
             .unwrap();
         tx.rollback().await.unwrap();

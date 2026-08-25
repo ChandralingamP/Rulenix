@@ -1212,28 +1212,17 @@ fn inspect_clear_trade_broker_state(
     Ok(state)
 }
 
-fn require_clear_trade_safety(
-    global_kill_enabled: bool,
-    broker: &ClearTradeBrokerState,
-) -> AppResult<()> {
+fn require_clear_trade_safety(global_kill_enabled: bool) -> AppResult<()> {
     if !global_kill_enabled {
         return Err(AppError::BadRequest(
             "Clear Trades requires the global kill switch to be enabled.".into(),
         ));
     }
-    if broker.open_positions > 0 {
-        return Err(AppError::BadRequest(format!(
-            "Clear Trades stopped because Angel One reports {} open position(s) for this user.",
-            broker.open_positions
-        )));
-    }
-    if broker.nonterminal_orders > 0 {
-        return Err(AppError::BadRequest(format!(
-            "Clear Trades stopped because Angel One reports {} nonterminal order(s) for this user.",
-            broker.nonterminal_orders
-        )));
-    }
     Ok(())
+}
+
+fn broker_allows_closed_live_history_cleanup(broker: Option<&ClearTradeBrokerState>) -> bool {
+    broker.is_some_and(|state| state.open_positions == 0 && state.nonterminal_orders == 0)
 }
 
 async fn inspect_user_broker_state_for_clear(
@@ -1319,9 +1308,22 @@ pub async fn clear_user_trade_logs(
     )
     .fetch_one(&mut *tx)
     .await?;
-    let broker = inspect_user_broker_state_for_clear(&state, &mut tx, target_id).await?;
-    require_clear_trade_safety(global_kill_enabled, &broker)?;
-    let cleared = clear_user_demo_trade_state(&mut tx, target_id).await?;
+    require_clear_trade_safety(global_kill_enabled)?;
+    // Demo state is simulated and remains safe to clear when Angel One is
+    // unavailable. Closed live history is stricter: it is deleted only after
+    // an authoritative flat/order-free broker response. Any broker error,
+    // malformed response, open position, or nonterminal order preserves every
+    // live record while allowing the transactional demo reset to proceed.
+    let broker = match inspect_user_broker_state_for_clear(&state, &mut tx, target_id).await {
+        Ok(broker) => Some(broker),
+        Err(error) => {
+            tracing::warn!(%target_id, %error, "Clear Trades preserving live history because broker state is unavailable");
+            None
+        }
+    };
+    let clear_closed_live_history = broker_allows_closed_live_history_cleanup(broker.as_ref());
+    let cleared =
+        clear_user_demo_trade_state(&mut tx, target_id, clear_closed_live_history).await?;
     let deleted_backtest_trades: i64 = sqlx::query_scalar(
         "SELECT COUNT(trade.id)::bigint FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id WHERE run.user_id=$1",
     )
@@ -1345,7 +1347,7 @@ pub async fn clear_user_trade_logs(
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
             summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":cleared.deleted_trades,"deleted_demo_trades":cleared.deleted_demo_trades,"deleted_demo_orders":cleared.deleted_demo_orders,"deleted_demo_intents":cleared.deleted_demo_intents,"deleted_demo_events":cleared.deleted_demo_events,"deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,"deleted_orphan_signals":cleared.deleted_orphan_signals,"deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"broker_open_positions":broker.open_positions,"broker_nonterminal_orders":broker.nonterminal_orders,"global_kill_switch":true}),
+            metadata: json!({"username":username,"deleted_trades":cleared.deleted_trades,"deleted_demo_trades":cleared.deleted_demo_trades,"deleted_closed_live_trades":cleared.deleted_closed_live_trades,"deleted_demo_orders":cleared.deleted_demo_orders,"deleted_demo_intents":cleared.deleted_demo_intents,"deleted_demo_events":cleared.deleted_demo_events,"deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,"deleted_orphan_signals":cleared.deleted_orphan_signals,"deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"broker_state_verified":broker.is_some(),"broker_open_positions":broker.as_ref().map(|value| value.open_positions),"broker_nonterminal_orders":broker.as_ref().map(|value| value.nonterminal_orders),"closed_live_history_cleanup":clear_closed_live_history,"global_kill_switch":true}),
         },
     )
     .await
@@ -1357,6 +1359,7 @@ pub async fn clear_user_trade_logs(
         "username":username,
         "deleted_trades":cleared.deleted_trades,
         "deleted_demo_trades":cleared.deleted_demo_trades,
+        "deleted_closed_live_trades":cleared.deleted_closed_live_trades,
         "deleted_demo_orders":cleared.deleted_demo_orders,
         "deleted_demo_intents":cleared.deleted_demo_intents,
         "deleted_demo_events":cleared.deleted_demo_events,
@@ -1365,8 +1368,10 @@ pub async fn clear_user_trade_logs(
         "deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,
         "deleted_backtest_runs":deleted_backtest_runs,
         "deleted_backtest_trades":deleted_backtest_trades,
-        "broker_open_positions":broker.open_positions,
-        "broker_nonterminal_orders":broker.nonterminal_orders,
+        "broker_state_verified":broker.is_some(),
+        "broker_open_positions":broker.as_ref().map(|value| value.open_positions),
+        "broker_nonterminal_orders":broker.as_ref().map(|value| value.nonterminal_orders),
+        "closed_live_history_cleanup":clear_closed_live_history,
         "global_kill_switch":true
     })))
 }
@@ -1375,6 +1380,7 @@ pub async fn clear_user_trade_logs(
 pub(crate) struct ClearedDemoTradeState {
     pub deleted_trades: u64,
     pub deleted_demo_trades: u64,
+    pub deleted_closed_live_trades: u64,
     pub deleted_demo_orders: u64,
     pub deleted_demo_intents: u64,
     pub deleted_demo_events: u64,
@@ -1385,10 +1391,12 @@ pub(crate) struct ClearedDemoTradeState {
 
 /// Remove only disposable per-user demo execution state. The caller must hold
 /// the global shared risk lock and the user's exclusive advisory lock and must
-/// have completed the authoritative live-broker flat/order-free gate.
+/// pass `clear_closed_live_history=true` only after the authoritative
+/// live-broker flat/order-free gate has completed successfully.
 pub(crate) async fn clear_user_demo_trade_state(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
+    clear_closed_live_history: bool,
 ) -> AppResult<ClearedDemoTradeState> {
     let reset_at: chrono::DateTime<Utc> = sqlx::query_scalar(
         "UPDATE user_profiles SET demo_state_reset_at=clock_timestamp(),updated_at=NOW() WHERE user_id=$1 RETURNING demo_state_reset_at",
@@ -1483,13 +1491,17 @@ pub(crate) async fn clear_user_demo_trade_state(
             .rows_affected();
     // Preserve the endpoint's established closed-history behavior for live
     // trades. Open live records are never removed by this demo reset.
-    let deleted_closed_live_trades = sqlx::query(
-        "DELETE FROM trades WHERE user_id=$1 AND execution_mode='live' AND status='closed'",
-    )
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
+    let deleted_closed_live_trades = if clear_closed_live_history {
+        sqlx::query(
+            "DELETE FROM trades WHERE user_id=$1 AND execution_mode='live' AND status='closed'",
+        )
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
     let deleted_orphan_signals = sqlx::query(
         "DELETE FROM strategy_signals s
          WHERE s.id=ANY($1::uuid[])
@@ -1515,6 +1527,7 @@ pub(crate) async fn clear_user_demo_trade_state(
     Ok(ClearedDemoTradeState {
         deleted_trades: deleted_demo_trades + deleted_closed_live_trades,
         deleted_demo_trades,
+        deleted_closed_live_trades,
         deleted_demo_orders,
         deleted_demo_intents,
         deleted_demo_events,
@@ -1648,7 +1661,8 @@ mod security_tests {
         )
         .unwrap();
         assert_eq!(flat, ClearTradeBrokerState::default());
-        assert!(require_clear_trade_safety(true, &flat).is_ok());
+        assert!(require_clear_trade_safety(true).is_ok());
+        assert!(broker_allows_closed_live_history_cleanup(Some(&flat)));
 
         let active = inspect_clear_trade_broker_state(
             &json!([{"status":"trigger pending"}, {}]),
@@ -1657,18 +1671,19 @@ mod security_tests {
         .unwrap();
         assert_eq!(active.open_positions, 1);
         assert_eq!(active.nonterminal_orders, 2);
-        assert!(require_clear_trade_safety(true, &active).is_err());
+        assert!(require_clear_trade_safety(true).is_ok());
+        assert!(!broker_allows_closed_live_history_cleanup(Some(&active)));
     }
 
     #[test]
     fn clear_trade_gate_depends_on_global_kill_not_force_demo_mode() {
-        let flat = ClearTradeBrokerState::default();
-        assert!(require_clear_trade_safety(true, &flat).is_ok());
+        assert!(require_clear_trade_safety(true).is_ok());
         assert!(matches!(
-            require_clear_trade_safety(false, &flat),
+            require_clear_trade_safety(false),
             Err(AppError::BadRequest(message))
                 if message.contains("global kill switch")
         ));
+        assert!(!broker_allows_closed_live_history_cleanup(None));
     }
 
     #[test]
