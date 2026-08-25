@@ -11554,6 +11554,34 @@ mod tests {
     }
 
     #[test]
+    fn persisted_futures_gap_labels_fit_the_migrated_columns() {
+        let plans = [
+            FuturesMissedEntryPlan {
+                buy_missed: false,
+                sell_missed: false,
+            },
+            FuturesMissedEntryPlan {
+                buy_missed: true,
+                sell_missed: false,
+            },
+            FuturesMissedEntryPlan {
+                buy_missed: false,
+                sell_missed: true,
+            },
+            FuturesMissedEntryPlan {
+                buy_missed: true,
+                sell_missed: true,
+            },
+        ];
+        assert!(plans.into_iter().all(|plan| plan.as_str().len() <= 16));
+        assert!(
+            ["BUY", "SELL", "BOTH"]
+                .into_iter()
+                .all(|direction| direction.len() <= 16)
+        );
+    }
+
+    #[test]
     fn missed_entry_boundaries_are_inclusive_and_ignore_previous_close() {
         assert!(
             futures_missed_entry_plan(110.0, 110.0, 90.0)
@@ -12431,6 +12459,39 @@ mod tests {
         let safety_columns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND ((table_name='trades' AND column_name IN ('safety_status','exposure_origin')) OR (table_name='strategy_orders' AND column_name IN ('order_type','exchange_segment','product_type')) OR (table_name='broker_position_incidents' AND column_name IN ('raw_broker_position','ownership_status','product_type')))")
             .fetch_one(&clean).await.unwrap();
         assert_eq!(safety_columns, 8);
+        let gap_column_widths: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT column_name,character_maximum_length::INTEGER
+             FROM information_schema.columns
+             WHERE table_schema='public'
+               AND table_name='strategy_market_snapshots'
+               AND column_name IN ('gap_direction','entry_direction')
+             ORDER BY column_name",
+        )
+        .fetch_all(&clean)
+        .await
+        .unwrap();
+        assert_eq!(
+            gap_column_widths,
+            vec![
+                ("entry_direction".to_string(), 16),
+                ("gap_direction".to_string(), 16),
+            ]
+        );
+        let snapshot_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','','test-token','TESTFUT',CURRENT_DATE+30,10,'MCX','CARRYFORWARD','gap-width-regression','')")
+            .bind(snapshot_id)
+            .bind(STRATEGY_KEY)
+            .execute(&clean)
+            .await
+            .unwrap();
+        for gap_direction in ["NONE_MISSED", "BUY_MISSED", "SELL_MISSED", "BOTH_MISSED"] {
+            sqlx::query("UPDATE strategy_market_snapshots SET gap_direction=$2,entry_direction='BOTH' WHERE id=$1")
+                .bind(snapshot_id)
+                .bind(gap_direction)
+                .execute(&clean)
+                .await
+                .expect("every executable Futures gap label must persist after migration");
+        }
         clean.close().await;
 
         let legacy_url = database_url_for_name(&base, &legacy_name);
@@ -12523,6 +12584,47 @@ mod tests {
                 .expect("disposable child database cleanup must succeed");
         }
         admin.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn futures_gap_labels_persist_in_migrated_database() {
+        let state = isolated_test_state().await;
+        let snapshot_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','','test-token','TESTFUT',CURRENT_DATE+30,10,'MCX','CARRYFORWARD','gap-width-stateful-regression','')")
+            .bind(snapshot_id)
+            .bind(STRATEGY_KEY)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        for gap_direction in ["NONE_MISSED", "BUY_MISSED", "SELL_MISSED", "BOTH_MISSED"] {
+            sqlx::query("UPDATE strategy_market_snapshots SET gap_direction=$2,entry_direction='BOTH' WHERE id=$1")
+                .bind(snapshot_id)
+                .bind(gap_direction)
+                .execute(&state.db)
+                .await
+                .expect("every executable Futures gap label must persist after migration");
+        }
+
+        let widths: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT column_name,character_maximum_length::INTEGER
+             FROM information_schema.columns
+             WHERE table_schema='public'
+               AND table_name='strategy_market_snapshots'
+               AND column_name IN ('gap_direction','entry_direction')
+             ORDER BY column_name",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            widths,
+            vec![
+                ("entry_direction".to_string(), 16),
+                ("gap_direction".to_string(), 16),
+            ]
+        );
     }
 
     #[tokio::test]
