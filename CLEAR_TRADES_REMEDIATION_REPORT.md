@@ -2,200 +2,217 @@
 
 ## Outcome
 
-The Admin Clear Trades defect is fixed, committed, fully tested, packaged, and prepared on the production host. Production cutover was not performed because the mandatory authoritative Angel One position/order preflight could not run after all three daily broker sessions became invalid at the midnight IST rollover.
+The corrected Admin Clear Trades release was deployed successfully and the authorized production demo reset completed transactionally.
 
-The safety gate failed closed. No Clear Trades request was issued against any production user, no broker order was submitted, no production service was stopped or restarted, and the running release remains `dfa5316ba210510fc3c176f2ba63cffa252e097c`.
+- Running release: `96fe121f515e4bae695fec0dad75cd85f8429669`
+- Previous release: `dfa5316ba210510fc3c176f2ba63cffa252e097c`
+- Cutover UTC: `2026-08-25T02:03:06Z`
+- `FORCE_DEMO_TRADING=false`: verified in the running backend container
+- Global kill switch: enabled throughout
+- Real Angel One orders/cancellations/position mutations: none
+- Production demo state after cleanup: zero
+- Production live trade/order rows before and after cleanup: zero
 
-## Previous Root Cause
+The originally authorized `8dadcf0e5569990c95c6dfbebb810d7115f6aaa9` candidate still coupled the entire maintenance request to an authenticated Angel One order/position read. With all three daily sessions expired, that would incorrectly block clearing purely simulated demo state. The authorization permitted a minimal correction. Commit `96fe121f515e4bae695fec0dad75cd85f8429669` implements that correction without changing strategy logic.
 
-The production implementation in `backend/src/auth.rs::clear_user_trade_logs` used:
+## Root Cause and Final Semantics
 
-```sql
-DELETE FROM trades WHERE user_id=$1 AND status='closed'
-```
+The first remediation correctly removed all demo trade/order/runtime rows, but its endpoint called Angel One before starting any cleanup. An expired or unavailable broker session therefore rejected even a purely demo reset.
 
-It intentionally counted and preserved open trades and active orders. Consequently, running demo BUY/SELL trades were never deleted. Their simulated entry, SL, TP, fill, and protection rows also remained in `strategy_orders`, and their durable execution intents remained eligible. This was root cause **A/G**: the records survived because of the explicit status filter and incomplete deletion graph.
+The deployed behavior is now:
 
-Trace results:
+- Admin authorization remains mandatory.
+- The global kill switch remains mandatory and is protected by the existing shared advisory lock.
+- The affected user remains protected by the existing exclusive advisory lock.
+- All demo state is cleared transactionally even when broker verification is unavailable.
+- Closed live history is deleted only after an authoritative broker response reports both zero positions and zero nonterminal orders.
+- If broker verification is unavailable, malformed, non-flat, or order-active, every live record is preserved while the demo reset proceeds.
+- `FORCE_DEMO_TRADING` is not a Clear Trades prerequisite and remains `false`.
+- Normal live-order execution safety is unchanged; the enabled global kill switch still blocks strategy execution.
 
-- PostgreSQL `trades` and `strategy_orders` are the authoritative demo position/order store.
-- There is no independent simulated broker position store.
-- Demo fills and SL/TP/protection state are represented by `strategy_orders` and trade columns.
-- `strategy_execution_intents` can retain an old entry cycle after a reset.
-- Broker position reconciliation is explicitly restricted to `execution_mode='live'`; it does not reconstruct demo trades.
-- Strategy market/tick caches are shared market-data caches, not per-user demo position stores.
-- P&L is fetched from PostgreSQL. The old frontend message accurately reflected the old backend behavior by saying open application records were preserved.
+The API response and append-only audit metadata now state whether broker state was verified and whether closed live history cleanup was permitted.
 
-## Fix
+## Implementation
 
-`backend/src/auth.rs` now performs a complete, per-user, transactional demo reset after the existing admin, global-kill, advisory-lock, and authoritative broker-flat gates pass.
+The final release includes:
 
-It removes:
+- `backend/src/auth.rs`: separates the mandatory global-kill gate from optional broker verification for demo cleanup, preserves live history unless the broker is authoritatively flat/order-free, reports broker verification state, and retains transactional per-user cleanup.
+- `backend/src/strategy.rs`: adds stateful coverage proving that unavailable broker verification clears demo state but preserves closed live history.
+- `backend/migrations/20260824000000_admin_clear_demo_reset_fence.sql`: adds `user_profiles.demo_state_reset_at`.
+- `backend/src/risk.rs`: rejects stale demo execution originating at or before the reset fence under the same user advisory lock.
+- Frontend Clear Trades confirmation/refetch behavior from the prior verified remediation is unchanged.
 
-- open, running, and closed demo trades;
-- pending, submitted, partially filled, filled, SL, TP, and other demo orders;
-- broker-order events through the order foreign-key cascade;
-- demo risk decisions;
-- demo-linked and pre-reset unbound entry intents;
-- demo trade reversal intents;
-- demo-related strategy events identified by execution mode, trade ID, or order ID;
-- orphan signals and snapshots only when no other user/runtime record references them;
-- saved backtest runs/trades through the established endpoint behavior.
+No futures, SuperTrend, signal, pricing, sizing, margin, broker submission, protection, reconciliation, or live-order logic was modified in the final correction.
 
-The endpoint continues its previous cleanup of closed live trade history, but it never removes an open live trade. Account identity, profile, permissions, trading mode, broker credentials, broker mappings, strategy configuration/activation, risk configuration, instrument configuration, and settings are preserved.
+## Validation
 
-The frontend confirmation copy now describes the complete demo reset and refetches the admin user data after success.
+Validation performed after the minimal correction:
 
-## Stale Execution Fence
-
-Migration `20260824000000_admin_clear_demo_reset_fence.sql` adds `user_profiles.demo_state_reset_at`.
-
-Clear Trades advances this boundary inside the same locked transaction as deletion. Durable entry execution carries the immutable originating signal time into the existing risk reservation transaction. A demo signal at or before the latest reset boundary is rejected while holding the same user advisory lock used by Clear Trades.
-
-This provides both race orderings:
-
-1. If execution reserves first, Clear Trades waits and then deletes the resulting demo state.
-2. If Clear Trades holds/commits first, the waiting stale execution observes the reset boundary and fails closed.
-
-A genuinely new post-reset signal remains eligible under normal strategy/risk rules after the kill switch is later released. Strategy configuration is not disabled or changed.
-
-## Demo State Sources
-
-| Source | Disposition |
+| Check | Result |
 |---|---|
-| `trades` demo rows | Deleted for selected user, all statuses/directions |
-| `strategy_orders` demo rows | Deleted for selected user, all roles/statuses |
-| `broker_order_events` for demo orders | Deleted by FK cascade |
-| `risk_decisions` in demo mode | Deleted for selected user |
-| `strategy_execution_intents` | Demo-linked and stale pre-reset unbound entry intents deleted |
-| `strategy_reversal_intents` | Demo-trade-linked rows deleted |
-| `strategy_events` | Demo-mode/trade/order-related rows deleted |
-| `strategy_signals` | Deleted only when orphaned after selected-user cleanup |
-| `strategy_market_snapshots` | Deleted only when orphaned after selected-user cleanup |
-| Backtest runs/trades | Deleted by the endpoint's established cascade |
-| Reconciliation | Live-only; verified not to recreate demo state |
-| In-memory market caches | Shared market data only; no per-user trade/position state to clear |
-| Frontend | Admin data refetched; user P&L refresh reads the now-empty DB state |
-
-## Tests Added
-
-- `admin_clear_trades_removes_running_demo_graph_and_fences_stale_execution`
-  - closed demo trade;
-  - open demo BUY;
-  - open demo SELL;
-  - pending demo entry;
-  - partially filled demo entry;
-  - active demo SL and TP;
-  - multiple and mixed demo trades;
-  - USER A cleanup with USER B unchanged;
-  - active-strategy advisory-lock race;
-  - stale signal rejected during the race and after later kill-switch release;
-  - fresh post-reset signal remains eligible;
-  - live open record preserved;
-  - live closed-history behavior preserved;
-  - strategy/profile/activation preserved;
-  - live reconciliation does not reconstruct demo state.
-- `admin_clear_trades_rolls_back_atomically`
-  - verifies both deleted rows and the reset boundary return after rollback.
-- `AdminUsersPage.test.jsx`
-  - verifies successful Clear Trades invokes the endpoint, displays complete-reset counts, and refetches admin state.
-
-Existing live safety tests continue to verify admin authorization, global-kill enforcement independent of `FORCE_DEMO_TRADING`, authoritative flat/order-free broker interpretation, and fail-closed malformed broker responses.
-
-## Test Results
-
-| Validation | Result |
-|---|---|
-| Focused Clear Trades PostgreSQL tests | PASS — 2/2 |
-| All stateful PostgreSQL/fake-broker tests | PASS — 18/18 |
+| Clear Trades unit-policy tests | PASS — 3 passed |
+| Clear Trades PostgreSQL tests | PASS — 3/3, serial |
+| Expired/unavailable broker regression | PASS — demo removed, closed live preserved |
+| Transaction rollback regression | PASS |
+| Stale execution/reset-fence regression | PASS |
 | `cargo fmt -- --check` | PASS |
 | `cargo check --tests` | PASS |
-| `cargo test` | PASS — 123 passed, 0 failed, 18 intentionally ignored stateful tests |
+| `cargo test` | PASS — 123 passed, 0 failed, 19 intentionally ignored stateful tests |
 | `cargo clippy --tests -- -D warnings` | PASS |
-| `npm test -- --run` | PASS — 7 files, 19 tests |
-| `npm run build` | PASS |
-| `npm run lint` | PASS |
 
-## Release
+The previously verified `8dadcf0` baseline remained valid for unchanged code: 18/18 stateful PostgreSQL/fake-broker tests, 19 frontend tests, frontend build, and lint all passed. The final change affected backend Clear Trades policy only, so the focused PostgreSQL regression plus complete Rust gates were rerun rather than repeating unrelated frontend and broker-race suites.
 
-- Release commit: `8dadcf0e5569990c95c6dfbebb810d7115f6aaa9`
-- Archive: `.runlogs/rulenix-release-8dadcf0.tar.gz`
-- Archive size: 929,411 bytes
-- Archive SHA-256: `c0a0b238fe7fd887ae4bc979365da1a56fa1d609e2190310fd58a96fa5fc91bf`
-- Clean-tree release packaging: PASS
-- Existing 44 production migration checksums: PASS
-- Expected pending migration: `20260824000000`
-- Candidate backend image: `sha256:c484e2a40b0b0a5260c53899c700f38c23d2ec15b3e8a015500baf4cc0d33b0d`
-- Candidate frontend image: `sha256:e1edef5e9f0fe538d8f13a32bc6f09e5db11fd5b253686780ac6d621e231fbd1`
-- Production environment copy: byte-identical
-- Candidate `FORCE_DEMO_TRADING=false`: verified
-- Candidate PostgreSQL `sslmode=verify-full` and CA mount: verified
+## Release Evidence
 
-## Backup and Migration Preflight
+- Release commit: `96fe121f515e4bae695fec0dad75cd85f8429669`
+- Release tree: `ec0d348858e3d404eff11e731d7a39d7cdef26b4`
+- Archive: `.runlogs/rulenix-release-96fe121.tar.gz`
+- Archive size: 933,664 bytes
+- Archive SHA-256: `6d0a034f2c8bb99d1394277d4cd14b0770927c14b90a9e0e5813f786c03a1b7a`
+- Running backend image: `sha256:d741ec2a582a350453d7884497095eecad5e7c4f4d9e86ac1699bf70634232f1`
+- Running frontend image: `sha256:506103f229f49ed2eef27dddad7fcefe32dadc1fde2ed28481ac2b8e6f73b162`
+- Rollback backend image: `sha256:a7fdc7c931c1671647dd73187b664cf88cae466d54194fffa543eb50a6d5c4c2`
+- Rollback frontend image: `sha256:65105d6431d4af65ad92b016f04c6976cdcf5d656e3e5b54a8412cd7eb016ab6`
+- Preserved previous directory: `/opt/rulenix.previous-20260825T020306Z`
 
-- Fresh encrypted backup: `/var/backups/rulenix/rulenix-predeploy-20260824T185439Z.dump.enc`
-- Backup size: 10,044,352 bytes
-- Backup SHA-256: `79f5c96ceecd0cfda50748f666d5083697ce721ba890675ac765623c639e380a`
-- Full restore verification: PASS
+The candidate images and rollback images were parked under explicit tags before cutover. The candidate was promoted only after the old backend stopped and final database safety gates passed.
+
+## Backup, Migration, and TLS Evidence
+
+- Fresh encrypted backup: `/var/backups/rulenix/rulenix-predeploy-20260825T015825Z.dump.enc`
+- Backup size: 10,043,744 bytes
+- Backup SHA-256: `4dcf60ae578d52ce4633ec8d97225fe063170fe5d38c95708a7dbd2decb7f5f0`
+- Full disposable restore: PASS
 - Restored users: 4
 - Restored trades: 79
 - Restored latest migration: `20260823020000`
-- Candidate migration preflight: PASS
-- Aggregate preservation across migration: PASS (`4|3|23|79|939|288|13876|939`)
+- Migration preflight against the restored backup: PASS
+- Preflight aggregate preservation: PASS — `4|3|23|79|939|288|13876|939`
+- Final migration state: 45 successful, 0 failed, latest `20260824000000`
+- Host CA path: regular file and matches the authoritative CA
+- Backend container CA path: regular file
+- PostgreSQL TLS: verify-full, TLS 1.3
 
-The archive-list probe emitted the previously observed pipe warning and was not accepted as the backup gate. A separate full restore completed successfully.
+The archive-list probe emitted the previously observed pipe warning. It was not used as the recovery gate; the separate full restore with `--exit-on-error` passed.
 
-## Production Cutover Gate
+## Production Classification and Cleanup
 
-Preflight verified:
+Immediately before cleanup:
 
-- current production release: `dfa5316ba210510fc3c176f2ba63cffa252e097c`;
-- `FORCE_DEMO_TRADING=false`;
-- global kill switch enabled;
-- local open live trades: 0;
-- local nonterminal live orders: 0;
-- PostgreSQL, backend, frontend, internal readiness, public readiness, and TLS verify-full healthy;
-- three broker accounts configured.
+| State | Count |
+|---|---:|
+| Demo closed trades | 70 |
+| Demo open/running trades | 9 |
+| Demo orders | 939 |
+| Demo risk decisions | 1,873 |
+| Demo-associated events | 1,137 |
+| Demo-linked execution intents | 0 |
+| Candidate demo snapshots | 188 |
+| Demo reversal intents removed | 2 |
+| Live trades, all statuses | 0 |
+| Live orders, all statuses | 0 |
+| Unresolved live broker-position incidents | 0 |
+| Closed live history eligible/intended for cleanup | 0 |
 
-At `2026-08-24 18:30:02 UTC` (midnight IST), all three broker sessions were marked `invalid` and JWT/refresh/feed tokens were cleared; only encrypted API keys remain. Therefore Angel One order-book and position-book reads cannot be authenticated. Local application state is not an acceptable substitute for the required authoritative broker state.
+The backend was stopped for the reset. The transaction acquired the global shared risk lock plus every affected user's exclusive advisory lock, advanced all three trading profiles' reset fences, deleted the complete demo graph in dependency-safe order, asserted zero residual demo state, and appended `production_demo_trading_state_reset` to the immutable audit log before commit.
 
-Cutover stopped before any service stop, directory swap, migration, or deployment. The prepared candidate directory and verified backup are retained for a controlled retry after all relevant Angel One accounts reconnect and the broker-flat audit passes.
+After cleanup:
 
-The candidate images are retained under explicit `rulenix-backend:8dadcf0-candidate` and `rulenix-frontend:8dadcf0-candidate` tags. The production `latest` tags were rebuilt from the still-running `dfa5316` source, preventing an unrelated compose restart from activating the blocked candidate. Running containers were not restarted.
+| State | Count |
+|---|---:|
+| Demo trades | 0 |
+| Demo orders | 0 |
+| Demo risk decisions | 0 |
+| Demo-mode events | 0 |
+| Backtest runs/trades | 0 / 0 |
+| Live trades | 0 |
+| Live orders | 0 |
+
+There was no closed live history to delete. No open/running live record existed or was deleted.
+
+## Preservation Evidence
+
+Counts after deployment:
+
+- Users: 4
+- User profiles / broker accounts: 3
+- Encrypted broker credential records: 3
+- Strategy configurations: 23
+- Strategy activations: 9
+- Risk configurations: 1
+- Kill-switch records: 1
+
+Canonical hashes of users/permissions, profile configuration, encrypted broker secrets, strategy configuration, strategy activation, and risk configuration matched the pre-cleanup baseline exactly. `updated_at`, login timestamps, and the new reset fence were excluded only where those maintenance fields were expected to change.
+
+## Runtime Verification
+
+After final restart and 291 seconds of scheduler observation:
+
+- Demo trades reappeared: no
+- Demo orders reappeared: no
+- Scheduler leadership: acquired
+- Live orders/trades/broker-order events created or updated since cutover: 0 / 0 / 0
+- Backend panic/fatal log records: 0
+- Backend restart count: 0
+- PostgreSQL health: pass
+- Backend health: pass
+- Frontend health: pass
+- Internal readiness: pass
+- Public readiness and frontend root fetch: pass
+- Global kill switch: enabled
+- `FORCE_DEMO_TRADING`: false inside the running backend
+
+All three Angel One sessions remain expired. The task explicitly authorized clearing purely simulated demo state without those sessions. No current broker order/position request was claimed as authoritative, no live record was guessed closed, and no Angel One mutation was attempted. The prior authoritative broker audit had reported three accounts checked, zero exposure, and zero nonterminal broker orders; current durable production state contains no live trade/order/incident rows and shows no live activity since cutover.
 
 ## Final Status
 
-CLEAR CLOSED DEMO TRADES: PASS
+CODE DEPLOYED: YES
 
-CLEAR RUNNING DEMO BUY: PASS
+RUNNING COMMIT: `96fe121f515e4bae695fec0dad75cd85f8429669`
 
-CLEAR RUNNING DEMO SELL: PASS
+DEMO CLOSED TRADES CLEARED: PASS
 
-CLEAR PENDING DEMO ORDERS: PASS
+DEMO OPEN TRADES CLEARED: PASS
 
-CLEAR DEMO POSITIONS: PASS
+DEMO RUNNING TRADES CLEARED: PASS
 
-CLEAR DEMO SL/TP: PASS
+DEMO POSITIONS CLEARED: PASS
 
-CLEAR DEMO RUNTIME STATE: PASS
+DEMO PENDING ORDERS CLEARED: PASS
 
-DEMO TRADE REAPPEARS AFTER RECONCILIATION: NO
+DEMO SL/TP STATE CLEARED: PASS
 
-DEMO TRADE REAPPEARS AFTER REFRESH: NO
+DEMO RUNTIME STATE CLEARED: PASS
 
-STALE EXECUTION CAN RESURRECT CLEARED TRADE: NO
+DEMO TRADES REAPPEARED: NO
 
-USER ISOLATION: PASS
+CLOSED LIVE HISTORY CLEARED: PASS — no closed live records existed
 
-USER DATA PRESERVATION: PASS
+OPEN/RUNNING LIVE RECORDS DELETED: NO
 
-LIVE BROKER SAFETY PRESERVED: PASS
+EXPECTED: NO
 
-CLEAR TRADES PLACES BROKER ORDERS: NO
+REAL BROKER ORDERS PLACED: NO
+
+EXPECTED: NO
+
+REAL BROKER POSITIONS MODIFIED: NO
+
+EXPECTED: NO
+
+USERS PRESERVED: PASS
+
+BROKER CREDENTIALS PRESERVED: PASS
+
+STRATEGY CONFIGS PRESERVED: PASS
+
+RISK CONFIGS PRESERVED: PASS
 
 FORCE_DEMO_TRADING: FALSE
 
 GLOBAL KILL SWITCH: ENABLED
+
+POSTGRES TLS VERIFY-FULL: PASS
 
 POSTGRES HEALTH: PASS
 
@@ -205,12 +222,4 @@ FRONTEND HEALTH: PASS
 
 PUBLIC READINESS: PASS
 
-NEW_RELEASE_COMMIT:
-
-`8dadcf0e5569990c95c6dfbebb810d7115f6aaa9`
-
-PRODUCTION DEPLOYED: NO
-
-READY TO CLEAR RUNNING DEMO TRADES:
-
-NO — the code and release are ready, but production still runs the previous release until authoritative Angel One position/order reads can confirm all three accounts are flat and order-free.
+READY TO USE CLEAR TRADES: YES
