@@ -132,7 +132,7 @@ There was no closed live history to delete. No open/running live record existed 
 
 ## Preservation Evidence
 
-Counts after deployment:
+Counts immediately after deployment and cleanup:
 
 - Users: 4
 - User profiles / broker accounts: 3
@@ -162,7 +162,9 @@ After final restart and 291 seconds of scheduler observation:
 - Global kill switch: enabled
 - `FORCE_DEMO_TRADING`: false inside the running backend
 
-All three Angel One sessions remain expired. The task explicitly authorized clearing purely simulated demo state without those sessions. No current broker order/position request was claimed as authoritative, no live record was guessed closed, and no Angel One mutation was attempted. The prior authoritative broker audit had reported three accounts checked, zero exposure, and zero nonterminal broker orders; current durable production state contains no live trade/order/incident rows and shows no live activity since cutover.
+All three Angel One sessions were expired during classification, cleanup, and the 291-second preservation audit. The task explicitly authorized clearing purely simulated demo state without those sessions. No current broker order/position request was claimed as authoritative, no live record was guessed closed, and no Angel One mutation was attempted. The prior authoritative broker audit had reported three accounts checked, zero exposure, and zero nonterminal broker orders; current durable production state contains no live trade/order/incident rows and shows no live activity since cutover.
+
+A later read-only recheck at `2026-08-25T02:11:56Z` observed normal external/account activity: one of the three broker sessions had reconnected, increasing encrypted broker-secret rows from 3 API-key-only records to 6 records, while two sessions remained invalid. The new credential/session state was preserved and was not rolled back. At that late recheck, demo trades/orders/risk/events remained zero, live trades/orders/incidents remained zero, the global kill switch remained enabled, and `FORCE_DEMO_TRADING` remained false. The immediate post-cleanup credential hash had already matched the pre-cleanup baseline before this later session change.
 
 ## Final Status
 
