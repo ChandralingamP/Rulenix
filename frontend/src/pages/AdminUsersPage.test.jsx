@@ -7,7 +7,7 @@ import AdminUsersPage from "./AdminUsersPage.jsx";
 import apiClient from "../utils/axiosConfig.js";
 
 vi.mock("../utils/axiosConfig.js", () => ({
-  default: { get: vi.fn(), delete: vi.fn(), patch: vi.fn() },
+  default: { get: vi.fn(), delete: vi.fn(), patch: vi.fn(), put: vi.fn() },
 }));
 
 const navigateMock = vi.fn();
@@ -31,6 +31,8 @@ const trader = {
   can_backtest: true,
   can_backtest_on_trading_days: false,
   trading_mode: "demo",
+  brokerage_user_id: "ANGEL01",
+  broker_egress_ip_id: null,
 };
 
 describe("AdminUsersPage Clear Trades", () => {
@@ -42,7 +44,9 @@ describe("AdminUsersPage Clear Trades", () => {
   it("refetches admin state after the complete demo reset succeeds", async () => {
     apiClient.get
       .mockResolvedValueOnce({ data: [trader] })
-      .mockResolvedValueOnce({ data: [{ ...trader }] });
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ ...trader }] })
+      .mockResolvedValueOnce({ data: [] });
     apiClient.delete.mockResolvedValue({
       data: {
         deleted_trades: 3,
@@ -58,10 +62,31 @@ describe("AdminUsersPage Clear Trades", () => {
     expect(screen.getByText(/closed and running demo trades/i)).toBeInTheDocument();
     await user.click(screen.getAllByRole("button", { name: "Clear trade logs" })[1]);
 
-    await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(4));
     expect(apiClient.delete).toHaveBeenCalledWith("/auth/admin/users/trade-logs/", {
       data: { username: "TRADER01" },
     });
     expect(await screen.findByText(/Cleared 3 trade records, 5 demo orders/)).toBeInTheDocument();
+  });
+
+  it("assigns an available IP and supports server-default networking", async () => {
+    const inventory = [{
+      id: "ip-id",
+      ip_address: "51.161.140.103",
+      configuration_status: "CONFIGURED",
+      verification_status: "VERIFIED",
+      assigned_user_id: null,
+    }];
+    apiClient.get
+      .mockResolvedValueOnce({ data: [trader] })
+      .mockResolvedValueOnce({ data: inventory })
+      .mockResolvedValueOnce({ data: [{ ...trader, broker_egress_ip_id: "ip-id", broker_egress_ip: "51.161.140.103" }] })
+      .mockResolvedValueOnce({ data: [{ ...inventory[0], assigned_user_id: trader.id }] });
+    apiClient.put.mockResolvedValue({ data: { egress_mode: "explicit" } });
+    const user = userEvent.setup();
+    render(<AdminUsersPage />);
+    const select = await screen.findByLabelText("Angel static egress IP for TRADER01");
+    await user.selectOptions(select, "ip-id");
+    await waitFor(() => expect(apiClient.put).toHaveBeenCalledWith("/admin/users/trader-id/angel-egress", { egress_ip_id: "ip-id" }));
   });
 });

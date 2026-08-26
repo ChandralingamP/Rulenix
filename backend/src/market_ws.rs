@@ -20,9 +20,41 @@ use serde_json::json;
 use std::collections::HashSet;
 use tokio::time::{Duration, Instant, interval};
 use tokio_tungstenite::{
-    connect_async,
+    client_async_tls,
     tungstenite::{Message as AngelMessage, client::IntoClientRequest},
 };
+
+type AngelSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_angel_ws(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> anyhow::Result<AngelSocket> {
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("Angel One WebSocket URL has no host"))?
+        .to_owned();
+    let port = request.uri().port_u16().unwrap_or(443);
+    let remote = tokio::net::lookup_host((host.as_str(), port))
+        .await?
+        .find(|address| address.is_ipv4())
+        .ok_or_else(|| anyhow::anyhow!("Angel One WebSocket host has no IPv4 address"))?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    if let Some(source) = crate::egress::source_ip_for_user(state, user_id).await? {
+        socket.bind((source, 0).into()).map_err(|error| {
+            anyhow::anyhow!(
+                "Configured Angel egress IP {source} is unavailable; broker operation blocked: {error}"
+            )
+        })?;
+    }
+    let stream = socket.connect(remote).await.map_err(|error| {
+        anyhow::anyhow!("Angel One WebSocket connection failed without fallback: {error}")
+    })?;
+    Ok(client_async_tls(request, stream).await?.0)
+}
 
 fn ist_minute_of_day() -> Option<(Weekday, u32)> {
     let now = Utc::now().with_timezone(&FixedOffset::east_opt(19_800)?);
@@ -121,7 +153,7 @@ async fn run_bridge(
     headers.insert("x-api-key", credentials.api_key.parse()?);
     headers.insert("x-client-code", profile.brokerage_user_id.parse()?);
     headers.insert("x-feed-token", credentials.feed_token.parse()?);
-    let (angel, _) = connect_async(request).await?;
+    let angel = connect_angel_ws(&state, profile.user_id, request).await?;
     let (mut angel_tx, mut angel_rx) = angel.split();
     let tokens: Vec<String> = query
         .tokens
@@ -451,7 +483,7 @@ async fn run_strategy_feed(state: &AppState, generation: uuid::Uuid) -> anyhow::
     headers.insert("x-api-key", credentials.api_key.parse()?);
     headers.insert("x-client-code", profile.brokerage_user_id.parse()?);
     headers.insert("x-feed-token", credentials.feed_token.parse()?);
-    let (socket, _) = connect_async(request).await?;
+    let socket = connect_angel_ws(state, profile.user_id, request).await?;
     let (mut sender, mut receiver) = socket.split();
     let mut subscribed = refresh_all_requested_tokens(state).await;
     if subscribed.is_empty() {

@@ -368,6 +368,7 @@ async fn refresh_tokens(state: &AppState, snapshot: &SessionSnapshot) -> AppResu
     };
     match angel::refresh_session(
         state,
+        snapshot.profile.user_id,
         &snapshot.credentials.api_key,
         &snapshot.credentials.jwt_token,
         &snapshot.credentials.refresh_token,
@@ -552,6 +553,7 @@ pub async fn connect(
     };
     let session = match angel::create_session(
         &state,
+        user.id,
         &snapshot.profile.brokerage_user_id,
         &snapshot.credentials.api_key,
         &input.mpin,

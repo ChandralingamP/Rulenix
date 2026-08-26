@@ -309,6 +309,8 @@ otherwise reusable credentials.
 - `GET /api/auth/access/`, `POST /api/auth/logout/`
 - `POST /api/auth/password/request-reset/`, `/verify-otp/`, `/reset/`
 - `GET|PATCH|DELETE /api/auth/admin/users/`
+- `GET|POST /api/admin/egress-ips`, `POST /api/admin/egress-ips/{id}/verify`
+- `PUT /api/admin/users/{user_id}/angel-egress`
 - `GET /api/home/status/`, `POST /api/home/connect/`, `PATCH /api/home/profile/`
 - `GET|PATCH /api/account/profile`, `POST /api/account/profile/request-otp`
 - `PUT /api/account/trading-mode`

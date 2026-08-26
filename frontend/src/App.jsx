@@ -12,6 +12,7 @@ import AdminPage from "./pages/AdminPage.jsx";
 import AdminRiskLimitsPage from "./pages/AdminRiskLimitsPage.jsx";
 import AdminJobsPage from "./pages/AdminJobsPage.jsx";
 import AdminDailyTradesPage from "./pages/AdminDailyTradesPage.jsx";
+import AdminEgressIpsPage from "./pages/AdminEgressIpsPage.jsx";
 import LogsViewerPage from "./pages/LogsViewerPage.jsx";
 import StrategiesPage from "./pages/StrategiesPage.jsx";
 import BacktestingPage from "./pages/BacktestingPage.jsx";
@@ -34,6 +35,7 @@ function AppRoutes() {
   else if (path === "/strategies") page = <StrategiesPage />;
   else if (path === "/backtesting") page = <BacktestingPage />;
   else if (path === "/admin/users") page = <AdminPage />;
+  else if (path === "/admin/egress-ips") page = <AdminEgressIpsPage />;
   else if (path === "/admin/limits") page = <AdminRiskLimitsPage />;
   else if (path === "/admin/jobs") page = <AdminJobsPage />;
   else if (path === "/admin/trades") page = <AdminDailyTradesPage />;

@@ -15,6 +15,11 @@ pub struct AdminUser {
     pub trading_mode: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+    pub brokerage_user_id: Option<String>,
+    pub broker_egress_ip_id: Option<Uuid>,
+    pub broker_egress_ip: Option<String>,
+    pub broker_egress_configuration_status: Option<String>,
+    pub broker_egress_verification_status: Option<String>,
 }
 
 #[derive(Debug, FromRow)]

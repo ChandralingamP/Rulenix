@@ -1443,6 +1443,7 @@ async fn shared_market_quote(
     for (attempt, credential) in credentials.into_iter().enumerate() {
         match angel::market_quote(
             state,
+            credential.profile_id,
             &credential.credentials.api_key,
             &credential.credentials.jwt_token,
             mode,
@@ -1498,6 +1499,7 @@ async fn shared_market_candles(
     for (attempt, credential) in credentials.into_iter().enumerate() {
         match angel::get_candles_with_exchange_interval(
             state,
+            credential.profile_id,
             &credential.credentials.api_key,
             &credential.credentials.jwt_token,
             exchange,
@@ -3250,6 +3252,7 @@ fn broker_available_funds(value: &Value) -> Option<f64> {
 
 async fn validate_live_order_price_band(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     order: &NewOrder,
@@ -3262,6 +3265,7 @@ async fn validate_live_order_price_band(
     token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
     let quote = angel::market_quote(
         state,
+        user_id,
         &credentials.api_key,
         &credentials.jwt_token,
         "FULL",
@@ -3295,6 +3299,7 @@ async fn validate_live_order_price_band(
 
 async fn validate_live_entry_margin(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     order: &NewOrder,
@@ -3306,6 +3311,7 @@ async fn validate_live_entry_margin(
         .ok_or_else(|| AppError::BadRequest("Snapshot has no contract token.".into()))?;
     let required = angel::margin_required(
         state,
+        user_id,
         &credentials.api_key,
         &credentials.jwt_token,
         json!({
@@ -3319,7 +3325,8 @@ async fn validate_live_entry_margin(
         }),
     )
     .await?;
-    let rms = angel::rms_limits(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let rms =
+        angel::rms_limits(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let available = broker_available_funds(&rms).ok_or_else(|| {
         AppError::BadRequest("Angel One RMS response has no valid available-funds field.".into())
     })?;
@@ -3335,11 +3342,13 @@ async fn validate_live_entry_margin(
 
 async fn confirm_original_terminal_nonfill(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     client_order_id: &str,
 ) -> AppResult<bool> {
-    let orders = angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let orders =
+        angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let order_book_nonfill = if let Some(item) = orders
         .as_array()
         .into_iter()
@@ -3365,7 +3374,8 @@ async fn confirm_original_terminal_nonfill(
         // the order book is acceptable only when the position book is flat.
         true
     };
-    let positions = angel::positions(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let positions =
+        angel::positions(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let exchange = snapshot.exchange_segment.to_uppercase();
     let token = snapshot.contract_token.as_deref().unwrap_or("");
     Ok(order_book_nonfill
@@ -3547,7 +3557,8 @@ async fn place_strategy_order_inner(
     if has_actionable_price
         && let Some(credentials) = entry_credentials.as_ref()
         && let Err(error) =
-            validate_live_order_price_band(state, credentials, snapshot, &order).await
+            validate_live_order_price_band(state, runner.user_id, credentials, snapshot, &order)
+                .await
     {
         let outside_band = error
             .to_string()
@@ -3576,8 +3587,15 @@ async fn place_strategy_order_inner(
     }
     if !protective
         && let Some(credentials) = entry_credentials.as_ref()
-        && let Err(error) =
-            validate_live_entry_margin(state, credentials, snapshot, &order, quantity).await
+        && let Err(error) = validate_live_entry_margin(
+            state,
+            runner.user_id,
+            credentials,
+            snapshot,
+            &order,
+            quantity,
+        )
+        .await
     {
         operational_alert_for(
             state,
@@ -3595,7 +3613,14 @@ async fn place_strategy_order_inner(
         let credentials = entry_credentials
             .as_ref()
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
-        match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await {
+        match angel::order_book(
+            state,
+            runner.user_id,
+            &credentials.api_key,
+            &credentials.jwt_token,
+        )
+        .await
+        {
             Ok(_) => {
                 live_reconciled = true;
                 risk::set_reconciliation_health(
@@ -3795,6 +3820,7 @@ async fn place_strategy_order_inner(
         } else {
             angel::place_order(
                 state,
+                runner.user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &angel::OrderRequest {
@@ -3901,6 +3927,7 @@ async fn place_strategy_order_inner(
                 match entry_credentials.as_ref() {
                     Some(credentials) => confirm_original_terminal_nonfill(
                         state,
+                        runner.user_id,
                         credentials,
                         snapshot,
                         &client_order_id,
@@ -4345,6 +4372,7 @@ async fn cancel_supertrend_active_entries_for_side(
             };
             match angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -7258,13 +7286,14 @@ fn reconciled_state(status: &str, filled: i32) -> &'static str {
 
 async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
     let credentials = state.credentials.load(user_id).await?;
-    let values = match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await
-    {
-        Ok(values) => values,
-        Err(error) => {
-            let _ =
-                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
-            operational_alert(
+    let values =
+        match angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
+                    .await;
+                operational_alert(
                 state,
                 Some(user_id),
                 "",
@@ -7275,11 +7304,16 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
                 ),
             )
             .await;
-            return Ok(());
-        }
-    };
-    let positions = match angel::positions(state, &credentials.api_key, &credentials.jwt_token)
-        .await
+                return Ok(());
+            }
+        };
+    let positions = match angel::positions(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
     {
         Ok(values) => values,
         Err(error) => {
@@ -7403,6 +7437,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             };
             match angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 broker_id,
@@ -7950,6 +7985,7 @@ async fn cancel_exit_orders(
             };
             if let Err(error) = angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -8192,6 +8228,7 @@ async fn clear_entry_orders_for_sl2_reversal(
         let credentials = state.credentials.load(intent.user_id).await?;
         angel::cancel_order(
             state,
+            intent.user_id,
             &credentials.api_key,
             &credentials.jwt_token,
             &broker_id,
@@ -8302,6 +8339,7 @@ async fn cancel_active_breakout_entry_orders(
             };
             angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -9808,6 +9846,7 @@ pub async fn finish_kill_cancellations(
             let credentials = state.credentials.load(user_id).await?;
             if let Err(error) = angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -10256,6 +10295,7 @@ async fn cancel_pending_entries(state: &AppState, user: Uuid, strategy_key: &str
             })?;
             if let Err(error) = angel::cancel_order(
                 state,
+                user,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -13240,6 +13280,7 @@ mod tests {
         assert!(
             !confirm_original_terminal_nonfill(
                 &state,
+                user_id,
                 &credentials,
                 &snapshot,
                 "missing-client-tag"
@@ -13251,6 +13292,7 @@ mod tests {
         assert!(
             confirm_original_terminal_nonfill(
                 &state,
+                user_id,
                 &credentials,
                 &snapshot,
                 "missing-client-tag"

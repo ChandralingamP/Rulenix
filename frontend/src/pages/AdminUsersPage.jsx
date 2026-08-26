@@ -23,6 +23,7 @@ export default function AdminUsersPage() {
   const { session, refreshSession } = useOutletContext();
   const navigate = useNavigate();
   const [users, setUsers] = useState([]);
+  const [egressIps, setEgressIps] = useState([]);
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
@@ -39,8 +40,12 @@ export default function AdminUsersPage() {
     setIsLoading(true);
     setError("");
     try {
-      const response = await apiClient.get("/auth/admin/users/");
+      const [response, inventory] = await Promise.all([
+        apiClient.get("/auth/admin/users/"),
+        apiClient.get("/admin/egress-ips"),
+      ]);
       setUsers(Array.isArray(response.data) ? response.data : []);
+      setEgressIps(Array.isArray(inventory.data) ? inventory.data : []);
     } catch (requestError) {
       if (requestError.response?.status === 401) {
         navigate("/login", { replace: true });
@@ -128,6 +133,24 @@ export default function AdminUsersPage() {
       setDeletingUser("");
     }
   }, [loadUsers, pendingDelete]);
+
+  const assignEgress = useCallback(async (userId, username, selected) => {
+    setSavingUser(username);
+    setError("");
+    setNotice("");
+    try {
+      await apiClient.put(`/admin/users/${userId}/angel-egress`, {
+        egress_ip_id: selected || null,
+      });
+      setNotice(selected ? `Angel static egress assignment updated for ${username}.` : `${username} now uses normal server-default networking.`);
+      await loadUsers();
+    } catch (requestError) {
+      setError(requestError.response?.data?.detail || "Unable to change the Angel egress assignment.");
+      await loadUsers();
+    } finally {
+      setSavingUser("");
+    }
+  }, [loadUsers]);
 
   const confirmClearLogs = useCallback(async () => {
     if (!pendingClearLogs) return;
@@ -220,7 +243,7 @@ export default function AdminUsersPage() {
           <div className="px-5 py-10 text-center text-sm text-slate-400">Loading users...</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-[1200px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
+            <table className="min-w-[1450px] w-full divide-y divide-slate-800 text-left text-sm text-slate-200">
               <thead className="bg-slate-950/50 text-xs uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-4 py-3">User</th>
@@ -229,12 +252,13 @@ export default function AdminUsersPage() {
                   <th className="px-4 py-3 text-center">Backtesting</th>
                   <th className="px-4 py-3 text-center">Trading day</th>
                   <th className="px-4 py-3 text-center">Mode</th>
+                  <th className="px-4 py-3">Angel static egress IP</th>
                   <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
                 {filteredUsers.length === 0 ? (
-                  <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No matching users.</td></tr>
+                  <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-400">No matching users.</td></tr>
                 ) : filteredUsers.map((user) => {
                   const busy = savingUser === user.username || deletingUser === user.username || clearingLogsUser === user.username;
                   const isSelf = adminUsername.toLowerCase() === user.username.toLowerCase();
@@ -284,6 +308,21 @@ export default function AdminUsersPage() {
                         </button>
                       </td>
                       <td className="px-4 py-4 text-center uppercase text-slate-300">{user.can_administer ? "Admin" : user.trading_mode}</td>
+                      <td className="px-4 py-4">
+                        {user.brokerage_user_id ? <>
+                          <select
+                            aria-label={`Angel static egress IP for ${user.username}`}
+                            value={user.broker_egress_ip_id || ""}
+                            disabled={busy}
+                            onChange={(event) => assignEgress(user.id, user.username, event.target.value)}
+                            className="h-10 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 text-xs text-white disabled:opacity-50"
+                          >
+                            <option value="">Use Server Default</option>
+                            {egressIps.filter((ip) => !ip.assigned_user_id || ip.id === user.broker_egress_ip_id).map((ip) => <option key={ip.id} value={ip.id}>{ip.ip_address} — {ip.configuration_status}/{ip.verification_status}</option>)}
+                          </select>
+                          <p className="mt-2 text-[11px] text-slate-500">{user.broker_egress_ip ? `Explicit ${user.broker_egress_ip} · ${user.broker_egress_configuration_status}/${user.broker_egress_verification_status}` : "Default OS routing; no source address is bound."}</p>
+                        </> : <span className="text-xs text-slate-500">No Angel broker account</span>}
+                      </td>
                       <td className="px-4 py-4">
                         <div className="flex flex-wrap justify-end gap-2">
                           <button type="button" disabled={busy || isSelf} onClick={() => updatePermission(user.username, "can_administer", !user.can_administer)} className="rounded-lg border border-violet-500/40 px-3 py-2 text-xs font-semibold text-violet-200 disabled:border-slate-700 disabled:text-slate-600">
