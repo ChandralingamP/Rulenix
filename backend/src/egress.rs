@@ -97,6 +97,17 @@ pub fn validate_public_ipv4(value: &str) -> AppResult<Ipv4Addr> {
     Ok(ip)
 }
 
+pub fn binding_ipv4(public: Ipv4Addr) -> Ipv4Addr {
+    let raw = u32::from(public);
+    let slot = (raw ^ (raw >> 22)).wrapping_mul(0x9e37_79b1) & 0x003f_ffff;
+    Ipv4Addr::new(
+        100,
+        64 + ((slot >> 16) & 0x3f) as u8,
+        ((slot >> 8) & 0xff) as u8,
+        (slot & 0xff) as u8,
+    )
+}
+
 fn inventory_query() -> &'static str {
     "SELECT e.id,host(e.ip_address) AS ip_address,e.configuration_status,e.verification_status,
             e.status_message,e.configured_at,e.last_verified_at,e.created_at,e.updated_at,
@@ -392,8 +403,9 @@ pub async fn source_ip_for_user(state: &AppState, user_id: Uuid) -> AppResult<Op
             "Configured Angel egress IP {ip} is unavailable; broker operation blocked."
         )));
     }
-    tracing::debug!(%user_id, egress_mode="explicit", egress_ip=%ip, "selected Angel networking");
-    Ok(Some(ip))
+    let binding_ip = binding_ipv4(ip);
+    tracing::debug!(%user_id, egress_mode="explicit", egress_ip=%ip, %binding_ip, "selected Angel networking");
+    Ok(Some(binding_ip))
 }
 
 pub async fn rehydrate_configured_ips(state: &AppState) {
@@ -459,6 +471,18 @@ mod tests {
             validate_public_ipv4("51.161.140.103").unwrap(),
             Ipv4Addr::new(51, 161, 140, 103)
         );
+    }
+
+    #[test]
+    fn public_egress_addresses_have_stable_private_binding_aliases() {
+        let primary = binding_ipv4(Ipv4Addr::new(139, 99, 155, 62));
+        let additional = binding_ipv4(Ipv4Addr::new(51, 161, 140, 103));
+        assert_ne!(primary, additional);
+        for alias in [primary, additional] {
+            let octets = alias.octets();
+            assert_eq!(octets[0], 100);
+            assert!((64..=127).contains(&octets[1]));
+        }
     }
 
     async fn observed_peer(client: reqwest::Client) -> std::io::Result<Ipv4Addr> {

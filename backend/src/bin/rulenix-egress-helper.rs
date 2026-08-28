@@ -75,6 +75,17 @@ mod linux {
         }
     }
 
+    fn binding_ipv4(public: Ipv4Addr) -> Ipv4Addr {
+        let raw = u32::from(public);
+        let slot = (raw ^ (raw >> 22)).wrapping_mul(0x9e37_79b1) & 0x003f_ffff;
+        Ipv4Addr::new(
+            100,
+            64 + ((slot >> 16) & 0x3f) as u8,
+            ((slot >> 8) & 0xff) as u8,
+            (slot & 0xff) as u8,
+        )
+    }
+
     fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
         let output = Command::new(program)
             .args(args)
@@ -257,7 +268,115 @@ mod linux {
         Ok(())
     }
 
-    fn verify(pid: &str, ip: Ipv4Addr, verify_url: &str) -> Result<String, String> {
+    fn container_ipv4(pid: &str) -> Result<Ipv4Addr, String> {
+        let output = run_command(
+            "/usr/bin/nsenter",
+            &[
+                "--target",
+                pid,
+                "--net",
+                "--",
+                "/usr/sbin/ip",
+                "-4",
+                "-o",
+                "address",
+                "show",
+                "dev",
+                "eth0",
+            ],
+        )?;
+        let address = output
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|pair| (pair[0] == "inet").then_some(pair[1]))
+            .and_then(|value| value.split('/').next())
+            .ok_or_else(|| "backend container has no eth0 IPv4 address".to_owned())?;
+        address
+            .parse()
+            .map_err(|_| "backend container returned an invalid eth0 IPv4 address".to_owned())
+    }
+
+    fn configure_host_nat(
+        settings: &Settings,
+        pid: &str,
+        public_ip: Ipv4Addr,
+        binding_ip: Ipv4Addr,
+    ) -> Result<(), String> {
+        let container_ip = container_ipv4(pid)?;
+        let route = run_command(
+            "/usr/sbin/ip",
+            &["-4", "route", "get", &container_ip.to_string()],
+        )?;
+        let words: Vec<_> = route.split_whitespace().collect();
+        let bridge = words
+            .windows(2)
+            .find_map(|pair| (pair[0] == "dev").then_some(pair[1]))
+            .ok_or_else(|| "could not determine backend bridge interface".to_owned())?;
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "route",
+                "replace",
+                &format!("{binding_ip}/32"),
+                "via",
+                &container_ip.to_string(),
+                "dev",
+                bridge,
+            ],
+        )?;
+
+        let comment = format!("rulenix-egress-{public_ip}");
+        let source = format!("{binding_ip}/32");
+        let public = public_ip.to_string();
+        let existing = run_command("/usr/sbin/iptables", &["-t", "nat", "-S", "POSTROUTING"])?;
+        for line in existing
+            .lines()
+            .filter(|line| line.contains(&format!("-s {source}")))
+        {
+            if !line.contains(&format!("--to-source {public}")) {
+                return Err(format!(
+                    "binding alias {binding_ip} conflicts with another egress mapping"
+                ));
+            }
+        }
+        let rule = [
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            &source,
+            "-o",
+            &settings.interface,
+            "-m",
+            "comment",
+            "--comment",
+            &comment,
+            "-j",
+            "SNAT",
+            "--to-source",
+            &public,
+        ];
+        let present = Command::new("/usr/sbin/iptables")
+            .args(rule)
+            .status()
+            .map_err(|error| format!("could not inspect egress SNAT rule: {error}"))?
+            .success();
+        if !present {
+            let mut add_rule = rule;
+            add_rule[2] = "-A";
+            run_command("/usr/sbin/iptables", &add_rule)?;
+        }
+        Ok(())
+    }
+
+    fn verify(
+        pid: &str,
+        binding_ip: Ipv4Addr,
+        expected_public_ip: Ipv4Addr,
+        verify_url: &str,
+    ) -> Result<String, String> {
         let parsed = url::Url::parse(verify_url)
             .map_err(|_| "invalid helper verification URL".to_owned())?;
         if parsed.scheme() != "https" {
@@ -287,13 +406,13 @@ mod linux {
                 "--max-time",
                 "15",
                 "--interface",
-                &ip.to_string(),
+                &binding_ip.to_string(),
                 "--resolve",
                 &resolve,
                 verify_url,
             ],
         )?;
-        if output.trim() != ip.to_string() {
+        if output.trim() != expected_public_ip.to_string() {
             return Err(format!(
                 "external verifier observed an unexpected source address: {}",
                 output.trim()
@@ -379,7 +498,8 @@ mod linux {
                 };
             }
         };
-        if let Err(message) = configure_container(&pid, ip) {
+        let binding_ip = binding_ipv4(ip);
+        if let Err(message) = configure_container(&pid, binding_ip) {
             return Response {
                 ok: false,
                 configured: true,
@@ -388,7 +508,16 @@ mod linux {
                 message,
             };
         }
-        match verify(&pid, ip, &settings.verify_url) {
+        if let Err(message) = configure_host_nat(settings, &pid, ip, binding_ip) {
+            return Response {
+                ok: false,
+                configured: true,
+                verified: false,
+                observed_ip: None,
+                message,
+            };
+        }
+        match verify(&pid, binding_ip, ip, &settings.verify_url) {
             Ok(observed) => Response {
                 ok: true,
                 configured: true,
