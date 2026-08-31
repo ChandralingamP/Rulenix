@@ -294,7 +294,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/risk/admin/kill-switch",
-            axum::routing::put(risk::update_global_kill),
+            get(risk::global_kill_state).put(risk::update_global_kill),
         )
         .route(
             "/risk/admin/kill-switch/{user_id}",

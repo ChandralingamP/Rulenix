@@ -2,6 +2,7 @@ use crate::{error::AppResult, security::RequestContext, state::AppState};
 use axum::{Extension, extract::ConnectInfo, http::HeaderMap};
 use ipnet::IpNet;
 use serde_json::Value;
+use sqlx::{Postgres, Transaction};
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -44,6 +45,32 @@ pub async fn record(state: &AppState, event: AuditEvent<'_>) -> AppResult<()> {
     .bind(event.summary)
     .bind(event.metadata)
     .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+/// Persist an audit event in the same transaction as the safety-critical
+/// state change it describes. If the audit insert fails, the caller's change
+/// can be rolled back instead of becoming unaudited.
+pub async fn record_in_transaction(
+    state: &AppState,
+    transaction: &mut Transaction<'_, Postgres>,
+    event: AuditEvent<'_>,
+) -> AppResult<()> {
+    let ip_address = attributed_ip(event.context, event.headers, &state.config.trusted_proxies)
+        .map(|value| value.to_string());
+    sqlx::query(
+        "INSERT INTO audit_events (event_type,actor_user_id,target_user_id,request_id,correlation_id,ip_address,summary,metadata) VALUES ($1,$2,$3,$4,$5,$6::inet,$7,$8)",
+    )
+    .bind(event.event_type)
+    .bind(event.actor_user_id)
+    .bind(event.target_user_id)
+    .bind(event.context.map(|value| value.request_id.as_str()))
+    .bind(event.context.map(|value| value.correlation_id.as_str()))
+    .bind(ip_address.as_deref())
+    .bind(event.summary)
+    .bind(event.metadata)
+    .execute(&mut **transaction)
     .await?;
     Ok(())
 }

@@ -13813,6 +13813,81 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_global_kill_switch_is_authorized_idempotent_persistent_and_audited() {
+        let state = isolated_test_state().await;
+        let admin_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,can_administer) VALUES($1,'kill-admin','kill-admin@example.test','test-only',TRUE)")
+            .bind(admin_id).execute(&state.db).await.unwrap();
+        let principal = crate::auth::AuthUser {
+            id: admin_id,
+            username: "kill-admin".into(),
+            can_administer: true,
+            can_live_trade: false,
+            can_backtest: false,
+            can_backtest_on_trading_days: false,
+            trading_mode: "demo".into(),
+            session_id: Uuid::new_v4(),
+        };
+        let normal = crate::auth::AuthUser {
+            can_administer: false,
+            ..principal.clone()
+        };
+        let headers = axum::http::HeaderMap::new();
+
+        let forbidden = risk::update_kill(
+            &state,
+            &normal,
+            &headers,
+            None,
+            None,
+            &risk::KillUpdate {
+                enabled: true,
+                reason: None,
+            },
+        )
+        .await;
+        assert!(matches!(forbidden, Err(AppError::Forbidden(_))));
+
+        for enabled in [true, true, false, false] {
+            risk::update_kill(
+                &state,
+                &principal,
+                &headers,
+                None,
+                None,
+                &risk::KillUpdate {
+                    enabled,
+                    reason: Some(format!("set {enabled}")),
+                },
+            )
+            .await
+            .unwrap();
+            let stored: bool =
+                sqlx::query_scalar("SELECT enabled FROM risk_kill_switches WHERE user_id IS NULL")
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, enabled);
+        }
+        let audit: Vec<(bool, bool, bool, bool)> = sqlx::query_as(
+            "SELECT (metadata->>'previous_state')::bool,(metadata->>'requested_state')::bool,(metadata->>'resulting_state')::bool,(metadata->>'state_changed')::bool FROM audit_events WHERE event_type='admin_global_kill_switch_set' ORDER BY created_at,id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit,
+            vec![
+                (false, true, true, true),
+                (true, true, true, false),
+                (true, false, false, true),
+                (false, false, false, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn admin_clear_trades_removes_running_demo_graph_and_fences_stale_execution() {
         let state = isolated_test_state().await;
         let user_a = Uuid::new_v4();
@@ -13954,6 +14029,20 @@ mod tests {
         sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,status,broker_order_id,idempotency_key,client_order_id) VALUES($1,$2,$3,'user-b','SELL_ENTRY','SELL','STOPLOSS_LIMIT','demo',1,10,90,'submitted',$4,$5,'USERB')")
             .bind(user_b_order).bind(user_b).bind(snapshot_b).bind(format!("DEMO-{user_b_order}")).bind(format!("user-b-{user_b_order}"))
             .execute(&state.db).await.unwrap();
+        let live_order = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,status,broker_order_id,idempotency_key,client_order_id,filled_quantity,processed_quantity) VALUES($1,$2,$3,$4,'live-history','BUY_ENTRY','BUY','MARKET','live',1,10,100,'filled','LIVE-HISTORY','live-history-key','LIVEHISTORY',10,10)")
+            .bind(live_order).bind(user_a).bind(snapshot_b).bind(live_closed_trade)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO broker_secrets(user_id,secret_kind,key_version,nonce,ciphertext) VALUES($1,'api_key',1,decode('000000000000000000000000','hex'),decode('00','hex'))")
+            .bind(user_a).execute(&state.db).await.unwrap();
+        let egress_id: Uuid = sqlx::query_scalar("INSERT INTO broker_egress_ips(ip_address,configuration_status,verification_status) VALUES('192.0.2.10','CONFIGURED','VERIFIED') RETURNING id")
+            .fetch_one(&state.db).await.unwrap();
+        sqlx::query("UPDATE user_profiles SET broker_egress_ip_id=$2 WHERE user_id=$1")
+            .bind(user_a)
+            .bind(egress_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
         let old_signal = Uuid::new_v4();
         let old_signal_at = Utc::now() - Duration::minutes(5);
         sqlx::query("INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,snapshot_id,signal_type,status,expected_users) VALUES($1,$2,'GOLDTEN','clear-old',$3,$4,'ENTRY','dispatching',1)")
@@ -14009,7 +14098,7 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_a, true)
+        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_a)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -14024,17 +14113,24 @@ mod tests {
         );
         assert_eq!(cleared.deleted_demo_trades, 3);
         assert_eq!(cleared.deleted_demo_orders, 5);
-        assert_eq!(cleared.deleted_demo_intents, 1);
+        assert_eq!(cleared.deleted_demo_intents, 0);
+        assert_eq!(cleared.skipped_ambiguous_intents, 1);
         assert_eq!(cleared.deleted_demo_events, 1);
         assert_eq!(cleared.deleted_demo_risk_decisions, 1);
-        assert_eq!(cleared.deleted_orphan_signals, 1);
-        assert_eq!(cleared.deleted_orphan_snapshots, 1);
-        let remaining_demo: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_execution_intents WHERE user_id=$1),(SELECT COUNT(*) FROM risk_decisions WHERE user_id=$1 AND execution_mode='demo')")
+        assert_eq!(cleared.deleted_orphan_signals, 0);
+        assert_eq!(cleared.deleted_orphan_snapshots, 0);
+        let remaining_demo: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_execution_intents WHERE user_id=$1 AND status IN ('pending','claimed','retry_wait','submitted')),(SELECT COUNT(*) FROM risk_decisions WHERE user_id=$1 AND execution_mode='demo')")
             .bind(user_a).fetch_one(&state.db).await.unwrap();
         assert_eq!(remaining_demo, (0, 0, 0, 0));
+        let ambiguous_intent: (i64, i64) = sqlx::query_as("SELECT COUNT(*),COUNT(*) FILTER (WHERE status='skipped' AND last_error LIKE 'Preserved and terminalized%') FROM strategy_execution_intents WHERE user_id=$1")
+            .bind(user_a).fetch_one(&state.db).await.unwrap();
+        assert_eq!(ambiguous_intent, (1, 1));
         let live_preserved: (i64, i64) = sqlx::query_as("SELECT COUNT(*) FILTER (WHERE status='open'),COUNT(*) FILTER (WHERE status='closed') FROM trades WHERE user_id=$1 AND execution_mode='live'")
             .bind(user_a).fetch_one(&state.db).await.unwrap();
-        assert_eq!(live_preserved, (1, 0));
+        assert_eq!(live_preserved, (1, 1));
+        let protected_records: (i64, i64, Option<Uuid>) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='live'),(SELECT COUNT(*) FROM broker_secrets WHERE user_id=$1),broker_egress_ip_id FROM user_profiles WHERE user_id=$1")
+            .bind(user_a).fetch_one(&state.db).await.unwrap();
+        assert_eq!(protected_records, (1, 1, Some(egress_id)));
         let user_b_state: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='demo')")
             .bind(user_b).fetch_one(&state.db).await.unwrap();
         assert_eq!(user_b_state, (1, 1));
@@ -14140,6 +14236,9 @@ mod tests {
         sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,strategy_key,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','BUY',10,100,100,0,NOW(),'GOLDTEN',$3,1,1,'DEMO'),($4,$2,'live','closed','BUY',10,100,101,10,NOW()-INTERVAL '2 days','NIFTY','option_entry_v1',1,0,'CLOSED')")
             .bind(Uuid::new_v4()).bind(user_id).bind(STRATEGY_KEY).bind(Uuid::new_v4())
             .execute(&state.db).await.unwrap();
+        let active_before: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM strategy_execution_intents WHERE user_id=$1 AND action='ENTRY' AND status IN ('pending','claimed','retry_wait','submitted'))")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert!(active_before, "running DEMO state must block a mode change");
 
         let mut tx = state.db.begin().await.unwrap();
         sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
@@ -14151,16 +14250,21 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_id, false)
+        let cleared = crate::auth::clear_user_demo_trade_state(&mut tx, user_id)
             .await
             .unwrap();
         tx.commit().await.unwrap();
 
         assert_eq!(cleared.deleted_demo_trades, 1);
-        assert_eq!(cleared.deleted_closed_live_trades, 0);
         let remaining: (i64, i64) = sqlx::query_as("SELECT COUNT(*) FILTER (WHERE execution_mode='demo'),COUNT(*) FILTER (WHERE execution_mode='live' AND status='closed') FROM trades WHERE user_id=$1")
             .bind(user_id).fetch_one(&state.db).await.unwrap();
         assert_eq!(remaining, (0, 1));
+        let active_after: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM strategy_execution_intents WHERE user_id=$1 AND action='ENTRY' AND status IN ('pending','claimed','retry_wait','submitted'))")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert!(
+            !active_after,
+            "legitimate demo cleanup must remove only the active-state blocker"
+        );
     }
 
     #[tokio::test]
@@ -14182,7 +14286,7 @@ mod tests {
         sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','BUY',10,100,100,0,NOW(),'GOLDTEN',$3,$4,1,1,'DEMO')")
             .bind(trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
         let mut tx = state.db.begin().await.unwrap();
-        crate::auth::clear_user_demo_trade_state(&mut tx, user_id, true)
+        crate::auth::clear_user_demo_trade_state(&mut tx, user_id)
             .await
             .unwrap();
         tx.rollback().await.unwrap();

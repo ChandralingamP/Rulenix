@@ -69,6 +69,24 @@ describe("AdminUsersPage Clear Trades", () => {
     expect(await screen.findByText(/Cleared 3 trade records, 5 demo orders/)).toBeInTheDocument();
   });
 
+  it("guides the administrator to the explicit Global Kill Switch when clear is blocked", async () => {
+    apiClient.get
+      .mockResolvedValueOnce({ data: [trader] })
+      .mockResolvedValueOnce({ data: [] });
+    apiClient.delete.mockRejectedValue({
+      response: { data: { detail: "Clear Trades requires the global kill switch to be enabled." } },
+    });
+    const user = userEvent.setup();
+    render(<AdminUsersPage />);
+
+    await screen.findByText("TRADER01");
+    await user.click(screen.getByRole("button", { name: "Clear trade logs" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(/LIVE trades, LIVE orders, credentials/i);
+    await user.click(screen.getAllByRole("button", { name: "Clear trade logs" })[1]);
+
+    expect(await screen.findByText("Enable the Global Kill Switch from Admin → Risk limits before clearing DEMO trading records.")).toBeInTheDocument();
+  });
+
   it("assigns an available IP and supports server-default networking", async () => {
     const inventory = [{
       id: "ip-id",

@@ -7,6 +7,7 @@ use crate::{
 use axum::{
     Json,
     extract::{Extension, Path, State},
+    http::HeaderMap,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -498,6 +499,26 @@ pub struct KillUpdate {
     pub reason: Option<String>,
 }
 
+fn kill_reason(update: &KillUpdate) -> AppResult<String> {
+    let default = if update.enabled {
+        "Emergency trading pause"
+    } else {
+        "Cleared by staff"
+    };
+    let reason = update
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default);
+    if reason.chars().count() > 500 {
+        return Err(AppError::BadRequest(
+            "Kill-switch reason must be 500 characters or fewer.".into(),
+        ));
+    }
+    Ok(reason.to_owned())
+}
+
 pub async fn admin_status(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthUser>,
@@ -581,20 +602,15 @@ pub async fn update_user_limits(
 }
 
 pub async fn update_kill(
-    State(state): State<AppState>,
-    Extension(admin): Extension<AuthUser>,
-    user: Option<Path<Uuid>>,
-    Json(v): Json<KillUpdate>,
-) -> AppResult<Json<Value>> {
-    require_admin_permission(&admin)?;
-    let user = user.map(|Path(v)| v);
-    let reason = v.reason.unwrap_or_else(|| {
-        if v.enabled {
-            "Emergency trading pause".into()
-        } else {
-            "Cleared by staff".into()
-        }
-    });
+    state: &AppState,
+    admin: &AuthUser,
+    headers: &HeaderMap,
+    context: Option<&crate::security::RequestContext>,
+    user: Option<Uuid>,
+    v: &KillUpdate,
+) -> AppResult<bool> {
+    require_admin_permission(admin)?;
+    let reason = kill_reason(v)?;
     let mut tx = state.db.begin().await?;
     if let Some(user_id) = user {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
@@ -606,32 +622,105 @@ pub async fn update_kill(
             .execute(&mut *tx)
             .await?;
     }
+    let previous: bool = if let Some(user_id) = user {
+        sqlx::query_scalar(
+            "SELECT COALESCE((SELECT enabled FROM risk_kill_switches WHERE user_id=$1),FALSE)",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT enabled FROM risk_kill_switches WHERE user_id IS NULL FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?
+    };
     if user.is_none() {
         sqlx::query("UPDATE risk_kill_switches SET enabled=$1,reason=$2,updated_by=$3,updated_at=NOW() WHERE user_id IS NULL").bind(v.enabled).bind(&reason).bind(admin.id).execute(&mut *tx).await?;
     } else {
         sqlx::query("INSERT INTO risk_kill_switches(user_id,enabled,reason,updated_by) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) WHERE user_id IS NOT NULL DO UPDATE SET enabled=EXCLUDED.enabled,reason=EXCLUDED.reason,updated_by=EXCLUDED.updated_by,updated_at=NOW() ").bind(user).bind(v.enabled).bind(&reason).bind(admin.id).execute(&mut *tx).await?;
     }
+    let state_changed = previous != v.enabled;
+    crate::audit::record_in_transaction(
+        state,
+        &mut tx,
+        crate::audit::AuditEvent {
+            context,
+            headers: Some(headers),
+            event_type: if user.is_some() {
+                "admin_user_kill_switch_set"
+            } else {
+                "admin_global_kill_switch_set"
+            },
+            actor_user_id: Some(admin.id),
+            target_user_id: user,
+            summary: if user.is_some() {
+                "Administrator set a user kill switch"
+            } else {
+                "Administrator set the global kill switch"
+            },
+            metadata: json!({
+                "scope": if user.is_some() { "user" } else { "global" },
+                "previous_state": previous,
+                "requested_state": v.enabled,
+                "resulting_state": v.enabled,
+                "state_changed": state_changed,
+                "reason": reason,
+            }),
+        },
+    )
+    .await?;
     tx.commit().await?;
-    if v.enabled {
-        let pending = cancel_pending_entries(&state, user, &reason).await?;
-        crate::strategy::finish_kill_cancellations(&state, pending).await?;
+    if v.enabled && state_changed {
+        let pending = cancel_pending_entries(state, user, &reason).await?;
+        crate::strategy::finish_kill_cancellations(state, pending).await?;
     }
-    admin_status(State(state), Extension(admin)).await
+    Ok(state_changed)
+}
+
+pub async fn global_kill_state(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+) -> AppResult<Json<Value>> {
+    require_admin_permission(&admin)?;
+    let value: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('enabled',enabled,'reason',reason,'updated_at',updated_at,'updated_by',updated_by) FROM risk_kill_switches WHERE user_id IS NULL",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(value))
 }
 pub async fn update_global_kill(
-    s: State<AppState>,
-    a: Extension<AuthUser>,
-    j: Json<KillUpdate>,
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+    headers: HeaderMap,
+    context: Option<Extension<crate::security::RequestContext>>,
+    Json(update): Json<KillUpdate>,
 ) -> AppResult<Json<Value>> {
-    update_kill(s, a, None, j).await
+    let context = crate::audit::optional_context(context);
+    update_kill(&state, &admin, &headers, context.as_ref(), None, &update).await?;
+    global_kill_state(State(state), Extension(admin)).await
 }
 pub async fn update_user_kill(
-    s: State<AppState>,
-    a: Extension<AuthUser>,
-    p: Path<Uuid>,
-    j: Json<KillUpdate>,
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthUser>,
+    Path(user): Path<Uuid>,
+    headers: HeaderMap,
+    context: Option<Extension<crate::security::RequestContext>>,
+    Json(update): Json<KillUpdate>,
 ) -> AppResult<Json<Value>> {
-    update_kill(s, a, Some(p), j).await
+    let context = crate::audit::optional_context(context);
+    update_kill(
+        &state,
+        &admin,
+        &headers,
+        context.as_ref(),
+        Some(user),
+        &update,
+    )
+    .await?;
+    admin_status(State(state), Extension(admin)).await
 }
 
 #[cfg(test)]
@@ -746,6 +835,24 @@ mod tests {
         assert!(!valid_order_values(1, 0, 1.0, None));
         assert!(!valid_order_values(1, 1, 1.0, Some(f64::NAN)));
         assert!(valid_order_values(1, 1, 1.0, Some(1.0)));
+    }
+
+    #[test]
+    fn kill_switch_requests_are_explicit_and_reasons_are_bounded() {
+        let enable = serde_json::from_value::<KillUpdate>(json!({"enabled": true})).unwrap();
+        assert!(enable.enabled);
+        assert_eq!(kill_reason(&enable).unwrap(), "Emergency trading pause");
+        assert!(serde_json::from_value::<KillUpdate>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<KillUpdate>(json!({"enabled": true, "toggle": true})).is_err()
+        );
+        assert!(
+            kill_reason(&KillUpdate {
+                enabled: false,
+                reason: Some("x".repeat(501)),
+            })
+            .is_err()
+        );
     }
 
     #[tokio::test]

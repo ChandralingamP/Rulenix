@@ -56,6 +56,7 @@ export default function AdminRiskLimitsPage() {
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState("info");
   const [busy, setBusy] = useState(false);
+  const [pendingGlobalKill, setPendingGlobalKill] = useState(null);
 
   const applyData = useCallback((next) => {
     setData(next);
@@ -70,8 +71,17 @@ export default function AdminRiskLimitsPage() {
   const load = useCallback(async () => {
     setMessage("");
     try {
-      const response = await apiClient.get("/risk/admin");
-      applyData(response.data);
+      const [riskResponse, killResponse] = await Promise.all([
+        apiClient.get("/risk/admin"),
+        apiClient.get("/risk/admin/kill-switch"),
+      ]);
+      applyData({
+        ...riskResponse.data,
+        global_kill_switch:
+          typeof killResponse.data?.enabled === "boolean"
+            ? killResponse.data
+            : riskResponse.data.global_kill_switch,
+      });
     } catch (requestError) {
       setMessageTone("error");
       setMessage(requestError.response?.data?.detail || "Unable to load risk limits.");
@@ -124,7 +134,7 @@ export default function AdminRiskLimitsPage() {
     }
   };
 
-  const setKill = async (url, enabled, label) => {
+  const setUserKill = async (url, enabled, label) => {
     setBusy(true);
     setMessage("");
     try {
@@ -138,6 +148,41 @@ export default function AdminRiskLimitsPage() {
     } catch (requestError) {
       setMessageTone("error");
       setMessage(requestError.response?.data?.detail || "Unable to update the kill switch.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmGlobalKillChange = async () => {
+    if (pendingGlobalKill === null || busy) return;
+    const requestedState = pendingGlobalKill;
+    setBusy(true);
+    setMessage("");
+    try {
+      await apiClient.put("/risk/admin/kill-switch", {
+        enabled: requestedState,
+        reason: requestedState
+          ? "Emergency pause enabled from Admin safety controls"
+          : "Emergency pause disabled from Admin safety controls",
+      });
+      const response = await apiClient.get("/risk/admin/kill-switch");
+      setData((current) => ({ ...current, global_kill_switch: response.data }));
+      setPendingGlobalKill(null);
+      setMessageTone("success");
+      setMessage(
+        response.data.enabled
+          ? "Global Kill Switch enabled. New trading entries are paused platform-wide."
+          : "Global Kill Switch disabled. Entries may become eligible under all other safety checks."
+      );
+    } catch (requestError) {
+      try {
+        const response = await apiClient.get("/risk/admin/kill-switch");
+        setData((current) => ({ ...current, global_kill_switch: response.data }));
+      } catch {
+        // Retain the last authoritative state when refresh is also unavailable.
+      }
+      setMessageTone("error");
+      setMessage(requestError.response?.data?.detail || "Unable to update the Global Kill Switch.");
     } finally {
       setBusy(false);
     }
@@ -166,18 +211,35 @@ export default function AdminRiskLimitsPage() {
         <section className="rounded-xl border border-slate-800 bg-slate-900/70 px-5 py-10 text-center text-sm text-slate-400">Loading risk limits...</section>
       ) : (
         <>
+          <section className={`rounded-xl border p-5 ${data.global_kill_switch.enabled ? "border-rose-400/60 bg-rose-500/10" : "border-amber-400/40 bg-amber-500/5"}`} aria-labelledby="global-kill-switch-title">
+            <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-300">Platform safety control</p>
+                <h2 id="global-kill-switch-title" className="mt-2 text-xl font-semibold text-white">Global Kill Switch</h2>
+                <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
+                  This control affects every user. When enabled, new entries are blocked and pending entries are handled by the existing safety engine; protective live exits remain eligible.
+                </p>
+                <p className="mt-3 text-sm font-semibold text-white">
+                  Current status: <span className={data.global_kill_switch.enabled ? "text-rose-300" : "text-emerald-300"}>{data.global_kill_switch.enabled ? "ENABLED — ENTRIES PAUSED" : "DISABLED — NORMAL ELIGIBILITY"}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setPendingGlobalKill(!data.global_kill_switch.enabled)}
+                className={`shrink-0 rounded-lg px-5 py-3 text-sm font-semibold text-white disabled:opacity-50 ${data.global_kill_switch.enabled ? "bg-emerald-600 hover:bg-emerald-500" : "bg-rose-600 hover:bg-rose-500"}`}
+              >
+                {busy ? "Updating..." : data.global_kill_switch.enabled ? "Disable Global Kill Switch" : "Enable Global Kill Switch"}
+              </button>
+            </div>
+          </section>
+
           <section className="rounded-xl border border-slate-800 bg-slate-900/70 p-5">
             <div className="flex flex-col justify-between gap-4 border-b border-slate-800 pb-5 sm:flex-row sm:items-start">
               <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-lg font-semibold text-white">Global limits</h2>
-                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${data.global_kill_switch.enabled ? "bg-rose-500/15 text-rose-300" : "bg-emerald-500/15 text-emerald-300"}`}>
-                    {data.global_kill_switch.enabled ? "Entries paused" : "Active"}
-                  </span>
-                </div>
+                <h2 className="text-lg font-semibold text-white">Global limits</h2>
                 <p className="mt-1 text-sm text-slate-400">Defaults and hard ceilings applied across every trading account.</p>
               </div>
-              <KillSwitchButton enabled={data.global_kill_switch.enabled} busy={busy} scope="all users" onClick={() => setKill("/risk/admin/kill-switch", !data.global_kill_switch.enabled, "All users")} />
             </div>
             <div className="mt-5 space-y-4">
               <LimitFields draft={globalDraft} prefix="Global" onChange={(key, value) => setGlobalDraft((current) => ({ ...current, [key]: value }))} />
@@ -191,7 +253,7 @@ export default function AdminRiskLimitsPage() {
                 <h2 className="text-lg font-semibold text-white">Per-user limits</h2>
                 <p className="mt-1 text-sm text-slate-400">Choose an account to review or override its effective limits.</p>
               </div>
-              {selected ? <KillSwitchButton enabled={selected.kill_switch.enabled} busy={busy} scope={selected.username} onClick={() => setKill(`/risk/admin/kill-switch/${selected.id}`, !selected.kill_switch.enabled, selected.username)} /> : null}
+              {selected ? <KillSwitchButton enabled={selected.kill_switch.enabled} busy={busy} scope={selected.username} onClick={() => setUserKill(`/risk/admin/kill-switch/${selected.id}`, !selected.kill_switch.enabled, selected.username)} /> : null}
             </div>
             {data.users?.length ? (
               <div className="mt-5 space-y-4">
@@ -218,6 +280,23 @@ export default function AdminRiskLimitsPage() {
           </section>
 
           <p className="text-xs leading-5 text-slate-500">Kill switches stop new entries and cancel pending entries. Existing target and stop-loss protection remains active.</p>
+
+          {pendingGlobalKill !== null ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
+              <div role="dialog" aria-modal="true" aria-labelledby="global-kill-confirm-title" className="w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+                <h2 id="global-kill-confirm-title" className="text-lg font-semibold text-white">{pendingGlobalKill ? "Enable Global Kill Switch?" : "Disable Global Kill Switch?"}</h2>
+                <p className="mt-3 text-sm leading-6 text-slate-300">
+                  {pendingGlobalKill
+                    ? "This will block new trading entries across the platform according to the existing kill-switch safety rules."
+                    : "New trading entries may become eligible again for users whose strategies, permissions, broker connection, egress, risk limits, and all other safety checks allow trading. This does not place an order by itself."}
+                </p>
+                <div className="mt-6 flex justify-end gap-3">
+                  <button type="button" disabled={busy} onClick={() => setPendingGlobalKill(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
+                  <button type="button" disabled={busy} onClick={confirmGlobalKillChange} className={`rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 ${pendingGlobalKill ? "bg-rose-600" : "bg-emerald-600"}`}>{busy ? "Updating..." : pendingGlobalKill ? "Enable globally" : "Disable globally"}</button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </>
       )}
     </div>

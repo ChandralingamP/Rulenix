@@ -164,7 +164,7 @@ pub async fn update_profile(
             .flatten();
     let client_changed = stored_client.as_deref().unwrap_or("") != client_id;
     if client_changed {
-        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM strategy_execution_intents WHERE user_id=$1 AND action='ENTRY' AND status IN ('pending','claimed','retry_wait','submitted'))")
             .bind(current.id)
             .fetch_one(&mut *transaction)
             .await?;
@@ -311,7 +311,7 @@ pub async fn update_trading_mode(
         input.confirm_live.unwrap_or(false),
     )?;
     if mode != current.1 {
-        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+        let execution_in_flight: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=$1 AND status='open') OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=$1 AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')) OR EXISTS(SELECT 1 FROM strategy_execution_intents WHERE user_id=$1 AND action='ENTRY' AND status IN ('pending','claimed','retry_wait','submitted'))")
             .bind(user.id).fetch_one(&mut *tx).await?;
         if execution_in_flight {
             return Err(AppError::BadRequest(
