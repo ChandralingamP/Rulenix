@@ -460,9 +460,26 @@ pub async fn set_reconciliation_health(
     healthy: bool,
     detail: &str,
 ) -> AppResult<()> {
-    sqlx::query("INSERT INTO broker_reconciliation_health (user_id,healthy,detail,checked_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (user_id) DO UPDATE SET healthy=EXCLUDED.healthy,detail=EXCLUDED.detail,checked_at=NOW()")
+    sqlx::query("INSERT INTO broker_reconciliation_health (user_id,healthy,detail,checked_at,broker_credential_revision) SELECT $1,$2,$3,NOW(),p.broker_credential_revision FROM user_profiles p WHERE p.user_id=$1 ON CONFLICT (user_id) DO UPDATE SET healthy=EXCLUDED.healthy,detail=EXCLUDED.detail,checked_at=NOW(),broker_credential_revision=EXCLUDED.broker_credential_revision")
         .bind(user).bind(healthy).bind(detail).execute(&state.db).await?;
     Ok(())
+}
+
+pub async fn reconciliation_ready(state: &AppState, user: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM broker_reconciliation_health h
+            JOIN user_profiles p ON p.user_id=h.user_id
+            WHERE h.user_id=$1
+              AND h.healthy=TRUE
+              AND h.broker_credential_revision=p.broker_credential_revision
+              AND h.checked_at>NOW()-INTERVAL '5 minutes'
+        )",
+    )
+    .bind(user)
+    .fetch_one(&state.db)
+    .await?)
 }
 
 pub async fn cancel_pending_entries(

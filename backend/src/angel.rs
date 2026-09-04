@@ -776,6 +776,48 @@ pub async fn trade_book(
     .await
 }
 
+pub async fn conditional_rules(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    api_key: &str,
+    jwt_token: &str,
+) -> AppResult<Vec<Value>> {
+    let mut rules = Vec::new();
+    for page in 1..=100 {
+        wait_for_request_capacity(
+            state,
+            api_key,
+            "conditional-rules",
+            &[(1, StdDuration::from_millis(1_050))],
+        )
+        .await;
+        let value = secure_json(
+            state,
+            user_id,
+            reqwest::Method::POST,
+            "/rest/secure/angelbroking/gtt/v1/ruleList",
+            api_key,
+            jwt_token,
+            Some(json!({
+                "status":["NEW","CANCELLED","ACTIVE","SENTTOEXCHANGE","FORALL"],
+                "page":page,
+                "count":100
+            })),
+        )
+        .await?;
+        let batch = value.as_array().ok_or_else(|| {
+            AppError::BadRequest("Angel One returned a malformed conditional-order list.".into())
+        })?;
+        rules.extend(batch.iter().cloned());
+        if batch.len() < 100 {
+            return Ok(rules);
+        }
+    }
+    Err(AppError::BadRequest(
+        "Angel One conditional-order pagination exceeded the safety limit.".into(),
+    ))
+}
+
 pub async fn positions(
     state: &AppState,
     user_id: uuid::Uuid,

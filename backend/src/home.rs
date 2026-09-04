@@ -192,6 +192,11 @@ async fn finalize_session_tokens(
         transaction.rollback().await?;
         return Ok(false);
     }
+    sqlx::query("INSERT INTO broker_reconciliation_health(user_id,healthy,detail,checked_at,broker_credential_revision) VALUES($1,FALSE,'Fresh Angel session established; full broker reconciliation is pending.',NOW(),$2) ON CONFLICT(user_id) DO UPDATE SET healthy=FALSE,detail=EXCLUDED.detail,checked_at=NOW(),broker_credential_revision=EXCLUDED.broker_credential_revision")
+        .bind(user_id)
+        .bind(expected_revision)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -397,6 +402,10 @@ async fn refresh_tokens(state: &AppState, snapshot: &SessionSnapshot) -> AppResu
             .await?;
             if finalized {
                 tracing::info!(user_id=%snapshot.profile.user_id, "Angel One session tokens refreshed");
+                crate::strategy::refresh_after_broker_connect(
+                    state.clone(),
+                    snapshot.profile.user_id,
+                );
             }
             Ok(finalized)
         }
@@ -594,7 +603,7 @@ pub async fn connect(
     }
     let refreshed = session_snapshot(&state, user.id).await?;
     crate::logs::append(&user.username, "BROKER SESSION connected to Angel One").await;
-    crate::strategy::refresh_after_broker_connect(state.clone());
+    crate::strategy::refresh_after_broker_connect(state.clone(), user.id);
     Ok(Json(
         json!({"message":"Brokerage session established successfully.","last_connected_at":refreshed.profile.token_received_at,"details":details(&refreshed.profile, &refreshed.credentials)}),
     ))

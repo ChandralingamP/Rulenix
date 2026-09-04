@@ -3163,6 +3163,7 @@ fn live_submission_rejection(
     user_kill: bool,
     account: Option<(bool, bool, &str, &str)>,
     broker_credentials_present: bool,
+    broker_reconciled: bool,
 ) -> Option<(&'static str, &'static str)> {
     if force_demo {
         Some((
@@ -3206,6 +3207,10 @@ fn live_submission_rejection(
             Some(_) if !broker_credentials_present => Some((
                 "broker_session_missing",
                 "Live submission stopped because broker credentials are unavailable.",
+            )),
+            Some(_) if !broker_reconciled => Some((
+                "broker_reconciliation",
+                "Live submission stopped until a full broker reconciliation succeeds.",
             )),
             Some(_) => None,
         }
@@ -3638,32 +3643,8 @@ async fn place_strategy_order_inner(
         return Err(error);
     }
     if runner.trading_mode == "live" && !protective {
-        let credentials = entry_credentials
-            .as_ref()
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
-        match angel::order_book(
-            state,
-            runner.user_id,
-            &credentials.api_key,
-            &credentials.jwt_token,
-        )
-        .await
-        {
-            Ok(_) => {
-                live_reconciled = true;
-                risk::set_reconciliation_health(
-                    state,
-                    runner.user_id,
-                    true,
-                    "Broker order book reconciled before entry",
-                )
-                .await?;
-            }
-            Err(error) => {
-                risk::set_reconciliation_health(state, runner.user_id, false, &error.to_string())
-                    .await?;
-            }
-        }
+        Box::pin(reconcile_live_user_readiness(state, runner.user_id)).await?;
+        live_reconciled = true;
     }
     let price_refresh_error = if !protective {
         match refresh_snapshot_market_tick(state, snapshot).await {
@@ -3775,7 +3756,7 @@ async fn place_strategy_order_inner(
                 .bind(runner.user_id)
                 .fetch_one(&mut *tx)
                 .await?;
-            let account: Option<(bool, bool, String, String)> = sqlx::query_as("SELECT u.is_active,u.can_live_trade,COALESCE(p.trading_mode,'demo'),COALESCE(p.last_token_status,'') FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
+            let account: Option<(bool, bool, String, String, bool)> = sqlx::query_as("SELECT u.is_active,u.can_live_trade,COALESCE(p.trading_mode,'demo'),COALESCE(p.last_token_status,''),EXISTS(SELECT 1 FROM broker_reconciliation_health h WHERE h.user_id=u.id AND h.healthy=TRUE AND h.broker_credential_revision=p.broker_credential_revision AND h.checked_at>NOW()-INTERVAL '5 minutes') FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
                 .bind(runner.user_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -3789,6 +3770,7 @@ async fn place_strategy_order_inner(
                 entry_credentials.as_ref().is_some_and(|credentials| {
                     !credentials.api_key.is_empty() && !credentials.jwt_token.is_empty()
                 }),
+                account.as_ref().is_some_and(|value| value.4),
             );
             let claimed = if let Some((code, message)) = rejection {
                 let rejected = sqlx::query("UPDATE strategy_orders SET status='rejected',broker_error_class='risk',broker_error_code=$2,broker_status=$3,state_version=state_version+1,updated_at=NOW() WHERE id=$1 AND status='pending'")
@@ -6032,8 +6014,11 @@ pub fn start(state: AppState) {
     });
 }
 
-pub fn refresh_after_broker_connect(state: AppState) {
+pub fn refresh_after_broker_connect(state: AppState, user_id: Uuid) {
     tokio::spawn(async move {
+        if let Err(error) = reconcile_live_user_readiness(&state, user_id).await {
+            tracing::warn!(%user_id, %error, "broker-connect full reconciliation failed; LIVE entries remain blocked");
+        }
         let now = ist_now();
         if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
             return;
@@ -6260,11 +6245,12 @@ impl StoredOrder {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReconciliationAudience {
     connected: Vec<Uuid>,
+    needs_full_readiness: Vec<Uuid>,
     disconnected: Vec<Uuid>,
 }
 
 async fn reconciliation_audience(state: &AppState) -> AppResult<ReconciliationAudience> {
-    let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+    let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(
         "SELECT u.id,
                 COALESCE(p.last_token_status IN ('success','refreshed'),FALSE)
                 AND EXISTS(
@@ -6274,7 +6260,31 @@ async fn reconciliation_audience(state: &AppState) -> AppResult<ReconciliationAu
                 AND EXISTS(
                     SELECT 1 FROM broker_secrets jwt
                     WHERE jwt.user_id=u.id AND jwt.secret_kind='jwt_token'
-                ) AS connected
+                ) AS connected,
+                NOT EXISTS(
+                    SELECT 1
+                    FROM broker_reconciliation_health h
+                    WHERE h.user_id=u.id
+                      AND h.healthy=TRUE
+                      AND h.broker_credential_revision=p.broker_credential_revision
+                      AND h.checked_at>NOW()-INTERVAL '5 minutes'
+                )
+                AND (
+                    NOT EXISTS(SELECT 1 FROM broker_reconciliation_health h WHERE h.user_id=u.id)
+                    OR EXISTS(
+                        SELECT 1 FROM broker_reconciliation_health h
+                        WHERE h.user_id=u.id
+                          AND (
+                              h.healthy=FALSE
+                              AND h.checked_at<=NOW()-INTERVAL '30 seconds'
+                              OR
+                              h.broker_credential_revision IS DISTINCT FROM p.broker_credential_revision
+                              OR h.checked_at<=NOW()-INTERVAL '5 minutes'
+                              OR h.detail='Full broker readiness reconciliation is required after deployment.'
+                              OR h.detail='Fresh Angel session established; full broker reconciliation is pending.'
+                          )
+                    )
+                ) AS needs_full_readiness
          FROM users u
          LEFT JOIN user_profiles p ON p.user_id=u.id
          WHERE (
@@ -6304,9 +6314,13 @@ async fn reconciliation_audience(state: &AppState) -> AppResult<ReconciliationAu
     .fetch_all(&state.db)
     .await?;
     let mut audience = ReconciliationAudience::default();
-    for (user_id, connected) in rows {
+    for (user_id, connected, needs_full_readiness) in rows {
         if connected {
-            audience.connected.push(user_id);
+            if needs_full_readiness {
+                audience.needs_full_readiness.push(user_id);
+            } else {
+                audience.connected.push(user_id);
+            }
         } else {
             audience.disconnected.push(user_id);
         }
@@ -6328,6 +6342,13 @@ async fn reconcile_live(state: &AppState) -> AppResult<()> {
         .execute(&state.db).await?;
     let audience = reconciliation_audience(state).await?;
     for user_id in audience.disconnected {
+        let _ = risk::set_reconciliation_health(
+            state,
+            user_id,
+            false,
+            "Angel session is disconnected; LIVE entries remain blocked.",
+        )
+        .await;
         operational_alert(
             state,
             Some(user_id),
@@ -6339,6 +6360,10 @@ async fn reconcile_live(state: &AppState) -> AppResult<()> {
         .await;
     }
     let mut tasks = tokio::task::JoinSet::new();
+    for user_id in audience.needs_full_readiness {
+        let state = state.clone();
+        tasks.spawn(async move { reconcile_live_user_readiness(&state, user_id).await });
+    }
     for user_id in audience.connected {
         let state = state.clone();
         tasks.spawn(async move { reconcile_live_user(&state, user_id).await });
@@ -7519,7 +7544,29 @@ fn reconciled_state(status: &str, filled: i32) -> &'static str {
     }
 }
 
-async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
+fn broker_order_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "complete" | "completed" | "filled" | "cancelled" | "canceled" | "rejected" | "expired"
+    )
+}
+
+fn conditional_rule_is_active(rule: &Value) -> bool {
+    let status = broker_text(rule, &["status", "ruleStatus", "rulestatus"])
+        .unwrap_or("")
+        .trim()
+        .to_uppercase();
+    !matches!(
+        status.as_str(),
+        "CANCELLED" | "CANCELED" | "REJECTED" | "EXPIRED" | "COMPLETED" | "COMPLETE"
+    )
+}
+
+async fn reconcile_live_user_with_scope(
+    state: &AppState,
+    user_id: Uuid,
+    full_readiness: bool,
+) -> AppResult<()> {
     let credentials = state.credentials.load(user_id).await?;
     let values =
         match angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
@@ -7539,7 +7586,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
                 ),
             )
             .await;
-                return Ok(());
+                return Err(error);
             }
         };
     let positions = match angel::positions(
@@ -7555,7 +7602,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             let _ =
                 risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
             operational_alert(state,Some(user_id),"","broker_position_reconcile_failed","error",&format!("Angel One net-position reconciliation failed; new live entries are blocked: {error}")).await;
-            return Ok(());
+            return Err(error);
         }
     };
     let broker_positions = parse_broker_positions(&positions);
@@ -7575,7 +7622,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             .find(|position| position.exchange == *exchange && position.token == *token)
             .is_none_or(|position| position.net_quantity == 0)
     });
-    let trade_book = if needs_trade_book {
+    let trade_book = if full_readiness || needs_trade_book {
         match angel::trade_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
         {
             Ok(value) => Some(value),
@@ -7583,7 +7630,22 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
                 let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
                     .await;
                 operational_alert(state,Some(user_id),"","broker_trade_reconcile_failed","error",&format!("Angel One trade-book reconciliation failed; a broker-flat local trade will remain unresolved: {error}")).await;
-                return Ok(());
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let conditional_rules = if full_readiness {
+        match angel::conditional_rules(state, user_id, &credentials.api_key, &credentials.jwt_token)
+            .await
+        {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
+                    .await;
+                operational_alert(state,Some(user_id),"","broker_conditional_reconcile_failed","error",&format!("Angel One conditional-order reconciliation failed; new live entries remain blocked: {error}")).await;
+                return Err(error);
             }
         }
     } else {
@@ -7785,14 +7847,106 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
         }
     }
     reconcile_broker_positions(state, user_id, &positions, trade_book.as_ref()).await?;
-    risk::set_reconciliation_health(
-        state,
-        user_id,
-        true,
-        "Broker order and net-position books reconciled",
-    )
-    .await?;
+    let unresolved_incidents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_position_incidents WHERE user_id=$1 AND status IN ('open','operator_required')")
+        .bind(user_id).fetch_one(&state.db).await?;
+    if unresolved_incidents > 0 {
+        risk::set_reconciliation_health(
+            state,
+            user_id,
+            false,
+            "Broker/local position reconciliation has unresolved incidents.",
+        )
+        .await?;
+        if full_readiness {
+            return Err(AppError::BadRequest(
+                "Full broker reconciliation found unresolved position exposure.".into(),
+            ));
+        }
+    }
+    if full_readiness {
+        let known_orders: Vec<(String, String)> = sqlx::query_as("SELECT broker_order_id,client_order_id FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND (broker_order_id<>'' OR client_order_id<>'')")
+            .bind(user_id).fetch_all(&state.db).await?;
+        let known_ids: HashSet<String> = known_orders
+            .iter()
+            .flat_map(|(broker_id, client_id)| [broker_id, client_id])
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        let mut active_unknown_orders = 0_i64;
+        let mut structurally_unknown_orders = 0_i64;
+        for item in values.as_array().into_iter().flatten() {
+            let status = broker_text(item, &["status", "orderstatus", "orderStatus"])
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if broker_order_is_terminal(&status) {
+                continue;
+            }
+            let broker_id = broker_text(item, &["orderid", "orderId"]).unwrap_or("");
+            let client_id = broker_text(item, &["ordertag", "orderTag"]).unwrap_or("");
+            if status.is_empty() {
+                structurally_unknown_orders += 1;
+            } else if !known_ids.contains(broker_id) && !known_ids.contains(client_id) {
+                active_unknown_orders += 1;
+            }
+        }
+        let active_conditionals = conditional_rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|rule| conditional_rule_is_active(rule))
+            .count() as i64;
+        let ambiguous_local_orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous')")
+            .bind(user_id).fetch_one(&state.db).await?;
+        let broker_mutation_blockers =
+            active_unknown_orders + structurally_unknown_orders + active_conditionals;
+        if broker_mutation_blockers > 0 {
+            let blocker_detail = format!(
+                "Full broker reconciliation found external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}."
+            );
+            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'open',$2,$3,$4,$5,NOW(),NOW(),NULL) ON CONFLICT(user_id) DO UPDATE SET status='open',external_active_orders=EXCLUDED.external_active_orders,structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=EXCLUDED.active_conditional_rules,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL")
+                .bind(user_id)
+                .bind(active_unknown_orders)
+                .bind(structurally_unknown_orders)
+                .bind(active_conditionals)
+                .bind(&blocker_detail)
+                .execute(&state.db)
+                .await?;
+        } else {
+            sqlx::query("UPDATE broker_reconciliation_blockers SET status='resolved',external_active_orders=0,structurally_unknown_orders=0,active_conditional_rules=0,detail='Authoritative full broker reconciliation found no unresolved broker mutations.',last_checked_at=NOW(),resolved_at=NOW() WHERE user_id=$1 AND status='open'")
+                .bind(user_id)
+                .execute(&state.db)
+                .await?;
+        }
+        if unresolved_incidents > 0 || broker_mutation_blockers > 0 || ambiguous_local_orders > 0 {
+            let detail = format!(
+                "Full broker reconciliation is unsafe: incidents={unresolved_incidents}, external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}, ambiguous_local_orders={ambiguous_local_orders}."
+            );
+            risk::set_reconciliation_health(state, user_id, false, &detail).await?;
+            return Err(AppError::BadRequest(detail));
+        }
+        risk::set_reconciliation_health(
+            state,
+            user_id,
+            true,
+            "Full Angel positions, orders, trades, and conditional state reconciled.",
+        )
+        .await?;
+        if !risk::reconciliation_ready(state, user_id).await? {
+            return Err(AppError::BadRequest(
+                "Broker reconciliation completed against a stale credential revision.".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
+    reconcile_live_user_with_scope(state, user_id, false).await
+}
+
+async fn reconcile_live_user_readiness(state: &AppState, user_id: Uuid) -> AppResult<()> {
+    reconcile_live_user_with_scope(state, user_id, true).await
 }
 
 type ProtectionRecoveryRow = (
@@ -11261,12 +11415,14 @@ mod tests {
         placed_orders: Arc<tokio::sync::Mutex<Vec<Value>>>,
         order_book: Arc<tokio::sync::Mutex<Vec<Value>>>,
         trade_book: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        conditional_rules: Arc<tokio::sync::Mutex<Vec<Value>>>,
         positions: Arc<tokio::sync::Mutex<Vec<Value>>>,
         cancelled_orders: Arc<tokio::sync::Mutex<Vec<String>>>,
         place_modes: Arc<tokio::sync::Mutex<VecDeque<FakePlaceMode>>>,
         cancel_modes: Arc<tokio::sync::Mutex<VecDeque<FakeCancelMode>>>,
         quote_ltps: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
         quote_unavailable: Arc<tokio::sync::Mutex<bool>>,
+        conditional_unavailable: Arc<tokio::sync::Mutex<bool>>,
     }
 
     #[derive(Clone, Copy)]
@@ -11389,6 +11545,26 @@ mod tests {
         }))
     }
 
+    async fn fake_conditional_rules(
+        State(fake): State<DeterministicFakeBroker>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        if *fake.conditional_unavailable.lock().await {
+            tokio::time::sleep(StdDuration::from_millis(600)).await;
+            return (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"status":false,"message":"conditional read timed out","data":null})),
+            );
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "status":true,
+                "message":"SUCCESS",
+                "data":fake.conditional_rules.lock().await.clone()
+            })),
+        )
+    }
+
     async fn fake_rms_limits() -> Json<Value> {
         Json(json!({
             "status":true,"message":"SUCCESS",
@@ -11480,6 +11656,10 @@ mod tests {
                 get(fake_trade_book),
             )
             .route(
+                "/rest/secure/angelbroking/gtt/v1/ruleList",
+                post(fake_conditional_rules),
+            )
+            .route(
                 "/rest/secure/angelbroking/order/v1/cancelOrder",
                 post(fake_cancel_order),
             )
@@ -11559,6 +11739,31 @@ mod tests {
         }])
         .await;
         (user_id, snapshot_id, trade_id, token, symbol)
+    }
+
+    async fn seed_flat_linked_live_account(state: &AppState, prefix: &str) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,can_live_trade) VALUES($1,$2,$3,'test-only',TRUE)")
+            .bind(user_id)
+            .bind(format!("{prefix}-user"))
+            .bind(format!("{prefix}@example.test"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_profiles(user_id,trading_mode,last_token_status,token_state,broker_credential_revision) VALUES($1,'live','success','connected',7)")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state
+            .credentials
+            .put(
+                user_id,
+                &[("api_key", "fake-api"), ("jwt_token", "fake-jwt")],
+            )
+            .await
+            .unwrap();
+        user_id
     }
 
     async fn seed_live_supertrend_square_off_fixture(
@@ -13294,7 +13499,8 @@ mod tests {
         let audience = reconciliation_audience(&state)
             .await
             .expect("reconciliation audience query must succeed");
-        assert_eq!(audience.connected, vec![user_id]);
+        assert!(audience.connected.is_empty());
+        assert_eq!(audience.needs_full_readiness, vec![user_id]);
         assert!(audience.disconnected.is_empty());
         let active_orders: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1")
@@ -14339,11 +14545,11 @@ mod tests {
     fn live_submission_guard_rechecks_kills_account_mode_and_session() {
         let safe = Some((true, true, "live", "success"));
         assert_eq!(
-            live_submission_rejection(false, false, false, safe, true),
+            live_submission_rejection(false, false, false, safe, true, true),
             None
         );
         assert_eq!(
-            live_submission_rejection(false, true, false, safe, true).map(|value| value.0),
+            live_submission_rejection(false, true, false, safe, true, true).map(|value| value.0),
             Some("global_kill_switch")
         );
         assert_eq!(
@@ -14352,6 +14558,7 @@ mod tests {
                 false,
                 false,
                 Some((true, false, "live", "success")),
+                true,
                 true,
             )
             .map(|value| value.0),
@@ -14364,13 +14571,18 @@ mod tests {
                 false,
                 Some((true, true, "demo", "success")),
                 true,
+                true,
             )
             .map(|value| value.0),
             Some("trading_mode_changed")
         );
         assert_eq!(
-            live_submission_rejection(false, false, false, safe, false).map(|value| value.0),
+            live_submission_rejection(false, false, false, safe, false, true).map(|value| value.0),
             Some("broker_session_missing")
+        );
+        assert_eq!(
+            live_submission_rejection(false, false, false, safe, true, false).map(|value| value.0),
+            Some("broker_reconciliation")
         );
     }
 
@@ -14895,6 +15107,11 @@ mod tests {
             ("buy", "BUY", "SELL", "SELL"),
             ("sell", "SELL", "BUY", "BUY"),
         ] {
+            // Each iteration represents a distinct Angel account. The shared fake
+            // server must not leak the prior account's broker book into this one.
+            fake.order_book.lock().await.clear();
+            fake.trade_book.lock().await.clear();
+            fake.positions.lock().await.clear();
             let (user_id, snapshot_id, trade_id, token, _) =
                 seed_live_futures_protection_fixture(&state, &format!("reversal-{index}")).await;
             sqlx::query("UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=DATE '2026-09-30' WHERE id=$1")
@@ -15107,6 +15324,160 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 1);
         broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn deployment_safety_inventory_covers_all_durable_live_exposure() {
+        let state = isolated_test_state().await;
+        let user_id = seed_flat_linked_live_account(&state, "deployment-inventory").await;
+        let snapshot_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key,underlying_token) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','','deployment-token','DEPLOYMENTFUT',CURRENT_DATE+30,10,'MCX','CARRYFORWARD','deployment-inventory','')")
+            .bind(snapshot_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+
+        async fn inventory(
+            state: &AppState,
+            user_id: Uuid,
+        ) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+            sqlx::query_as("SELECT open_live_trades,unresolved_closed_live_trades,unresolved_live_orders,unresolved_live_execution_intents,unresolved_live_reversals,unresolved_live_manual_closes,unresolved_broker_incidents,unresolved_broker_mutations FROM broker_deployment_account_safety WHERE user_id=$1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+        }
+        assert_eq!(inventory(&state, user_id).await, (0, 0, 0, 0, 0, 0, 0, 0));
+
+        let trade_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'live','open','BUY',10,100,100,0,NOW(),'GOLDTEN','DEPLOYMENTFUT','deployment inventory',$3,$4,1,1,'PROTECTION_REQUIRED')")
+            .bind(trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.0, 1);
+
+        let order_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,status,broker_order_id,broker_status,idempotency_key,client_order_id) VALUES($1,$2,$3,'deployment-pending','BUY_ENTRY','BUY','MARKET','live',1,10,100,'pending','','','deployment-pending-key','deployment-pending-tag')")
+            .bind(order_id).bind(user_id).bind(snapshot_id).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.2, 1);
+
+        let signal_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,signal_type) VALUES($1,$2,'GOLDTEN','deployment-signal',NOW(),'BUY_ENTRY')")
+            .bind(signal_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO strategy_execution_intents(id,signal_id,user_id,snapshot_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,quantity,price,status) VALUES($1,$2,$3,$4,$5,'GOLDTEN','deployment-intent','ENTRY','BUY_ENTRY','BUY','MARKET',1,10,100,'claimed')")
+            .bind(Uuid::new_v4()).bind(signal_id).bind(user_id).bind(snapshot_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.3, 1);
+
+        sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_reason='SL2',exit_price=98,exit_datetime=NOW(),broker_net_quantity=0 WHERE id=$1")
+            .bind(trade_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO strategy_reversal_intents(source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key,status) VALUES($1,$2,$3,'GOLDTEN','BUY','SELL',1,98,$4,'waiting')")
+            .bind(trade_id).bind(user_id).bind(snapshot_id).bind(sl2_reversal_session(trade_id)).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.4, 1);
+
+        let manual_trade_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'live','open','SELL',10,100,100,0,NOW(),'GOLDTEN','DEPLOYMENTFUT','manual deployment inventory',$3,$4,1,1,'PROTECTED')")
+            .bind(manual_trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO manual_trade_close_intents(trade_id,user_id,requested_quantity,close_side,status) VALUES($1,$2,10,'BUY','ambiguous')")
+            .bind(manual_trade_id).bind(user_id).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.5, 1);
+
+        sqlx::query("INSERT INTO broker_position_incidents(id,user_id,strategy_key,instrument,exchange_segment,contract_token,contract_symbol,incident_type,status,broker_quantity,local_quantity,detail) VALUES($1,$2,$3,'GOLDTEN','MCX','deployment-token','DEPLOYMENTFUT','QUANTITY_OR_DIRECTION_MISMATCH','operator_required',0,10,'deployment inventory')")
+            .bind(Uuid::new_v4()).bind(user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.6, 1);
+
+        sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,detail) VALUES($1,'open',1,'deployment inventory')")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        assert_eq!(inventory(&state, user_id).await.7, 1);
+
+        sqlx::query("UPDATE trades SET safety_status='CLOSED',broker_net_quantity=5 WHERE id=$1")
+            .bind(trade_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(inventory(&state, user_id).await.1, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn full_reconciliation_controls_revision_bound_live_readiness() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let user_id = seed_flat_linked_live_account(&state, "readiness").await;
+        risk::set_reconciliation_health(&state, user_id, false, "offline")
+            .await
+            .unwrap();
+        assert!(!risk::reconciliation_ready(&state, user_id).await.unwrap());
+
+        reconcile_live_user_readiness(&state, user_id)
+            .await
+            .unwrap();
+        assert!(risk::reconciliation_ready(&state, user_id).await.unwrap());
+
+        *fake.positions.lock().await = vec![json!({
+            "exchange":"MCX", "symboltoken":"external-token",
+            "tradingsymbol":"EXTERNALFUT", "producttype":"CARRYFORWARD",
+            "netqty":"10", "avgnetprice":"100"
+        })];
+        assert!(
+            reconcile_live_user_readiness(&state, user_id)
+                .await
+                .is_err()
+        );
+        assert!(!risk::reconciliation_ready(&state, user_id).await.unwrap());
+        let incident: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_position_incidents WHERE user_id=$1 AND status IN ('open','operator_required')")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(incident, 1);
+
+        *fake.positions.lock().await = Vec::new();
+        sqlx::query("UPDATE broker_position_incidents SET status='resolved',resolved_at=NOW() WHERE user_id=$1")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        *fake.order_book.lock().await = vec![json!({
+            "orderid":"EXTERNAL-ACTIVE-1", "status":"open",
+            "transactiontype":"BUY", "quantity":"10",
+            "tradingsymbol":"EXTERNALFUT", "symboltoken":"external-token"
+        })];
+        assert!(
+            reconcile_live_user_readiness(&state, user_id)
+                .await
+                .is_err()
+        );
+        let durable_blocker: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_reconciliation_blockers WHERE user_id=$1 AND status='open'")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(durable_blocker, 1);
+
+        fake.order_book.lock().await.clear();
+        *fake.conditional_unavailable.lock().await = true;
+        assert!(
+            reconcile_live_user_readiness(&state, user_id)
+                .await
+                .is_err()
+        );
+        assert!(!risk::reconciliation_ready(&state, user_id).await.unwrap());
+        let blocker_survives_read_failure: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_reconciliation_blockers WHERE user_id=$1 AND status='open'")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(blocker_survives_read_failure, 1);
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn disconnected_flat_account_is_live_blocked_without_platform_exposure() {
+        let state = isolated_test_state().await;
+        let user_id = seed_flat_linked_live_account(&state, "offline-flat").await;
+        state
+            .credentials
+            .put(user_id, &[("jwt_token", "")])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_profiles SET last_token_status='invalid',token_state='invalid' WHERE user_id=$1")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        let audience = reconciliation_audience(&state).await.unwrap();
+        assert_eq!(audience.disconnected, vec![user_id]);
+        let local_total: i64 = sqlx::query_scalar("SELECT open_live_trades+unresolved_closed_live_trades+unresolved_live_orders+unresolved_live_execution_intents+unresolved_live_reversals+unresolved_live_manual_closes+unresolved_broker_incidents+unresolved_broker_mutations FROM broker_deployment_account_safety WHERE user_id=$1")
+            .bind(user_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(local_total, 0);
+        assert!(
+            reconcile_live_user_readiness(&state, user_id)
+                .await
+                .is_err()
+        );
+        assert!(!risk::reconciliation_ready(&state, user_id).await.unwrap());
     }
 
     #[test]
