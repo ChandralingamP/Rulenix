@@ -58,6 +58,30 @@ export const exportTrades = createAsyncThunk(
   }
 );
 
+export const closeTrade = createAsyncThunk(
+  "pnl/closeTrade",
+  async (tradeId, thunkAPI) => {
+    try {
+      const username = getAuthUsername();
+      if (!username) {
+        return thunkAPI.rejectWithValue({
+          tradeId,
+          message: "Session expired. Please sign in again.",
+        });
+      }
+      const response = await apiClient.post(`/pnl/trades/${tradeId}/close`);
+      return { tradeId, ...response.data };
+    } catch (error) {
+      return thunkAPI.rejectWithValue({
+        tradeId,
+        message:
+          error.response?.data?.detail ||
+          "Unable to request an authoritative broker close",
+      });
+    }
+  }
+);
+
 const initialState = {
   entries: [],
   status: "idle",
@@ -72,6 +96,9 @@ const initialState = {
   exporting: false,
   exportError: null,
   mode: "all",
+  closingTradeId: null,
+  closeError: null,
+  closeMessage: null,
 };
 
 const pnlSlice = createSlice({
@@ -134,6 +161,20 @@ const pnlSlice = createSlice({
       .addCase(exportTrades.rejected, (state, action) => {
         state.exporting = false;
         state.exportError = action.payload;
+      })
+      .addCase(closeTrade.pending, (state, action) => {
+        state.closingTradeId = action.meta.arg;
+        state.closeError = null;
+        state.closeMessage = null;
+      })
+      .addCase(closeTrade.fulfilled, (state, action) => {
+        state.closingTradeId = null;
+        state.closeMessage = action.payload.message;
+      })
+      .addCase(closeTrade.rejected, (state, action) => {
+        state.closingTradeId = null;
+        state.closeError =
+          action.payload?.message || "Unable to request broker close";
       });
   },
 });

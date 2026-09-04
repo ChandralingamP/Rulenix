@@ -29,6 +29,8 @@ pub struct TradeRow {
     pub id: Uuid,
     pub execution_mode: String,
     pub status: String,
+    pub safety_status: String,
+    pub manual_close_status: Option<String>,
     pub strategy_key: String,
     pub strategy_name: String,
     pub direction: String,
@@ -64,6 +66,8 @@ const TRADE_ROWS_SQL: &str = r#"
         id,
         execution_mode,
         status,
+        safety_status,
+        (SELECT status FROM manual_trade_close_intents close_intent WHERE close_intent.trade_id=trades.id) AS manual_close_status,
         strategy_key,
         CASE strategy_key
             WHEN 'futures_breakout_v3' THEN 'Futures Breakout v3'

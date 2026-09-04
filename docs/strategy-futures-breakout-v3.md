@@ -155,6 +155,15 @@ Rules:
 - Opposite-side trades and valid reversals remain allowed.
 - Existing trades are not manually closed just because a new signal appears.
 
+## SL2 reversal execution
+
+- A reversal is created only from a fully processed `SL2` execution. A price touch, trigger-pending order, submitted stop, or partial fill is not sufficient.
+- The source trade is closed first and a unique durable `strategy_reversal_intents.source_trade_id` row is committed in the same transaction as the SL2 fill accounting.
+- The reversal entry keeps the source trade ID as lineage, but is validated as a new `BUY_ENTRY`/`SELL_ENTRY`, not as an exit against the already-closed source trade.
+- LIVE reversals wait for a successful broker position reconciliation proving the source contract flat. DEMO reversals use the deterministic simulated-fill path and never call Angel One.
+- The normal entry pipeline remains authoritative for kill switches, LIVE permission, session health, egress selection, risk limits, quantity validation, idempotency, and ambiguous-write handling.
+- Restarts reclaim durable intents and reuse the stable reversal session key, so repeated fill/reconciliation observations cannot create a second reversal order.
+
 This prevents rows like repeated SELL entries at the same level while keeping legitimate opposite-side/reversal behavior.
 
 ## Demo vs live execution

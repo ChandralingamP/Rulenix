@@ -751,6 +751,31 @@ pub async fn order_book(
     .await
 }
 
+pub async fn trade_book(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    api_key: &str,
+    jwt_token: &str,
+) -> AppResult<Value> {
+    wait_for_request_capacity(
+        state,
+        api_key,
+        "trade-book",
+        &[(1, StdDuration::from_millis(1_050))],
+    )
+    .await;
+    secure_json(
+        state,
+        user_id,
+        reqwest::Method::GET,
+        "/rest/secure/angelbroking/order/v1/getTradeBook",
+        api_key,
+        jwt_token,
+        None,
+    )
+    .await
+}
+
 pub async fn positions(
     state: &AppState,
     user_id: uuid::Uuid,

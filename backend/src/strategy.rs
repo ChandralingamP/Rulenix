@@ -3469,7 +3469,7 @@ async fn place_strategy_order_inner(
             order.lots
         )));
     }
-    if entry_order && order.trade_id.is_none() {
+    if entry_order {
         let expected_quantity = lot_size
             .checked_mul(order.lots)
             .ok_or_else(|| AppError::BadRequest("Order quantity overflow.".into()))?;
@@ -3485,7 +3485,35 @@ async fn place_strategy_order_inner(
                 order_lots = order.lots
             )));
         }
-        if snapshot.strategy_key == STRATEGY_KEY
+        if let Some(source_trade_id) = order.trade_id {
+            let valid_reversal_source: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM strategy_reversal_intents i
+                    JOIN trades source ON source.id=i.source_trade_id
+                    WHERE i.source_trade_id=$1
+                      AND i.user_id=$2
+                      AND i.snapshot_id=$3
+                      AND i.order_session_key=$4
+                      AND i.status='processing'
+                      AND source.status='closed'
+                      AND source.exit_reason='SL2'
+                      AND i.reversal_direction=$5
+                )",
+            )
+            .bind(source_trade_id)
+            .bind(runner.user_id)
+            .bind(snapshot.id)
+            .bind(session)
+            .bind(order.side)
+            .fetch_one(&state.db)
+            .await?;
+            if !valid_reversal_source {
+                return Err(AppError::BadRequest(
+                    "Entry order has no claimed, authoritative SL2 reversal intent.".into(),
+                ));
+            }
+        } else if snapshot.strategy_key == STRATEGY_KEY
             && user_has_breakout_open_position(state, runner.user_id, &snapshot.instrument).await?
         {
             return Err(AppError::BadRequest(format!(
@@ -5250,6 +5278,8 @@ fn recorded_exit_reason(strategy_key: &str, role: &str, session_key: &str) -> &'
         "MARKET_CLOSED"
     } else if session_key.starts_with("strev-") {
         "SIGNAL_REVERSAL"
+    } else if session_key.starts_with("mc-") {
+        "MANUAL_RULENIX_CLOSE"
     } else if role == "EMERGENCY_CLOSE" {
         "EMERGENCY_CLOSE"
     } else if strategy_key == STRATEGY_KEY {
@@ -6488,6 +6518,140 @@ struct BrokerNetPosition {
     raw: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct BrokerTradeFill {
+    order_id: String,
+    exchange: String,
+    token: String,
+    symbol: String,
+    side: String,
+    quantity: i32,
+    price: f64,
+    filled_at: DateTime<Utc>,
+}
+
+fn parse_broker_fill_time(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+        return Some(value.with_timezone(&Utc));
+    }
+    let raw = value.trim();
+    for format in [
+        "%d-%b-%Y %H:%M:%S",
+        "%d%b%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(value) = NaiveDateTime::parse_from_str(raw, format) {
+            return FixedOffset::east_opt(19_800)?
+                .from_local_datetime(&value)
+                .single()
+                .map(|value| value.with_timezone(&Utc));
+        }
+    }
+    None
+}
+
+fn parse_broker_trade_fills(value: &Value) -> Vec<BrokerTradeFill> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let quantity = broker_i32(
+                item,
+                &[
+                    "fillsize",
+                    "fillSize",
+                    "filledshares",
+                    "filledShares",
+                    "quantity",
+                ],
+            )?;
+            let price = broker_f64(item, &["fillprice", "fillPrice", "averageprice"])?;
+            let side = broker_text(item, &["transactiontype", "transactionType", "side"])?
+                .trim()
+                .to_uppercase();
+            let filled_at = broker_text(
+                item,
+                &[
+                    "filltime",
+                    "fillTime",
+                    "tradetime",
+                    "tradeTime",
+                    "updatetime",
+                ],
+            )
+            .and_then(parse_broker_fill_time)?;
+            let fill = BrokerTradeFill {
+                order_id: broker_text(item, &["orderid", "orderId"])?
+                    .trim()
+                    .to_owned(),
+                exchange: broker_text(item, &["exchange"])?.trim().to_uppercase(),
+                token: broker_text(item, &["symboltoken", "symbolToken"])?
+                    .trim()
+                    .to_owned(),
+                symbol: broker_text(item, &["tradingsymbol", "tradingSymbol"])
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned(),
+                side,
+                quantity,
+                price,
+                filled_at,
+            };
+            (!fill.order_id.is_empty()
+                && matches!(fill.side.as_str(), "BUY" | "SELL")
+                && fill.quantity > 0
+                && fill.price.is_finite()
+                && fill.price > 0.0)
+                .then_some(fill)
+        })
+        .collect()
+}
+
+struct ManualFillExpectation<'a> {
+    exchange: &'a str,
+    token: &'a str,
+    symbol: &'a str,
+    direction: &'a str,
+    quantity: i32,
+    entry_at: DateTime<Utc>,
+    known_order_ids: &'a HashSet<String>,
+}
+
+fn attributable_manual_flat_fill(
+    fills: &[BrokerTradeFill],
+    expected: &ManualFillExpectation<'_>,
+) -> Option<f64> {
+    let exit_side = if expected.direction == "BUY" {
+        "SELL"
+    } else {
+        "BUY"
+    };
+    let matching: Vec<&BrokerTradeFill> = fills
+        .iter()
+        .filter(|fill| {
+            fill.exchange.eq_ignore_ascii_case(expected.exchange)
+                && fill.token == expected.token
+                && (expected.symbol.is_empty() || fill.symbol.eq_ignore_ascii_case(expected.symbol))
+                && fill.side == exit_side
+                && fill.filled_at >= expected.entry_at
+                && !expected.known_order_ids.contains(&fill.order_id)
+        })
+        .collect();
+    let total: i64 = matching.iter().map(|fill| i64::from(fill.quantity)).sum();
+    if total != i64::from(expected.quantity) || total <= 0 {
+        return None;
+    }
+    Some(
+        matching
+            .iter()
+            .map(|fill| fill.price * f64::from(fill.quantity))
+            .sum::<f64>()
+            / total as f64,
+    )
+}
+
 fn position_mismatch_type(broker_quantity: i32, local_quantity: i32) -> Option<&'static str> {
     if broker_quantity == local_quantity {
         None
@@ -6793,12 +6957,16 @@ type LocalBrokerPositionRow = (
     String,
     String,
     Option<i32>,
+    DateTime<Utc>,
+    String,
+    f64,
 );
 
 async fn reconcile_broker_positions(
     state: &AppState,
     user_id: Uuid,
     value: &Value,
+    trade_book: Option<&Value>,
 ) -> AppResult<()> {
     let broker_positions = parse_broker_positions(value);
     let broker_by_key: HashMap<(String, String), BrokerNetPosition> = broker_positions
@@ -6820,7 +6988,7 @@ async fn reconcile_broker_positions(
             .bind(broker.map(|position| position.average_price).filter(|value| *value>0.0))
             .execute(&state.db).await?;
     }
-    let locals: Vec<LocalBrokerPositionRow> = sqlx::query_as("SELECT t.id,t.strategy_key,t.instrument_label,t.direction,s.exchange_segment,s.contract_token,t.quantity,t.entry_price::float8,t.safety_status,t.exposure_origin,s.lot_size FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open' AND s.contract_token IS NOT NULL")
+    let locals: Vec<LocalBrokerPositionRow> = sqlx::query_as("SELECT t.id,t.strategy_key,t.instrument_label,t.direction,s.exchange_segment,s.contract_token,t.quantity,t.entry_price::float8,t.safety_status,t.exposure_origin,s.lot_size,t.entry_datetime,COALESCE(t.contract_symbol,''),t.pnl::float8 FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open' AND s.contract_token IS NOT NULL")
         .bind(user_id).fetch_all(&state.db).await?;
     let mut local_groups: HashMap<(String, String), Vec<LocalBrokerPositionRow>> = HashMap::new();
     for mut local in locals {
@@ -6846,19 +7014,6 @@ async fn reconcile_broker_positions(
             local.3 = verified_direction.to_owned();
             local.6 = verified_quantity;
         }
-        if broker_quantity == 0 && matches!(local.8.as_str(), "CLOSING" | "EMERGENCY_CLOSING") {
-            cancel_active_exits(state, user_id, local.0).await?;
-            cancel_active_emergency_closes(state, user_id, local.0).await?;
-            let active_protection: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2','EMERGENCY_CLOSE') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
-                .bind(local.0).fetch_one(&state.db).await?;
-            if !active_protection {
-                sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_price=last_price,exit_datetime=NOW(),exit_reason='BROKER_RECONCILED_FLAT',broker_net_quantity=0,last_position_reconciled_at=NOW(),notes=CONCAT(notes,'; broker position confirmed flat during close reconciliation'),updated_at=NOW() WHERE id=$1 AND status='open'")
-                    .bind(local.0).execute(&state.db).await?;
-                resolve_position_incidents(state, user_id, &local.4, &local.5).await?;
-                operational_alert_for(state,&local.1,Some(user_id),&local.2,"broker_flat_close_reconciled","warning",&format!("Broker position is flat for closing trade {}; local state was closed from authoritative position reconciliation. Final P&L may require broker trade-book verification.",local.0)).await;
-                continue;
-            }
-        }
         local_groups.entry(key).or_default().push(local);
     }
     let local_keys: HashSet<(String, String)> = local_groups.keys().cloned().collect();
@@ -6881,6 +7036,86 @@ async fn reconcile_broker_positions(
         });
         let broker = broker_by_key.get(&(exchange_key.clone(), token_key.clone()));
         let broker_quantity = broker.map_or(0, |position| position.net_quantity);
+        if broker_quantity == 0 && group.len() == 1 {
+            let local = &group[0];
+            let known_close_fill: Option<(f64, String)> = sqlx::query_as(
+                "SELECT average_fill_price::float8,session_key
+                 FROM strategy_orders
+                 WHERE trade_id=$1 AND role='EMERGENCY_CLOSE' AND status='filled'
+                   AND processed_quantity=quantity AND processed_quantity>= $2 AND average_fill_price>0
+                 ORDER BY updated_at DESC,id DESC LIMIT 1",
+            )
+            .bind(local.0)
+            .bind(local.6)
+            .fetch_optional(&state.db)
+            .await?;
+            if let Some((exit_price, session_key)) = known_close_fill {
+                cancel_active_exits(state, user_id, local.0).await?;
+                let active_protection: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2','EMERGENCY_CLOSE') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+                    .bind(local.0).fetch_one(&state.db).await?;
+                if !active_protection {
+                    let realized = trade_pnl(
+                        &local.3,
+                        local.7,
+                        exit_price,
+                        runtime_pnl_units(&local.2, local.6, local.10),
+                    );
+                    let reason = recorded_exit_reason(&local.1, "EMERGENCY_CLOSE", &session_key);
+                    sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),exit_reason=$4,broker_net_quantity=0,last_position_reconciled_at=NOW(),notes=CONCAT(notes,'; broker flatness confirmed after attributable Rulenix close fill'),updated_at=NOW() WHERE id=$1 AND status='open'")
+                        .bind(local.0).bind(exit_price).bind(local.13 + realized).bind(reason).execute(&state.db).await?;
+                    sqlx::query("UPDATE manual_trade_close_intents SET status='completed',completed_at=NOW(),last_error='',updated_at=NOW() WHERE trade_id=$1")
+                        .bind(local.0).execute(&state.db).await?;
+                    resolve_position_incidents(state, user_id, &local.4, &local.5).await?;
+                }
+                continue;
+            }
+            let known_order_ids: HashSet<String> = sqlx::query_scalar(
+                "SELECT broker_order_id FROM strategy_orders WHERE trade_id=$1 AND broker_order_id<>''",
+            )
+            .bind(local.0)
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
+            let manual_exit_price = trade_book.and_then(|book| {
+                attributable_manual_flat_fill(
+                    &parse_broker_trade_fills(book),
+                    &ManualFillExpectation {
+                        exchange: exchange_key,
+                        token: token_key,
+                        symbol: &local.12,
+                        direction: &local.3,
+                        quantity: local.6,
+                        entry_at: local.11,
+                        known_order_ids: &known_order_ids,
+                    },
+                )
+            });
+            if let Some(exit_price) = manual_exit_price {
+                sqlx::query("UPDATE trades SET safety_status='RECONCILIATION_REQUIRED',broker_net_quantity=0,last_position_reconciled_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='open'")
+                    .bind(local.0).execute(&state.db).await?;
+                cancel_active_exits(state, user_id, local.0).await?;
+                let active_protection: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2','EMERGENCY_CLOSE') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
+                    .bind(local.0).fetch_one(&state.db).await?;
+                if !active_protection {
+                    let realized = trade_pnl(
+                        &local.3,
+                        local.7,
+                        exit_price,
+                        runtime_pnl_units(&local.2, local.6, local.10),
+                    );
+                    let changed = sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),exit_reason='MANUAL_BROKER_CLOSE',broker_net_quantity=0,last_position_reconciled_at=NOW(),notes=CONCAT(notes,'; broker-side manual close verified from position and trade books'),updated_at=NOW() WHERE id=$1 AND status='open'")
+                        .bind(local.0).bind(exit_price).bind(local.13 + realized).execute(&state.db).await?;
+                    if changed.rows_affected() > 0 {
+                        sqlx::query("UPDATE manual_trade_close_intents SET status='completed',completed_at=NOW(),last_error='',updated_at=NOW() WHERE trade_id=$1")
+                            .bind(local.0).execute(&state.db).await?;
+                        resolve_position_incidents(state, user_id, &local.4, &local.5).await?;
+                        operational_alert_for(state,&local.1,Some(user_id),&local.2,"broker_manual_close_reconciled","info",&format!("Broker position and attributable trade-book fills confirmed manual closure of trade {} at weighted fill price {:.4}.",local.0,exit_price)).await;
+                    }
+                }
+                continue;
+            }
+        }
         if let Some(incident_type) = position_mismatch_type(broker_quantity, local_signed) {
             let detail = format!(
                 "Broker/local aggregate exposure mismatch for {}: broker net quantity {broker_quantity}, local signed quantity {local_signed} across {} open trade row(s).",
@@ -7323,6 +7558,37 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             return Ok(());
         }
     };
+    let broker_positions = parse_broker_positions(&positions);
+    let local_contracts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT UPPER(s.exchange_segment),s.contract_token
+         FROM trades t
+         JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
+           AND s.contract_token IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let needs_trade_book = local_contracts.iter().any(|(exchange, token)| {
+        broker_positions
+            .iter()
+            .find(|position| position.exchange == *exchange && position.token == *token)
+            .is_none_or(|position| position.net_quantity == 0)
+    });
+    let trade_book = if needs_trade_book {
+        match angel::trade_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
+        {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
+                    .await;
+                operational_alert(state,Some(user_id),"","broker_trade_reconcile_failed","error",&format!("Angel One trade-book reconciliation failed; a broker-flat local trade will remain unresolved: {error}")).await;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let mut by_id = HashMap::new();
     let mut by_tag = HashMap::new();
     for item in values.as_array().into_iter().flatten() {
@@ -7518,7 +7784,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
                 .bind(order.id).execute(&state.db).await?;
         }
     }
-    reconcile_broker_positions(state, user_id, &positions).await?;
+    reconcile_broker_positions(state, user_id, &positions, trade_book.as_ref()).await?;
     risk::set_reconciliation_health(
         state,
         user_id,
@@ -7587,6 +7853,10 @@ fn emergency_close_session(trade_id: Uuid) -> String {
     format!("ec-{}", &trade_id.simple().to_string()[..16])
 }
 
+fn manual_close_session(trade_id: Uuid) -> String {
+    format!("mc-{}", &trade_id.simple().to_string()[..16])
+}
+
 async fn terminal_retry_session(
     state: &AppState,
     trade_id: Uuid,
@@ -7624,7 +7894,20 @@ async fn protection_runner(
     } else {
         snapshot.instrument.as_str()
     };
-    let mut runner = runner_for_strategy(state, user_id, strategy_key, instrument).await?;
+    // Risk-reducing exits remain available even after LIVE-entry permission or
+    // strategy activation is removed.
+    let mut runner: Runner = sqlx::query_as(
+        "SELECT c.user_id,u.username,c.instrument,c.lots,c.run_day_session,c.run_evening_session,p.trading_mode
+         FROM user_strategy_configs c
+         JOIN users u ON u.id=c.user_id
+         JOIN user_profiles p ON p.user_id=c.user_id
+         WHERE c.user_id=$1 AND c.strategy_key=$2 AND c.instrument=$3",
+    )
+    .bind(user_id)
+    .bind(strategy_key)
+    .bind(instrument)
+    .fetch_one(&state.db)
+    .await?;
     runner.trading_mode = "live".into();
     Ok(runner)
 }
@@ -7730,13 +8013,76 @@ async fn begin_emergency_close(
         _,
         _,
     ) = trade;
-    sqlx::query("UPDATE trades SET safety_status='EMERGENCY_CLOSING',updated_at=NOW() WHERE id=$1 AND status='open'")
-        .bind(trade_id).execute(&state.db).await?;
+    let manual_close_status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM manual_trade_close_intents WHERE trade_id=$1 AND status<>'completed'",
+    )
+    .bind(trade_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let manual_close_requested = manual_close_status.is_some();
+    if manual_close_status.as_deref() == Some("failed") {
+        return Ok(());
+    }
+    sqlx::query("UPDATE trades SET safety_status=CASE WHEN $2 THEN 'CLOSING' ELSE 'EMERGENCY_CLOSING' END,updated_at=NOW() WHERE id=$1 AND status='open'")
+        .bind(trade_id).bind(manual_close_requested).execute(&state.db).await?;
+    if manual_close_requested {
+        sqlx::query("UPDATE manual_trade_close_intents SET status='cancelling_protection',last_error='',updated_at=NOW() WHERE trade_id=$1 AND status IN ('requested','cancelling_protection','reconciliation_required')")
+            .bind(trade_id).execute(&state.db).await?;
+    }
     cancel_active_exits(state, *user_id, *trade_id).await?;
     let active_exit: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))")
         .bind(trade_id).fetch_one(&state.db).await?;
     if active_exit {
         return Ok(());
+    }
+    if manual_close_requested {
+        let credentials = state.credentials.load(*user_id).await?;
+        angel::order_book(
+            state,
+            *user_id,
+            &credentials.api_key,
+            &credentials.jwt_token,
+        )
+        .await?;
+        let positions = angel::positions(
+            state,
+            *user_id,
+            &credentials.api_key,
+            &credentials.jwt_token,
+        )
+        .await?;
+        let token = snapshot.contract_token.as_deref().unwrap_or("");
+        let exchange = snapshot.exchange_segment.to_uppercase();
+        let broker_quantity = parse_broker_positions(&positions)
+            .into_iter()
+            .find(|position| position.exchange == exchange && position.token == token)
+            .map_or(0, |position| position.net_quantity);
+        let expected_quantity = if direction == "BUY" {
+            *quantity
+        } else {
+            -*quantity
+        };
+        let attributable_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades t
+             JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+             WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
+               AND UPPER(s.exchange_segment)=$2 AND s.contract_token=$3",
+        )
+        .bind(user_id)
+        .bind(&exchange)
+        .bind(token)
+        .fetch_one(&state.db)
+        .await?;
+        if attributable_rows != 1 || broker_quantity != expected_quantity {
+            let detail = format!(
+                "Manual close paused before submission: broker quantity {broker_quantity}, attributable local quantity {expected_quantity}, matching local trades {attributable_rows}."
+            );
+            sqlx::query("UPDATE manual_trade_close_intents SET status='reconciliation_required',last_error=$2,updated_at=NOW() WHERE trade_id=$1")
+                .bind(trade_id).bind(&detail).execute(&state.db).await?;
+            sqlx::query("UPDATE trades SET safety_status='RECONCILIATION_REQUIRED',broker_net_quantity=$2,last_position_reconciled_at=NOW(),last_protection_error=$3,updated_at=NOW() WHERE id=$1 AND status='open'")
+                .bind(trade_id).bind(broker_quantity).bind(detail).execute(&state.db).await?;
+            return Ok(());
+        }
     }
     let already_closing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=$1 AND role='EMERGENCY_CLOSE' AND status NOT IN ('failed','rejected','cancelled'))")
         .bind(trade_id).fetch_one(&state.db).await?;
@@ -7755,10 +8101,14 @@ async fn begin_emergency_close(
         })?
     };
     operational_alert_for(state,strategy_key,Some(*user_id),instrument,"emergency_close","critical",&format!("Stop protection could not be confirmed; submitting an idempotent MARKET close for trade {trade_id}.")).await;
-    let base_session = emergency_close_session(*trade_id);
+    let base_session = if manual_close_requested {
+        manual_close_session(*trade_id)
+    } else {
+        emergency_close_session(*trade_id)
+    };
     let session =
         terminal_retry_session(state, *trade_id, "EMERGENCY_CLOSE", &base_session).await?;
-    place_strategy_order(
+    let result = place_strategy_order(
         state,
         &runner,
         snapshot,
@@ -7774,7 +8124,31 @@ async fn begin_emergency_close(
             quantity: Some((*quantity).max(1)),
         },
     )
-    .await
+    .await;
+    if manual_close_requested {
+        let close_order: Option<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id,status,broker_status FROM strategy_orders WHERE trade_id=$1 AND role='EMERGENCY_CLOSE' AND session_key LIKE 'mc-%' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(trade_id)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some((order_id, status, diagnostic)) = close_order {
+            let intent_status = match status.as_str() {
+                "submitted" | "processing" | "cancelling" => "submitted",
+                "partially_filled" => "partially_filled",
+                "ambiguous" | "submitting" => "ambiguous",
+                "filled" => "completed",
+                "failed" | "rejected" | "cancelled" => "failed",
+                _ => "requested",
+            };
+            sqlx::query("UPDATE manual_trade_close_intents SET status=$2,strategy_order_id=$3,last_error=CASE WHEN $2 IN ('failed','ambiguous') THEN $4 ELSE '' END,completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END,updated_at=NOW() WHERE trade_id=$1")
+                .bind(trade_id).bind(intent_status).bind(order_id).bind(diagnostic).execute(&state.db).await?;
+        } else if let Err(error) = &result {
+            sqlx::query("UPDATE manual_trade_close_intents SET status='failed',last_error=$2,updated_at=NOW() WHERE trade_id=$1 AND status NOT IN ('submitted','ambiguous','completed')")
+                .bind(trade_id).bind(error.to_string()).execute(&state.db).await?;
+        }
+    }
+    result
 }
 
 async fn recover_unprotected_trades(state: &AppState) -> AppResult<()> {
@@ -7804,6 +8178,9 @@ async fn recover_unprotected_trades(state: &AppState) -> AppResult<()> {
             .bind(snapshot_id)
             .fetch_one(&state.db)
             .await?;
+        if safety_status == "RECONCILIATION_REQUIRED" {
+            continue;
+        }
         if matches!(safety_status.as_str(), "CLOSING" | "EMERGENCY_CLOSING") {
             if let Err(error) = begin_emergency_close(state, &trade, &snapshot).await {
                 operational_alert_for(
@@ -7914,21 +8291,209 @@ async fn recover_unprotected_trades(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+pub async fn manual_close_trade(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(trade_id): Path<Uuid>,
+    headers: HeaderMap,
+    context: Option<Extension<crate::security::RequestContext>>,
+) -> AppResult<Json<Value>> {
+    type ManualCloseLookup = (String, String, String, i32, String, String, String);
+    let lookup: Option<ManualCloseLookup> = sqlx::query_as(
+        "SELECT t.status,t.execution_mode,t.direction,t.quantity,
+                UPPER(s.exchange_segment),s.contract_token,COALESCE(t.contract_symbol,'')
+         FROM trades t
+         JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.id=$1 AND t.user_id=$2",
+    )
+    .bind(trade_id)
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((status, mode, _, _, _, _, _)) = lookup else {
+        return Err(AppError::NotFound("Trade was not found.".into()));
+    };
+    if status == "closed" {
+        return Ok(Json(json!({
+            "trade_id":trade_id,
+            "status":"completed",
+            "message":"Trade is already closed."
+        })));
+    }
+    if mode != "live" {
+        return Err(AppError::BadRequest(
+            "Close Trade is currently available only for running LIVE trades.".into(),
+        ));
+    }
+
+    // Reconcile known fills/cancellations first, then independently require
+    // successful fresh order and position reads for this user action.
+    reconcile_live_user(&state, user.id).await?;
+    let credentials = state.credentials.load(user.id).await?;
+    angel::order_book(
+        &state,
+        user.id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await?;
+    let positions = angel::positions(
+        &state,
+        user.id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await?;
+
+    let refreshed: Option<ManualCloseLookup> = sqlx::query_as(
+        "SELECT t.status,t.execution_mode,t.direction,t.quantity,
+                UPPER(s.exchange_segment),s.contract_token,COALESCE(t.contract_symbol,'')
+         FROM trades t
+         JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.id=$1 AND t.user_id=$2",
+    )
+    .bind(trade_id)
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((status, _, direction, quantity, exchange, token, symbol)) = refreshed else {
+        return Err(AppError::NotFound("Trade was not found.".into()));
+    };
+    if status == "closed" {
+        return Ok(Json(json!({
+            "trade_id":trade_id,
+            "status":"completed",
+            "message":"Broker reconciliation confirmed that the trade is already closed."
+        })));
+    }
+    let attributable_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trades t
+         JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
+           AND UPPER(s.exchange_segment)=$2 AND s.contract_token=$3",
+    )
+    .bind(user.id)
+    .bind(&exchange)
+    .bind(&token)
+    .fetch_one(&state.db)
+    .await?;
+    if attributable_rows != 1 {
+        return Err(AppError::BadRequest(format!(
+            "Close Trade requires exactly one attributable open Rulenix trade for {exchange}/{token}; found {attributable_rows}."
+        )));
+    }
+    let broker = parse_broker_positions(&positions)
+        .into_iter()
+        .find(|position| position.exchange == exchange && position.token == token);
+    let expected_signed = if direction == "BUY" {
+        quantity
+    } else {
+        -quantity
+    };
+    let broker_quantity = broker.as_ref().map_or(0, |position| position.net_quantity);
+    let symbol_matches = broker.as_ref().is_none_or(|position| {
+        symbol.is_empty()
+            || position.symbol.is_empty()
+            || position.symbol.eq_ignore_ascii_case(&symbol)
+    });
+    if broker_quantity != expected_signed || !symbol_matches {
+        sqlx::query("UPDATE trades SET safety_status='RECONCILIATION_REQUIRED',broker_net_quantity=$2,last_position_reconciled_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='open'")
+            .bind(trade_id).bind(broker_quantity).execute(&state.db).await?;
+        return Err(AppError::BadRequest(format!(
+            "Close Trade stopped because fresh Angel exposure ({broker_quantity}) does not exactly match the attributable Rulenix exposure ({expected_signed}). Reconciliation is required."
+        )));
+    }
+    let close_side = if direction == "BUY" { "SELL" } else { "BUY" };
+    let mut tx = state.db.begin().await?;
+    let lock_key = format!("manual-close:{trade_id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO manual_trade_close_intents(trade_id,user_id,requested_quantity,close_side)
+         VALUES($1,$2,$3,$4)
+         ON CONFLICT(trade_id) DO UPDATE
+         SET status=CASE
+               WHEN manual_trade_close_intents.status IN ('failed','partially_filled','reconciliation_required')
+                 THEN 'requested'
+               ELSE manual_trade_close_intents.status
+             END,
+             requested_quantity=CASE
+               WHEN manual_trade_close_intents.status IN ('failed','partially_filled','reconciliation_required')
+                 THEN EXCLUDED.requested_quantity
+               ELSE manual_trade_close_intents.requested_quantity
+             END,
+             close_side=EXCLUDED.close_side,
+             last_error='',updated_at=NOW()",
+    )
+    .bind(trade_id)
+    .bind(user.id)
+    .bind(quantity)
+    .bind(close_side)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE trades SET safety_status='CLOSING',updated_at=NOW() WHERE id=$1 AND user_id=$2 AND status='open'")
+        .bind(trade_id).bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    let request_context = crate::audit::optional_context(context);
+    if let Err(error) = crate::audit::record(
+        &state,
+        crate::audit::AuditEvent {
+            context: request_context.as_ref(),
+            headers: Some(&headers),
+            event_type: "manual_live_trade_close_requested",
+            actor_user_id: Some(user.id),
+            target_user_id: Some(user.id),
+            summary: "User requested an attributable risk-reducing LIVE trade close",
+            metadata: json!({"trade_id":trade_id,"close_side":close_side,"quantity":quantity}),
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error,%trade_id,"could not write manual close audit event");
+    }
+
+    let trade: ProtectionRecoveryRow = sqlx::query_as("SELECT id,user_id,strategy_snapshot_id,strategy_key,instrument_label,direction,execution_mode,quantity,remaining_lots,total_lots,target_price::float8,sl1_price::float8,sl2_price::float8,safety_status,protection_deadline_at,protection_attempts FROM trades WHERE id=$1 AND user_id=$2 AND status='open'")
+        .bind(trade_id).bind(user.id).fetch_one(&state.db).await?;
+    let query = format!("{} WHERE id=$1", snapshot_select());
+    let snapshot: Snapshot = sqlx::query_as(&query)
+        .bind(trade.2)
+        .fetch_one(&state.db)
+        .await?;
+    let submission_error = begin_emergency_close(&state, &trade, &snapshot)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let intent: (String, String) = sqlx::query_as(
+        "SELECT status,last_error FROM manual_trade_close_intents WHERE trade_id=$1",
+    )
+    .bind(trade_id)
+    .fetch_one(&state.db)
+    .await?;
+    if let Some(error) = submission_error {
+        sqlx::query("UPDATE manual_trade_close_intents SET last_error=$2,updated_at=NOW() WHERE trade_id=$1 AND status<>'completed'")
+            .bind(trade_id).bind(&error).execute(&state.db).await?;
+        return Err(AppError::BadRequest(error));
+    }
+    Ok(Json(json!({
+        "trade_id":trade_id,
+        "status":intent.0,
+        "message":if intent.0=="submitted" {
+            "The broker close was submitted and is awaiting authoritative fill reconciliation."
+        } else {
+            "The close request is durable and is waiting for protective-order cancellation reconciliation."
+        },
+        "detail":intent.1
+    })))
+}
+
 pub(crate) async fn cancel_active_exits(
     state: &AppState,
     user_id: Uuid,
     trade_id: Uuid,
 ) -> AppResult<()> {
     let orders:Vec<(Uuid,String,String,String)>=sqlx::query_as("SELECT id,broker_order_id,execution_mode,order_type FROM strategy_orders WHERE trade_id=$1 AND role IN ('TARGET','SL1','SL2') AND status IN ('submitted','partially_filled')").bind(trade_id).fetch_all(&state.db).await?;
-    cancel_exit_orders(state, user_id, orders).await
-}
-
-async fn cancel_active_emergency_closes(
-    state: &AppState,
-    user_id: Uuid,
-    trade_id: Uuid,
-) -> AppResult<()> {
-    let orders:Vec<(Uuid,String,String,String)>=sqlx::query_as("SELECT id,broker_order_id,execution_mode,order_type FROM strategy_orders WHERE trade_id=$1 AND role='EMERGENCY_CLOSE' AND status IN ('submitted','partially_filled')").bind(trade_id).fetch_all(&state.db).await?;
     cancel_exit_orders(state, user_id, orders).await
 }
 
@@ -8387,13 +8952,20 @@ async fn attempt_claimed_sl2_reversal(
         "SELECT EXISTS(
             SELECT 1 FROM trades t
             JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
-            WHERE t.id=$1 AND t.status='closed' AND t.broker_net_quantity=0
-              AND t.last_position_reconciled_at IS NOT NULL
-              AND t.last_position_reconciled_at>=t.exit_datetime
-              AND NOT EXISTS(
-                  SELECT 1 FROM broker_position_incidents i
-                  WHERE i.user_id=t.user_id AND i.exchange_segment=s.exchange_segment
-                    AND i.contract_token=s.contract_token AND i.status IN ('open','operator_required')
+            WHERE t.id=$1 AND t.status='closed' AND t.exit_reason='SL2'
+              AND (
+                  t.execution_mode='demo'
+                  OR (
+                      t.execution_mode='live'
+                      AND t.broker_net_quantity=0
+                      AND t.last_position_reconciled_at IS NOT NULL
+                      AND t.last_position_reconciled_at>=t.exit_datetime
+                      AND NOT EXISTS(
+                          SELECT 1 FROM broker_position_incidents i
+                          WHERE i.user_id=t.user_id AND i.exchange_segment=s.exchange_segment
+                            AND i.contract_token=s.contract_token AND i.status IN ('open','operator_required')
+                      )
+                  )
               )
         )",
     )
@@ -9584,6 +10156,10 @@ async fn complete_claimed_order(
                     sqlx::query("UPDATE trades SET safety_status=CASE WHEN $6='EMERGENCY_CLOSE' THEN 'EMERGENCY_CLOSING' WHEN execution_mode='live' THEN 'PROTECTION_REQUIRED' ELSE safety_status END,protection_deadline_at=CASE WHEN execution_mode='live' THEN NOW()+($7::text || ' seconds')::interval ELSE protection_deadline_at END,quantity=$2,remaining_lots=$3,last_price=($4::float8)::numeric,pnl=($5::float8)::numeric,updated_at=NOW() WHERE id=$1").bind(trade_id).bind(remaining_quantity).bind(remaining_lots).bind(fill).bind(pnl).bind(&order.role).bind(state.config.protection_ack_timeout_seconds).execute(&mut *fill_tx).await?;
                 }
                 sqlx::query("UPDATE strategy_orders SET status=CASE WHEN $2<quantity THEN 'partially_filled' ELSE 'filled' END,processed_quantity=GREATEST(processed_quantity,$2),filled_quantity=GREATEST(filled_quantity,$2),updated_at=NOW() WHERE id=$1").bind(order.id).bind(cumulative_fill).execute(&mut *fill_tx).await?;
+                if order.role == "EMERGENCY_CLOSE" && order.session_key.starts_with("mc-") {
+                    sqlx::query("UPDATE manual_trade_close_intents SET status=CASE WHEN $2=0 THEN 'completed' ELSE 'partially_filled' END,strategy_order_id=$3,last_error='',completed_at=CASE WHEN $2=0 THEN NOW() ELSE completed_at END,updated_at=NOW() WHERE trade_id=$1")
+                        .bind(trade_id).bind(remaining_quantity).bind(order.id).execute(&mut *fill_tx).await?;
+                }
                 if let Some(plan) = reversal {
                     sqlx::query(
                         "INSERT INTO strategy_reversal_intents
@@ -10684,6 +11260,7 @@ mod tests {
     struct DeterministicFakeBroker {
         placed_orders: Arc<tokio::sync::Mutex<Vec<Value>>>,
         order_book: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        trade_book: Arc<tokio::sync::Mutex<Vec<Value>>>,
         positions: Arc<tokio::sync::Mutex<Vec<Value>>>,
         cancelled_orders: Arc<tokio::sync::Mutex<Vec<String>>>,
         place_modes: Arc<tokio::sync::Mutex<VecDeque<FakePlaceMode>>>,
@@ -10804,6 +11381,14 @@ mod tests {
         }))
     }
 
+    async fn fake_trade_book(State(fake): State<DeterministicFakeBroker>) -> Json<Value> {
+        Json(json!({
+            "status":true,
+            "message":"SUCCESS",
+            "data":fake.trade_book.lock().await.clone()
+        }))
+    }
+
     async fn fake_rms_limits() -> Json<Value> {
         Json(json!({
             "status":true,"message":"SUCCESS",
@@ -10889,6 +11474,10 @@ mod tests {
             .route(
                 "/rest/secure/angelbroking/order/v1/getPosition",
                 get(fake_positions),
+            )
+            .route(
+                "/rest/secure/angelbroking/order/v1/getTradeBook",
+                get(fake_trade_book),
             )
             .route(
                 "/rest/secure/angelbroking/order/v1/cancelOrder",
@@ -12727,7 +13316,7 @@ mod tests {
             "avgnetprice":"4321.25",
             "brokerExtra":"retained"
         });
-        reconcile_broker_positions(&state, user_id, &json!([raw_position.clone()]))
+        reconcile_broker_positions(&state, user_id, &json!([raw_position.clone()]), None)
             .await
             .expect("unknown broker position reconciliation must succeed");
         let incident: (String, String, String, String, i32, Option<f64>, Value) = sqlx::query_as(
@@ -12952,10 +13541,10 @@ mod tests {
         let second_positions = positions.clone();
         let (first, second) = tokio::join!(
             tokio::spawn(async move {
-                reconcile_broker_positions(&first_state, user_id, &first_positions).await
+                reconcile_broker_positions(&first_state, user_id, &first_positions, None).await
             }),
             tokio::spawn(async move {
-                reconcile_broker_positions(&second_state, user_id, &second_positions).await
+                reconcile_broker_positions(&second_state, user_id, &second_positions, None).await
             })
         );
         first.unwrap().unwrap();
@@ -13016,9 +13605,9 @@ mod tests {
                     .is_some_and(|quantity| quantity == 25 || quantity == 50)
         }));
 
-        sqlx::query("UPDATE strategy_orders SET status='filled',filled_quantity=quantity,processed_quantity=quantity,last_reconciled_at=NOW() WHERE user_id=$1 AND role='EMERGENCY_CLOSE'")
+        sqlx::query("UPDATE strategy_orders SET status='filled',filled_quantity=quantity,processed_quantity=quantity,average_fill_price=price,last_reconciled_at=NOW() WHERE user_id=$1 AND role='EMERGENCY_CLOSE'")
             .bind(user_id).execute(&state.db).await.unwrap();
-        reconcile_broker_positions(&state, user_id, &json!([]))
+        reconcile_broker_positions(&state, user_id, &json!([]), None)
             .await
             .unwrap();
         let still_open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE user_id=$1 AND status='open' AND exposure_origin='broker_over_close'")
@@ -13135,6 +13724,8 @@ mod tests {
             "exchange":"MCX","symboltoken":token,"tradingsymbol":symbol,
             "producttype":"CARRYFORWARD","netqty":"50","avgnetprice":"100"
         })];
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,100,NOW())")
+            .bind(&token).execute(&state.db).await.unwrap();
 
         recover_unprotected_trades(&state).await.unwrap();
         let first: (String, String) = sqlx::query_as(
@@ -14293,5 +14884,299 @@ mod tests {
         let state_after_rollback: (i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),demo_state_reset_at FROM user_profiles WHERE user_id=$1")
             .bind(user_id).fetch_one(&state.db).await.unwrap();
         assert_eq!(state_after_rollback, (1, None));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn claimed_sl2_reversals_submit_once_in_both_directions() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        for (index, source_direction, reversal_direction, expected_side) in [
+            ("buy", "BUY", "SELL", "SELL"),
+            ("sell", "SELL", "BUY", "BUY"),
+        ] {
+            let (user_id, snapshot_id, trade_id, token, _) =
+                seed_live_futures_protection_fixture(&state, &format!("reversal-{index}")).await;
+            sqlx::query("UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=DATE '2026-09-30' WHERE id=$1")
+                .bind(snapshot_id).bind(ist_now().date_naive()).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active) VALUES($1,$2,TRUE) ON CONFLICT(user_id,strategy_key) DO UPDATE SET is_active=TRUE")
+                .bind(user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+            sqlx::query("UPDATE trades SET status='closed',direction=$2,exit_reason='SL2',exit_datetime=NOW()-INTERVAL '1 second',remaining_lots=0,safety_status='CLOSED',broker_net_quantity=0,last_position_reconciled_at=NOW() WHERE id=$1")
+                .bind(trade_id).bind(source_direction).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,100,NOW()) ON CONFLICT(exchange_segment,contract_token) DO UPDATE SET price=100,received_at=NOW()")
+                .bind(&token).execute(&state.db).await.unwrap();
+            let session = sl2_reversal_session(trade_id);
+            sqlx::query("INSERT INTO strategy_reversal_intents(source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key,status,attempts) VALUES($1,$2,$3,'GOLDTEN',$4,$5,5,98,$6,'processing',1)")
+                .bind(trade_id).bind(user_id).bind(snapshot_id).bind(source_direction).bind(reversal_direction).bind(&session).execute(&state.db).await.unwrap();
+            let intent = Sl2ReversalIntent {
+                source_trade_id: trade_id,
+                user_id,
+                snapshot_id,
+                instrument: "GOLDTEN".into(),
+                source_direction: source_direction.into(),
+                reversal_direction: reversal_direction.into(),
+                lots: 5,
+                entry_price: 98.0,
+                order_session_key: session,
+                attempts: 1,
+                created_at: Utc::now(),
+            };
+            assert!(matches!(
+                attempt_claimed_sl2_reversal(&state, &intent).await.unwrap(),
+                Sl2ReversalOutcome::Submitted
+            ));
+            assert!(matches!(
+                attempt_claimed_sl2_reversal(&state, &intent).await.unwrap(),
+                Sl2ReversalOutcome::Submitted
+            ));
+            let placed = fake.placed_orders.lock().await;
+            let latest = placed.last().expect("reversal must reach fake broker");
+            assert_eq!(latest["transactiontype"], expected_side);
+            assert_eq!(latest["quantity"], "50");
+            drop(placed);
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_orders WHERE trade_id=$1 AND session_key=$2 AND role IN ('BUY_ENTRY','SELL_ENTRY')")
+                .bind(trade_id).bind(&intent.order_session_key).fetch_one(&state.db).await.unwrap();
+            assert_eq!(
+                count, 1,
+                "repeated observation must reuse one durable order"
+            );
+        }
+        assert_eq!(fake.placed_orders.lock().await.len(), 2);
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn demo_sl2_reversal_is_simulated_without_angel_mutation() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, snapshot_id, trade_id, token, _) =
+            seed_live_futures_protection_fixture(&state, "demo-reversal").await;
+        sqlx::query("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=DATE '2026-09-30' WHERE id=$1")
+            .bind(snapshot_id).bind(ist_now().date_naive()).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE trades SET execution_mode='demo',status='closed',exit_reason='SL2',exit_datetime=NOW(),remaining_lots=0,safety_status='CLOSED',broker_net_quantity=NULL,last_position_reconciled_at=NULL WHERE id=$1")
+            .bind(trade_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active) VALUES($1,$2,TRUE)")
+            .bind(user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,98,NOW())")
+            .bind(&token).execute(&state.db).await.unwrap();
+        let session = sl2_reversal_session(trade_id);
+        sqlx::query("INSERT INTO strategy_reversal_intents(source_trade_id,user_id,snapshot_id,instrument,source_direction,reversal_direction,lots,entry_price,order_session_key,status,attempts) VALUES($1,$2,$3,'GOLDTEN','BUY','SELL',5,98,$4,'processing',1)")
+            .bind(trade_id).bind(user_id).bind(snapshot_id).bind(&session).execute(&state.db).await.unwrap();
+        let intent = Sl2ReversalIntent {
+            source_trade_id: trade_id,
+            user_id,
+            snapshot_id,
+            instrument: "GOLDTEN".into(),
+            source_direction: "BUY".into(),
+            reversal_direction: "SELL".into(),
+            lots: 5,
+            entry_price: 98.0,
+            order_session_key: session,
+            attempts: 1,
+            created_at: Utc::now(),
+        };
+        assert!(matches!(
+            attempt_claimed_sl2_reversal(&state, &intent).await.unwrap(),
+            Sl2ReversalOutcome::Completed
+        ));
+        let reversal: (String, String, Option<Uuid>) = sqlx::query_as("SELECT execution_mode,direction,reversal_of_trade_id FROM trades WHERE reversal_of_trade_id=$1 AND status='open'")
+            .bind(trade_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(reversal, ("demo".into(), "SELL".into(), Some(trade_id)));
+        assert!(fake.placed_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn manual_live_close_is_owned_idempotent_and_allowed_during_global_kill() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, _, trade_id, token, symbol) =
+            seed_live_futures_protection_fixture(&state, "manual-close").await;
+        *fake.positions.lock().await = vec![json!({
+            "exchange":"MCX","symboltoken":token,"tradingsymbol":symbol,
+            "producttype":"CARRYFORWARD","netqty":"50","avgnetprice":"100"
+        })];
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,100,NOW())")
+            .bind(&token).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE,reason='test global kill'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET can_live_trade=FALSE WHERE id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let auth = AuthUser {
+            id: user_id,
+            username: "manual-close-user".into(),
+            can_administer: false,
+            can_live_trade: false,
+            can_backtest: false,
+            can_backtest_on_trading_days: false,
+            trading_mode: "live".into(),
+            session_id: Uuid::new_v4(),
+        };
+        for _ in 0..2 {
+            let _ = manual_close_trade(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(trade_id),
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let intent: (String, i32, String) = sqlx::query_as("SELECT status,requested_quantity,close_side FROM manual_trade_close_intents WHERE trade_id=$1")
+            .bind(trade_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(intent, ("submitted".into(), 50, "SELL".into()));
+        let placed = fake.placed_orders.lock().await;
+        assert_eq!(
+            placed.len(),
+            1,
+            "double request cannot submit a second close"
+        );
+        assert_eq!(placed[0]["transactiontype"], "SELL");
+        assert_eq!(placed[0]["quantity"], "50");
+        drop(placed);
+        let local_status: String = sqlx::query_scalar("SELECT status FROM trades WHERE id=$1")
+            .bind(trade_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(local_status, "open", "submission is not broker fill truth");
+
+        let other = AuthUser {
+            id: Uuid::new_v4(),
+            ..auth
+        };
+        assert!(matches!(
+            manual_close_trade(
+                State(state.clone()),
+                Extension(other),
+                Path(trade_id),
+                HeaderMap::new(),
+                None,
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn broker_manual_flat_requires_trade_fill_and_records_actual_price() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, _, trade_id, _token, _symbol) =
+            seed_live_futures_protection_fixture(&state, "broker-manual").await;
+        *fake.positions.lock().await = vec![];
+        *fake.trade_book.lock().await = vec![json!({
+            "orderid":"ANGEL-MANUAL-1","exchange":"MCX",
+            "symboltoken":"broker-manual-token","tradingsymbol":"GOLDTEN-broker-manual-FUT",
+            "transactiontype":"SELL","fillsize":"50","fillprice":"102.5",
+            "filltime":Utc::now().to_rfc3339()
+        })];
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let closed: (String, String, f64, f64) = sqlx::query_as(
+            "SELECT status,exit_reason,exit_price::float8,pnl::float8 FROM trades WHERE id=$1",
+        )
+        .bind(trade_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(closed.0, "closed");
+        assert_eq!(closed.1, "MANUAL_BROKER_CLOSE");
+        assert_eq!(closed.2, 102.5);
+        assert_eq!(closed.3, 12.5, "GOLDTEN P&L uses actual weighted fill");
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE id=$1 AND status='closed'")
+                .bind(trade_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        broker_task.abort();
+    }
+
+    #[test]
+    fn manual_flat_attribution_requires_exact_unknown_opposite_fills() {
+        let entry_at = Utc::now() - Duration::minutes(5);
+        let known = HashSet::from(["RULENIX-SL".to_string()]);
+        let fill = |order_id: &str, side: &str, quantity: i32, seconds: i64| BrokerTradeFill {
+            order_id: order_id.into(),
+            exchange: "MCX".into(),
+            token: "123".into(),
+            symbol: "GOLDTEN30SEP26FUT".into(),
+            side: side.into(),
+            quantity,
+            price: 101.5,
+            filled_at: entry_at + Duration::seconds(seconds),
+        };
+        let expected = ManualFillExpectation {
+            exchange: "MCX",
+            token: "123",
+            symbol: "GOLDTEN30SEP26FUT",
+            direction: "BUY",
+            quantity: 20,
+            entry_at,
+            known_order_ids: &known,
+        };
+        assert_eq!(
+            attributable_manual_flat_fill(&[fill("MANUAL-1", "SELL", 20, 1)], &expected,),
+            Some(101.5)
+        );
+        assert!(
+            attributable_manual_flat_fill(&[fill("RULENIX-SL", "SELL", 20, 1)], &expected,)
+                .is_none(),
+            "a Rulenix-owned protective fill is not a broker-side manual close"
+        );
+        assert!(
+            attributable_manual_flat_fill(&[fill("MANUAL-1", "SELL", 10, 1)], &expected,).is_none(),
+            "partial or ambiguous attribution must fail closed"
+        );
+        assert!(
+            attributable_manual_flat_fill(&[fill("MANUAL-1", "BUY", 20, 1)], &expected,).is_none(),
+            "same-side or unrelated fills cannot close the trade"
+        );
+        let short_expected = ManualFillExpectation {
+            direction: "SELL",
+            ..expected
+        };
+        assert_eq!(
+            attributable_manual_flat_fill(&[fill("MANUAL-SHORT", "BUY", 20, 1)], &short_expected,),
+            Some(101.5)
+        );
+    }
+
+    #[test]
+    fn manual_close_sessions_are_stable_and_have_distinct_exit_reason() {
+        let trade_id = Uuid::new_v4();
+        assert_eq!(
+            manual_close_session(trade_id),
+            manual_close_session(trade_id)
+        );
+        assert_ne!(
+            manual_close_session(trade_id),
+            emergency_close_session(trade_id)
+        );
+        assert_eq!(
+            recorded_exit_reason(
+                STRATEGY_KEY,
+                "EMERGENCY_CLOSE",
+                &manual_close_session(trade_id)
+            ),
+            "MANUAL_RULENIX_CLOSE"
+        );
     }
 }

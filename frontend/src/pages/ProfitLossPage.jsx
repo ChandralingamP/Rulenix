@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import {
+  closeTrade,
   exportTrades,
   fetchTrades,
   setMode,
@@ -41,6 +42,9 @@ export default function ProfitLossPage() {
     exporting,
     exportError,
     mode,
+    closingTradeId,
+    closeError,
+    closeMessage,
   } = useSelector((state) => state.pnl);
   // Fetch trades on page/mode change
   useEffect(() => {
@@ -96,6 +100,25 @@ export default function ProfitLossPage() {
     dispatch(setMode(value));
   };
 
+  const handleCloseTrade = (trade) => {
+    const symbol = trade.contract_symbol || trade.instrument_label || "trade";
+    const direction = String(trade.direction || "").toUpperCase();
+    const quantity = Number(trade.quantity || 0).toLocaleString("en-IN");
+    if (
+      !window.confirm(
+        `Close this running LIVE trade?\n\n${symbol} · ${direction} · remaining quantity ${quantity}\n\nRulenix will attempt to close the remaining live broker position and reconcile the trade with Angel One.`
+      )
+    ) {
+      return;
+    }
+    dispatch(closeTrade(trade.id))
+      .unwrap()
+      .then(() => dispatch(fetchTrades({ page, pageSize, mode })))
+      .catch(() => {
+        /* errors handled via slice */
+      });
+  };
+
   const formatDateTime = (value) => {
     if (!value) {
       return "—";
@@ -129,6 +152,8 @@ export default function ProfitLossPage() {
       MARKET_CLOSED: "Market closed (3:20 PM)",
       SIGNAL_REVERSAL: "Signal reversal",
       SAR_REVERSAL: "Stop-and-reverse",
+      MANUAL_RULENIX_CLOSE: "Closed from Rulenix",
+      MANUAL_BROKER_CLOSE: "Closed at Angel One",
     }[value] || value || "Closed";
   };
 
@@ -211,6 +236,16 @@ export default function ProfitLossPage() {
       {exportError ? (
         <div className="text-xs text-rose-300">{exportError}</div>
       ) : null}
+      {closeError ? (
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          {closeError}
+        </div>
+      ) : null}
+      {closeMessage ? (
+        <div className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
+          {closeMessage}
+        </div>
+      ) : null}
 
       <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-900/60 shadow-xl shadow-black/30">
         <table className="min-w-full divide-y divide-slate-800 text-sm text-slate-100">
@@ -230,13 +265,14 @@ export default function ProfitLossPage() {
               <th className="whitespace-nowrap px-4 py-3">Exit reason</th>
               <th className="whitespace-nowrap px-4 py-3">TP1 details</th>
               <th className="whitespace-nowrap px-4 py-3">P/L</th>
+              <th className="whitespace-nowrap px-4 py-3">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800">
             {status === "loading" && entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={14}
+                  colSpan={15}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   Loading trades...
@@ -245,7 +281,7 @@ export default function ProfitLossPage() {
             ) : entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={14}
+                  colSpan={15}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   No trade history available.
@@ -311,6 +347,15 @@ export default function ProfitLossPage() {
                 const tp1Details = trade.tp1_exit_price == null
                   ? "—"
                   : `${tp1Price} · Qty ${Number(trade.tp1_exit_quantity || 0).toLocaleString("en-IN")} · ${formatDateTime(trade.tp1_exit_datetime)}`;
+                const canClose =
+                  trade.status === "open" && trade.execution_mode === "live";
+                const closePending = closingTradeId === trade.id;
+                const closeAlreadyPending = [
+                  "requested",
+                  "cancelling_protection",
+                  "submitted",
+                  "ambiguous",
+                ].includes(trade.manual_close_status);
 
                 return (
                   <tr key={trade.id ?? serial} className="text-center">
@@ -353,6 +398,28 @@ export default function ProfitLossPage() {
                       }`}
                     >
                       {formattedProfit}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3">
+                      {canClose ? (
+                        <button
+                          type="button"
+                          onClick={() => handleCloseTrade(trade)}
+                          disabled={
+                            closePending ||
+                            Boolean(closingTradeId) ||
+                            closeAlreadyPending
+                          }
+                          className="rounded-lg border border-rose-400/60 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {closePending
+                            ? "Reconciling..."
+                            : trade.manual_close_status
+                            ? "Close pending"
+                            : "Close Trade"}
+                        </button>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                   </tr>
                 );

@@ -273,6 +273,10 @@ async fn main() -> Result<()> {
         )
         .route("/pnl", get(pnl::list))
         .route("/pnl/export", get(pnl::export))
+        .route(
+            "/pnl/trades/{trade_id}/close",
+            post(strategy::manual_close_trade),
+        )
         .route("/backtesting/runs", get(backtesting::history))
         .route(
             "/backtesting/runs/{run_id}/export",

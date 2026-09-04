@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Provider } from "react-redux";
 import { configureStore } from "@reduxjs/toolkit";
 import pnlReducer from "../features/pnl/pnlSlice.js";
@@ -9,7 +9,7 @@ import ProfitLossPage from "./ProfitLossPage.jsx";
 import apiClient from "../utils/axiosConfig.js";
 
 vi.mock("../utils/axiosConfig.js", () => ({
-  default: { get: vi.fn() },
+  default: { get: vi.fn(), post: vi.fn() },
 }));
 
 vi.mock("../utils/authCookies.js", () => ({
@@ -79,5 +79,33 @@ describe("ProfitLossPage exit audit", () => {
 
     expect(await screen.findByText("Market closed (3:20 PM)")).toBeInTheDocument();
     expect(screen.getByText("SuperTrend Index Options v1")).toBeInTheDocument();
+  });
+
+  it("confirms and submits a close only for an open LIVE trade", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    apiClient.post.mockResolvedValue({
+      data: { status: "submitted", message: "Awaiting broker fill." },
+    });
+    renderPage([{
+      id: "trade-live",
+      status: "open",
+      execution_mode: "live",
+      direction: "BUY",
+      quantity: 20,
+      strategy_key: "futures_breakout_v3",
+      instrument_label: "GOLDTEN",
+      contract_symbol: "GOLDTEN30SEP26FUT",
+      entry_price: 100,
+      last_price: 101,
+      pnl: 20,
+    }]);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Close Trade" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("remaining quantity 20"));
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/pnl/trades/trade-live/close"
+      )
+    );
   });
 });
