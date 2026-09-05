@@ -2,6 +2,10 @@
 # across Windows development and Linux production deployments.
 backend/migrations/*.sql text eol=lf
 
+# Production operational scripts execute under Linux. Archive/export operations
+# from Windows must never introduce CRLF bytes into their shebang or shell syntax.
+*.sh text eol=lf
+
 # These migrations were first applied to production with CRLF bytes. SQLx
 # validates the original bytes, so their exported line endings must stay CRLF.
 backend/migrations/20260713000000_backtesting.sql text eol=crlf
