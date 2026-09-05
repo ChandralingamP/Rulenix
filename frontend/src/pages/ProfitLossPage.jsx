@@ -149,7 +149,7 @@ export default function ProfitLossPage() {
       SL: "SL hit",
       TP1: "TP1 hit",
       TP: "TP hit",
-      MARKET_CLOSED: "Market closed (3:20 PM)",
+      MARKET_CLOSED: "Market closed (3:10 PM)",
       SIGNAL_REVERSAL: "Signal reversal",
       SAR_REVERSAL: "Stop-and-reverse",
       MANUAL_RULENIX_CLOSE: "Closed from Rulenix",

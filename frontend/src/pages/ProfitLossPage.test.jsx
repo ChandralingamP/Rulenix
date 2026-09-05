@@ -61,7 +61,7 @@ describe("ProfitLossPage exit audit", () => {
     expect(screen.getByText("226902.00")).toBeInTheDocument();
   });
 
-  it("labels the 3:20 PM square-off reason", async () => {
+  it("labels the 3:10 PM square-off reason", async () => {
     renderPage([{
       id: "trade-2",
       status: "closed",
@@ -77,7 +77,7 @@ describe("ProfitLossPage exit audit", () => {
       pnl: 200,
     }]);
 
-    expect(await screen.findByText("Market closed (3:20 PM)")).toBeInTheDocument();
+    expect(await screen.findByText("Market closed (3:10 PM)")).toBeInTheDocument();
     expect(screen.getByText("SuperTrend Index Options v1")).toBeInTheDocument();
   });
 

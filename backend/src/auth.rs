@@ -1157,14 +1157,54 @@ fn require_clear_trade_safety(global_kill_enabled: bool) -> AppResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClearTradeScope {
+    Demo,
+    Live,
+    All,
+}
+
+impl ClearTradeScope {
+    fn includes_demo(self) -> bool {
+        matches!(self, Self::Demo | Self::All)
+    }
+
+    fn includes_live(self) -> bool {
+        matches!(self, Self::Live | Self::All)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::Live => "live",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminClearTradesMutation {
+    pub username: String,
+    #[serde(default = "default_clear_trade_scope")]
+    pub scope: ClearTradeScope,
+}
+
+fn default_clear_trade_scope() -> ClearTradeScope {
+    ClearTradeScope::Demo
+}
+
 pub async fn clear_user_trade_logs(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthUser>,
     headers: HeaderMap,
     context: Option<Extension<crate::security::RequestContext>>,
-    Json(input): Json<AdminMutation>,
+    Json(input): Json<AdminClearTradesMutation>,
 ) -> AppResult<Json<Value>> {
     require_admin_permission(&admin)?;
+    let scope = input.scope;
+    let request_context = crate::audit::optional_context(context);
     let mut tx = state.db.begin().await?;
     let target: Option<(Uuid, String)> =
         sqlx::query_as("SELECT id,username FROM users WHERE LOWER(username)=LOWER($1)")
@@ -1190,58 +1230,241 @@ pub async fn clear_user_trade_logs(
     .fetch_one(&mut *tx)
     .await?;
     require_clear_trade_safety(global_kill_enabled)?;
-    // This operation is strictly local and demo-only. It performs no Angel
-    // Place/Modify/Cancel call and never removes live trades or live orders.
-    let cleared = clear_user_demo_trade_state(&mut tx, target_id).await?;
-    let deleted_backtest_trades: i64 = sqlx::query_scalar(
-        "SELECT COUNT(trade.id)::bigint FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id WHERE run.user_id=$1",
-    )
-    .bind(target_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let deleted_backtest_runs = sqlx::query("DELETE FROM backtest_runs WHERE user_id=$1")
+    // Clear Trades is local-data maintenance only. LIVE/ALL performs four
+    // authoritative read-only inventories while both safety locks are held;
+    // it never calls Angel Place/Modify/Cancel/Close.
+    if scope.includes_live() {
+        require_no_live_clear_blockers(&mut tx, target_id).await?;
+        crate::strategy::verify_broker_safe_for_live_clear(&state, target_id).await?;
+        // READ COMMITTED plus the user advisory lock makes this a fresh final
+        // check immediately before deletion, not a stale preflight decision.
+        require_no_live_clear_blockers(&mut tx, target_id).await?;
+    }
+    let cleared_demo = if scope.includes_demo() {
+        clear_user_demo_trade_state(&mut tx, target_id).await?
+    } else {
+        ClearedDemoTradeState::default()
+    };
+    let cleared_live = if scope.includes_live() {
+        clear_user_live_trade_state(&mut tx, target_id).await?
+    } else {
+        ClearedLiveTradeState::default()
+    };
+    let (deleted_backtest_runs, deleted_backtest_trades) = if scope.includes_demo() {
+        let trades: i64 = sqlx::query_scalar(
+            "SELECT COUNT(trade.id)::bigint FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id WHERE run.user_id=$1",
+        )
         .bind(target_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    tx.commit().await?;
-
-    let request_context = crate::audit::optional_context(context);
-    if let Err(error) = crate::audit::record(
+        .fetch_one(&mut *tx)
+        .await?;
+        let runs = sqlx::query("DELETE FROM backtest_runs WHERE user_id=$1")
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        (runs, trades)
+    } else {
+        (0, 0)
+    };
+    let deleted_trades = cleared_demo.deleted_trades + cleared_live.deleted_live_trades;
+    crate::audit::record_in_transaction(
         &state,
+        &mut tx,
         crate::audit::AuditEvent {
             context: request_context.as_ref(),
             headers: Some(&headers),
             event_type: "admin_user_trade_logs_cleared",
             actor_user_id: Some(admin.id),
             target_user_id: Some(target_id),
-            summary: "Administrator cleared a user's trade logs",
-            metadata: json!({"username":username,"deleted_trades":cleared.deleted_trades,"deleted_demo_trades":cleared.deleted_demo_trades,"deleted_closed_live_trades":0,"deleted_demo_orders":cleared.deleted_demo_orders,"deleted_demo_intents":cleared.deleted_demo_intents,"skipped_ambiguous_intents":cleared.skipped_ambiguous_intents,"deleted_demo_events":cleared.deleted_demo_events,"deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,"deleted_orphan_signals":cleared.deleted_orphan_signals,"deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"broker_mutations":{"placed":0,"modified":0,"cancelled":0},"closed_live_history_cleanup":false,"global_kill_switch":true}),
+            summary: "Administrator cleared eligible local trade records",
+            metadata: json!({"username":username,"scope":scope.as_str(),"deleted_trades":deleted_trades,"deleted_demo_trades":cleared_demo.deleted_demo_trades,"deleted_live_trades":cleared_live.deleted_live_trades,"deleted_demo_orders":cleared_demo.deleted_demo_orders,"deleted_live_orders":cleared_live.deleted_live_orders,"deleted_demo_intents":cleared_demo.deleted_demo_intents,"deleted_live_intents":cleared_live.deleted_live_intents,"skipped_ambiguous_intents":cleared_demo.skipped_ambiguous_intents,"deleted_demo_events":cleared_demo.deleted_demo_events,"deleted_live_events":cleared_live.deleted_live_events,"deleted_demo_risk_decisions":cleared_demo.deleted_demo_risk_decisions,"deleted_live_risk_decisions":cleared_live.deleted_live_risk_decisions,"deleted_orphan_signals":cleared_demo.deleted_orphan_signals+cleared_live.deleted_orphan_signals,"deleted_orphan_snapshots":cleared_demo.deleted_orphan_snapshots+cleared_live.deleted_orphan_snapshots,"deleted_backtest_runs":deleted_backtest_runs,"deleted_backtest_trades":deleted_backtest_trades,"broker_reads":if scope.includes_live(){json!(["positions","orders","trades","conditional_rules"])}else{json!([])},"broker_mutations":{"placed":0,"modified":0,"cancelled":0},"global_kill_switch":true}),
         },
     )
-    .await
-    {
-        tracing::warn!(%error, "could not write trade-log clearing audit event");
-    }
+    .await?;
+    tx.commit().await?;
+
     Ok(Json(json!({
-        "detail":"Trading state cleared successfully.",
+        "detail":"Eligible local trading records cleared successfully. No broker order or position was changed.",
         "username":username,
-        "deleted_trades":cleared.deleted_trades,
-        "deleted_demo_trades":cleared.deleted_demo_trades,
-        "deleted_closed_live_trades":0,
-        "deleted_demo_orders":cleared.deleted_demo_orders,
-        "deleted_demo_intents":cleared.deleted_demo_intents,
-        "skipped_ambiguous_intents":cleared.skipped_ambiguous_intents,
-        "deleted_demo_events":cleared.deleted_demo_events,
-        "deleted_demo_risk_decisions":cleared.deleted_demo_risk_decisions,
-        "deleted_orphan_signals":cleared.deleted_orphan_signals,
-        "deleted_orphan_snapshots":cleared.deleted_orphan_snapshots,
+        "scope":scope.as_str(),
+        "deleted_trades":deleted_trades,
+        "deleted_demo_trades":cleared_demo.deleted_demo_trades,
+        "deleted_live_trades":cleared_live.deleted_live_trades,
+        "deleted_closed_live_trades":cleared_live.deleted_live_trades,
+        "deleted_demo_orders":cleared_demo.deleted_demo_orders,
+        "deleted_live_orders":cleared_live.deleted_live_orders,
+        "deleted_demo_intents":cleared_demo.deleted_demo_intents,
+        "deleted_live_intents":cleared_live.deleted_live_intents,
+        "skipped_ambiguous_intents":cleared_demo.skipped_ambiguous_intents,
+        "deleted_demo_events":cleared_demo.deleted_demo_events,
+        "deleted_live_events":cleared_live.deleted_live_events,
+        "deleted_demo_risk_decisions":cleared_demo.deleted_demo_risk_decisions,
+        "deleted_live_risk_decisions":cleared_live.deleted_live_risk_decisions,
+        "deleted_orphan_signals":cleared_demo.deleted_orphan_signals+cleared_live.deleted_orphan_signals,
+        "deleted_orphan_snapshots":cleared_demo.deleted_orphan_snapshots+cleared_live.deleted_orphan_snapshots,
         "deleted_backtest_runs":deleted_backtest_runs,
         "deleted_backtest_trades":deleted_backtest_trades,
         "broker_mutations":{"placed":0,"modified":0,"cancelled":0},
-        "closed_live_history_cleanup":false,
+        "closed_live_history_cleanup":scope.includes_live(),
         "global_kill_switch":true
     })))
+}
+
+type LiveClearBlockers = (i64, i64, i64, i64, i64, i64, i64, i64);
+
+async fn require_no_live_clear_blockers(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> AppResult<()> {
+    let blockers: LiveClearBlockers = sqlx::query_as(
+        "SELECT open_live_trades,unresolved_closed_live_trades,unresolved_live_orders,unresolved_live_execution_intents,unresolved_live_reversals,unresolved_live_manual_closes,unresolved_broker_incidents,unresolved_broker_mutations FROM broker_deployment_account_safety WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let total = blockers.0
+        + blockers.1
+        + blockers.2
+        + blockers.3
+        + blockers.4
+        + blockers.5
+        + blockers.6
+        + blockers.7;
+    if total > 0 {
+        return Err(AppError::BadRequest(format!(
+            "Clear LIVE refused because durable LIVE exposure is unresolved (open_trades={}, unsafe_closed_trades={}, active_orders={}, execution_intents={}, reversals={}, manual_closes={}, broker_incidents={}, broker_mutations={}). Reconcile or close it first.",
+            blockers.0,
+            blockers.1,
+            blockers.2,
+            blockers.3,
+            blockers.4,
+            blockers.5,
+            blockers.6,
+            blockers.7
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClearedLiveTradeState {
+    pub deleted_live_trades: u64,
+    pub deleted_live_orders: u64,
+    pub deleted_live_intents: u64,
+    pub deleted_live_events: u64,
+    pub deleted_live_risk_decisions: u64,
+    pub deleted_orphan_signals: u64,
+    pub deleted_orphan_snapshots: u64,
+}
+
+pub(crate) async fn clear_user_live_trade_state(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> AppResult<ClearedLiveTradeState> {
+    let live_trade_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM trades WHERE user_id=$1 AND execution_mode='live' FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let live_order_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let candidate_snapshot_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT snapshot_id FROM strategy_orders WHERE id=ANY($1::uuid[])
+         UNION
+         SELECT DISTINCT strategy_snapshot_id FROM trades WHERE id=ANY($2::uuid[]) AND strategy_snapshot_id IS NOT NULL",
+    )
+    .bind(&live_order_ids)
+    .bind(&live_trade_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let removed_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "DELETE FROM strategy_execution_intents i
+         WHERE i.user_id=$1
+           AND (i.strategy_order_id=ANY($2::uuid[]) OR i.trade_id=ANY($3::uuid[]))
+         RETURNING i.signal_id",
+    )
+    .bind(user_id)
+    .bind(&live_order_ids)
+    .bind(&live_trade_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let live_trade_text = live_trade_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    let live_order_text = live_order_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    let deleted_live_events = sqlx::query(
+        "DELETE FROM strategy_events
+         WHERE user_id=$1 AND (
+           payload->>'mode'='live'
+           OR payload->>'execution_mode'='live'
+           OR payload->>'trade_id'=ANY($2::text[])
+           OR payload->>'order_id'=ANY($3::text[])
+         )",
+    )
+    .bind(user_id)
+    .bind(&live_trade_text)
+    .bind(&live_order_text)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let deleted_live_orders =
+        sqlx::query("DELETE FROM strategy_orders WHERE user_id=$1 AND execution_mode='live'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    let deleted_live_risk_decisions =
+        sqlx::query("DELETE FROM risk_decisions WHERE user_id=$1 AND execution_mode='live'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    let deleted_live_trades =
+        sqlx::query("DELETE FROM trades WHERE user_id=$1 AND execution_mode='live'")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    let deleted_orphan_signals = sqlx::query(
+        "DELETE FROM strategy_signals s
+         WHERE s.id=ANY($1::uuid[])
+           AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.signal_id=s.id)",
+    )
+    .bind(&removed_signal_ids)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let deleted_orphan_snapshots = sqlx::query(
+        "DELETE FROM strategy_market_snapshots s
+         WHERE s.id=ANY($1::uuid[])
+           AND NOT EXISTS (SELECT 1 FROM strategy_orders o WHERE o.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.strategy_snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_reversal_intents r WHERE r.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_signals signal WHERE signal.snapshot_id=s.id)
+           AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.snapshot_id=s.id)",
+    )
+    .bind(&candidate_snapshot_ids)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(ClearedLiveTradeState {
+        deleted_live_trades,
+        deleted_live_orders,
+        deleted_live_intents: removed_signal_ids.len() as u64,
+        deleted_live_events,
+        deleted_live_risk_decisions,
+        deleted_orphan_signals,
+        deleted_orphan_snapshots,
+    })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1525,5 +1748,24 @@ mod security_tests {
             Err(AppError::BadRequest(message))
                 if message.contains("global kill switch")
         ));
+    }
+
+    #[test]
+    fn clear_trade_scope_is_explicit_strict_and_demo_compatible() {
+        let demo: AdminClearTradesMutation =
+            serde_json::from_value(json!({"username":"TRADER"})).unwrap();
+        assert_eq!(demo.scope, ClearTradeScope::Demo);
+        let live: AdminClearTradesMutation =
+            serde_json::from_value(json!({"username":"TRADER","scope":"live"})).unwrap();
+        assert_eq!(live.scope, ClearTradeScope::Live);
+        let all: AdminClearTradesMutation =
+            serde_json::from_value(json!({"username":"TRADER","scope":"all"})).unwrap();
+        assert_eq!(all.scope, ClearTradeScope::All);
+        assert!(
+            serde_json::from_value::<AdminClearTradesMutation>(
+                json!({"username":"TRADER","scope":"unsafe"})
+            )
+            .is_err()
+        );
     }
 }

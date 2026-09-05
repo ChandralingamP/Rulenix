@@ -155,18 +155,19 @@ export default function AdminUsersPage() {
   const confirmClearLogs = useCallback(async () => {
     if (!pendingClearLogs) return;
     const username = pendingClearLogs.username;
+    const scope = pendingClearLogs.scope;
     setClearingLogsUser(username);
     setError("");
     setNotice("");
     try {
       const response = await apiClient.delete("/auth/admin/users/trade-logs/", {
-        data: { username },
+        data: { username, scope },
       });
       const deletedTrades = response.data?.deleted_trades ?? 0;
-      const deletedDemoOrders = response.data?.deleted_demo_orders ?? 0;
+      const deletedOrders = (response.data?.deleted_demo_orders ?? 0) + (response.data?.deleted_live_orders ?? 0);
       const deletedBacktests = response.data?.deleted_backtest_runs ?? 0;
       setNotice(
-        `Cleared ${deletedTrades} trade ${deletedTrades === 1 ? "record" : "records"}, ${deletedDemoOrders} demo ${deletedDemoOrders === 1 ? "order" : "orders"}, and ${deletedBacktests} backtest ${deletedBacktests === 1 ? "run" : "runs"} for ${username}. Refresh the user's trading view to confirm the clean state.`
+        `Clear ${scope.toUpperCase()} completed for ${username}: ${deletedTrades} trade ${deletedTrades === 1 ? "record" : "records"}, ${deletedOrders} local ${deletedOrders === 1 ? "order" : "orders"}, and ${deletedBacktests} backtest ${deletedBacktests === 1 ? "run" : "runs"} removed. No broker order or position was changed.`
       );
       setPendingClearLogs(null);
       await loadUsers();
@@ -174,7 +175,7 @@ export default function AdminUsersPage() {
       const detail = requestError.response?.data?.detail;
       setError(
         detail?.toLowerCase().includes("global kill switch")
-          ? "Enable the Global Kill Switch from Admin → Risk limits before clearing DEMO trading records."
+          ? "Enable the Global Kill Switch from Admin → Risk limits before clearing trading records."
           : detail || "Unable to clear trade logs."
       );
     } finally {
@@ -339,8 +340,14 @@ export default function AdminUsersPage() {
                           <button type="button" disabled={busy} onClick={() => updatePermission(user.username, "can_backtest", !user.can_backtest)} className="rounded-lg border border-sky-500/40 px-3 py-2 text-xs font-semibold text-sky-200 disabled:border-slate-700 disabled:text-slate-600">
                             {user.can_backtest ? "Revoke backtest" : "Grant backtest"}
                           </button>
-                          <button type="button" disabled={busy} onClick={() => setPendingClearLogs({ username: user.username })} className="rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-200 disabled:border-slate-700 disabled:text-slate-600">
-                            {clearingLogsUser === user.username ? "Clearing..." : "Clear trade logs"}
+                          <button type="button" disabled={busy} onClick={() => setPendingClearLogs({ username: user.username, scope: "demo" })} className="rounded-lg border border-amber-500/40 px-3 py-2 text-xs font-semibold text-amber-200 disabled:border-slate-700 disabled:text-slate-600">
+                            {clearingLogsUser === user.username ? "Clearing..." : "Clear DEMO"}
+                          </button>
+                          <button type="button" disabled={busy} onClick={() => setPendingClearLogs({ username: user.username, scope: "live" })} className="rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-200 disabled:border-slate-700 disabled:text-slate-600">
+                            {clearingLogsUser === user.username ? "Clearing..." : "Clear LIVE"}
+                          </button>
+                          <button type="button" disabled={busy} onClick={() => setPendingClearLogs({ username: user.username, scope: "all" })} className="rounded-lg bg-rose-600/80 px-3 py-2 text-xs font-semibold text-white disabled:bg-slate-700">
+                            {clearingLogsUser === user.username ? "Clearing..." : "Clear ALL"}
                           </button>
                           <button type="button" disabled={busy || isSelf} onClick={() => setPendingDelete({ username: user.username })} className="rounded-lg bg-rose-500/80 px-3 py-2 text-xs font-semibold text-white disabled:bg-slate-700">
                             {deletingUser === user.username ? "Deleting..." : "Delete"}
@@ -372,11 +379,18 @@ export default function AdminUsersPage() {
       {pendingClearLogs ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
           <div role="dialog" aria-modal="true" aria-labelledby="clear-trade-logs-title" className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
-            <h2 id="clear-trade-logs-title" className="text-lg font-semibold text-white">Clear trade logs for {pendingClearLogs.username}?</h2>
-            <p className="mt-2 text-sm leading-6 text-slate-300">This permanently resets this user&apos;s closed and running DEMO trades, simulated orders, related execution state, and saved backtest runs. Enable the Global Kill Switch from Admin → Risk limits first. LIVE trades, LIVE orders, credentials, permissions, strategy settings, and Angel egress assignments are preserved. No broker order is placed, modified, or cancelled by this action. This action cannot be undone.</p>
+            <h2 id="clear-trade-logs-title" className="text-lg font-semibold text-white">Clear {pendingClearLogs.scope.toUpperCase()} records for {pendingClearLogs.username}?</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-300">
+              {pendingClearLogs.scope === "demo"
+                ? "This permanently removes this user's local DEMO trades, simulated orders, related execution state, and saved backtest runs. LIVE records are preserved."
+                : pendingClearLogs.scope === "live"
+                  ? "This permanently removes only eligible local LIVE history after authoritative Angel positions, orders, trades, and conditional/GTT checks prove it safe. DEMO records are preserved. It does NOT close broker positions or orders."
+                  : "This permanently removes eligible local DEMO and LIVE history. LIVE cleanup proceeds only after authoritative Angel positions, orders, trades, and conditional/GTT checks prove it safe. It does NOT close broker positions or orders."}
+              {" "}The Global Kill Switch must be enabled. Credentials, permissions, strategy settings, connection configuration, and Angel egress assignments are preserved. No broker order is placed, modified, or cancelled. This action cannot be undone.
+            </p>
             <div className="mt-6 flex justify-end gap-3">
               <button type="button" disabled={Boolean(clearingLogsUser)} onClick={() => setPendingClearLogs(null)} className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 disabled:opacity-50">Cancel</button>
-              <button type="button" disabled={Boolean(clearingLogsUser)} onClick={confirmClearLogs} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{clearingLogsUser ? "Clearing..." : "Clear trade logs"}</button>
+              <button type="button" disabled={Boolean(clearingLogsUser)} onClick={confirmClearLogs} className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-700">{clearingLogsUser ? "Clearing..." : `Clear ${pendingClearLogs.scope.toUpperCase()}`}</button>
             </div>
           </div>
         </div>

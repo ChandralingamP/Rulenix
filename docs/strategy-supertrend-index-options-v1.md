@@ -100,8 +100,8 @@ remaining active exit order.
 ## Trading window
 
 The scheduler evaluates SuperTrend on exact 5-minute boundaries from 09:15 IST
-until 15:20 IST. Entries and reversals are allowed from 09:15 IST until before
-15:20 IST. Only completed 5-minute candles are used. A shared Angel websocket
+until 15:10 IST. Entries and reversals are allowed from 09:15 IST until before
+15:10 IST. Only completed 5-minute candles are used. A shared Angel websocket
 continuously builds the SENSEX and NIFTY candles once for all users. Historical
 REST candles warm the previous-session state and recover websocket gaps.
 
@@ -111,11 +111,11 @@ an old crossover at the next 5- or 10-minute cycle. Entry intents expire 90
 seconds after the signal candle closes, preventing a slow quote/contract lookup
 from creating a stale trade.
 
-At/after 15:20 IST, the strategy creates durable intraday square-off intents for
+At/after 15:10 IST, the strategy creates durable intraday square-off intents for
 all open positions. Active protective orders are cancelled before square-off.
 The watchdog keeps retrying after 15:30 and across backend restarts until broker
 reconciliation confirms closure. No new SuperTrend entries are submitted at or
-after 15:20 IST.
+after 15:10 IST.
 
 The existing stop remains active if the square-off quote cannot be obtained. A MARKET close is attempted only after protective cancellation is broker-terminal. Rejected attempts remain in history and retries use a new deterministic attempt key; an active or ambiguous MARKET close is never blindly duplicated.
 

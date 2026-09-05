@@ -23,10 +23,10 @@
   <text x="115" y="216" class="label">Leader scheduler</text><text x="115" y="239" class="small">5-second clock + DB leader lock</text>
   <path d="M400 220 H510" class="arrow"/>
   <rect x="510" y="188" width="390" height="64" class="box" fill="#1d4ed8" stroke="#60a5fa"/>
-  <text x="535" y="216" class="label">Exact 5-minute boundary</text><text x="535" y="239" class="small">09:15, 09:20 … 15:20 IST</text>
+  <text x="535" y="216" class="label">Exact 5-minute boundary</text><text x="535" y="239" class="small">09:15, 09:20 … 15:10 IST</text>
   <path d="M900 220 H1010" class="arrow"/>
   <rect x="1010" y="188" width="455" height="64" class="box" fill="#312e81" stroke="#818cf8"/>
-  <text x="1035" y="216" class="label">Spawn one SuperTrend cycle</text><text x="1035" y="239" class="small">Session check · 15:20 square-off gate</text>
+  <text x="1035" y="216" class="label">Spawn one SuperTrend cycle</text><text x="1035" y="239" class="small">Session check · 15:10 square-off gate</text>
 
   <rect x="55" y="310" width="1490" height="270" class="lane"/>
   <text x="85" y="345" class="tiny">SIGNAL LANE · SEQUENTIAL BY DESIGN TO PROTECT ANGEL HISTORICAL-DATA RATE LIMIT</text>

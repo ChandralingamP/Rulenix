@@ -59,11 +59,11 @@ For priced orders, Rulenix requests FULL market data and validates the actionabl
 
 The RMS parser requires the documented `availablecash` field and does not fall back to `net` or `availablelimitmargin`. Estimated order margin plus the configured safety buffer must fit inside that value. Exact live semantics and rejection behavior remain an Angel One sandbox release gate.
 
-## 15:20 square-off
+## 15:10 square-off
 
-SuperTrend creates durable `SQUARE_OFF` intents for every open trade at 15:20
+SuperTrend creates durable `SQUARE_OFF` intents for every open trade at 15:10
 IST. Protective orders are cancelled first, then a MARKET exit
-is submitted. The watchdog continues every minute after 15:20 and across
+is submitted. The watchdog continues every minute after 15:10 and across
 restarts until reconciliation confirms closure. Demo expiry checkpoints may
 close the local trade directly; live trades are never marked closed without a
 confirmed broker outcome.

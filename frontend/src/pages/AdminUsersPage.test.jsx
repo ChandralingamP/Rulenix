@@ -41,7 +41,7 @@ describe("AdminUsersPage Clear Trades", () => {
     vi.clearAllMocks();
   });
 
-  it("refetches admin state after the complete demo reset succeeds", async () => {
+  it("submits an explicit DEMO scope and refetches after success", async () => {
     apiClient.get
       .mockResolvedValueOnce({ data: [trader] })
       .mockResolvedValueOnce({ data: [] })
@@ -58,15 +58,15 @@ describe("AdminUsersPage Clear Trades", () => {
     render(<AdminUsersPage />);
 
     await screen.findByText("TRADER01");
-    await user.click(screen.getByRole("button", { name: "Clear trade logs" }));
-    expect(screen.getByText(/closed and running demo trades/i)).toBeInTheDocument();
-    await user.click(screen.getAllByRole("button", { name: "Clear trade logs" })[1]);
+    await user.click(screen.getByRole("button", { name: "Clear DEMO" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(/local DEMO trades/i);
+    await user.click(screen.getAllByRole("button", { name: "Clear DEMO" })[1]);
 
     await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(4));
     expect(apiClient.delete).toHaveBeenCalledWith("/auth/admin/users/trade-logs/", {
-      data: { username: "TRADER01" },
+      data: { username: "TRADER01", scope: "demo" },
     });
-    expect(await screen.findByText(/Cleared 3 trade records, 5 demo orders/)).toBeInTheDocument();
+    expect(await screen.findByText(/Clear DEMO completed.*3 trade records, 5 local orders/i)).toBeInTheDocument();
   });
 
   it("guides the administrator to the explicit Global Kill Switch when clear is blocked", async () => {
@@ -80,11 +80,26 @@ describe("AdminUsersPage Clear Trades", () => {
     render(<AdminUsersPage />);
 
     await screen.findByText("TRADER01");
-    await user.click(screen.getByRole("button", { name: "Clear trade logs" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent(/LIVE trades, LIVE orders, credentials/i);
-    await user.click(screen.getAllByRole("button", { name: "Clear trade logs" })[1]);
+    await user.click(screen.getByRole("button", { name: "Clear LIVE" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(/does NOT close broker positions or orders/i);
+    await user.click(screen.getAllByRole("button", { name: "Clear LIVE" })[1]);
 
-    expect(await screen.findByText("Enable the Global Kill Switch from Admin → Risk limits before clearing DEMO trading records.")).toBeInTheDocument();
+    expect(await screen.findByText("Enable the Global Kill Switch from Admin → Risk limits before clearing trading records.")).toBeInTheDocument();
+  });
+
+  it("exposes DEMO, LIVE, and ALL scopes with a strong ALL confirmation", async () => {
+    apiClient.get
+      .mockResolvedValueOnce({ data: [trader] })
+      .mockResolvedValueOnce({ data: [] });
+    const user = userEvent.setup();
+    render(<AdminUsersPage />);
+
+    await screen.findByText("TRADER01");
+    expect(screen.getByRole("button", { name: "Clear DEMO" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear LIVE" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Clear ALL" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent(/eligible local DEMO and LIVE history/i);
+    expect(screen.getByRole("dialog")).toHaveTextContent(/No broker order is placed, modified, or cancelled/i);
   });
 
   it("assigns an available IP and supports server-default networking", async () => {

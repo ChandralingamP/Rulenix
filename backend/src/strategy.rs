@@ -41,7 +41,7 @@ const NIFTY_INDEX_TOKEN: &str = "99926000";
 const OPTION_INTERVAL: &str = "FIVE_MINUTE";
 const OPTION_PRODUCT_TYPE: &str = "INTRADAY";
 const SUPERTREND_ENTRY_START_MINUTE: u32 = 9 * 60 + 15;
-const OPTION_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
+const OPTION_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 10;
 const OPTION_SCHEDULER_END_MINUTE: u32 = 15 * 60 + 30;
 const FUTURES_EXPIRY_SQUARE_OFF_MINUTE: u32 = 15 * 60 + 20;
 const SHARED_MARKET_CREDENTIAL_LIMIT: i64 = 8;
@@ -4717,16 +4717,16 @@ async fn ensure_square_off_intents(
     strategy_key: &str,
     now: DateTime<FixedOffset>,
 ) -> AppResult<Uuid> {
-    let session_key = format!("squareoff-{}-1520", now.format("%Y%m%d"));
+    let session_key = format!("squareoff-{}-1510", now.format("%Y%m%d"));
     let signal_at = ist_naive_to_utc(
         now.date_naive()
-            .and_hms_opt(15, 20, 0)
+            .and_hms_opt(15, 10, 0)
             .ok_or_else(|| AppError::BadRequest("Invalid square-off time.".into()))?,
     )?;
     let signal_id = Uuid::new_v4();
     let stored_id: Uuid = sqlx::query_scalar(
         "INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,signal_type,expected_users,payload,status)
-         SELECT $1,$2,'ALL',$3,$4,'SQUARE_OFF',COUNT(DISTINCT user_id)::int4,jsonb_build_object('scheduled_for','15:20 IST'),'dispatching'
+         SELECT $1,$2,'ALL',$3,$4,'SQUARE_OFF',COUNT(DISTINCT user_id)::int4,jsonb_build_object('scheduled_for','15:10 IST'),'dispatching'
          FROM trades WHERE strategy_key=$2 AND status='open' AND remaining_lots>0
          ON CONFLICT(strategy_key,instrument,session_key,signal_type)
          DO UPDATE SET expected_users=GREATEST(strategy_signals.expected_users,EXCLUDED.expected_users),updated_at=NOW()
@@ -4742,7 +4742,7 @@ async fn ensure_square_off_intents(
         "INSERT INTO strategy_execution_intents(id,signal_id,user_id,snapshot_id,trade_id,strategy_key,instrument,session_key,action,role,side,order_type,lots,quantity,price,status)
          SELECT gen_random_uuid(),$1,t.user_id,t.strategy_snapshot_id,t.id,t.strategy_key,
                 split_part(t.instrument_label,'_',1),
-                'stsq-' || $2 || '-1520',
+                'stsq-' || $2 || '-1510',
                 'SQUARE_OFF','EMERGENCY_CLOSE','SELL','MARKET',GREATEST(t.remaining_lots,1),GREATEST(t.quantity,1),t.last_price::float8,'pending'
          FROM trades t
          WHERE t.strategy_key=$3 AND t.status='open' AND t.remaining_lots>0 AND t.strategy_snapshot_id IS NOT NULL
@@ -5095,7 +5095,7 @@ async fn process_supertrend_square_off(
         sqlx::query("UPDATE trades SET safety_status=CASE WHEN safety_status='EMERGENCY_CLOSING' THEN safety_status ELSE 'CLOSING' END,updated_at=NOW() WHERE id=$1 AND status='open'")
             .bind(trade_id).execute(&state.db).await?;
         trip_execution_failpoint("after_square_off_intent_before_market_close").await?;
-        let base_session = format!("stsq-{}-{}-1520", underlying, now.format("%Y%m%d"));
+        let base_session = format!("stsq-{}-{}-1510", underlying, now.format("%Y%m%d"));
         let session =
             terminal_retry_session(state, trade_id, "EMERGENCY_CLOSE", &base_session).await?;
         if let Err(error) = place_strategy_order(
@@ -7560,6 +7560,186 @@ fn conditional_rule_is_active(rule: &Value) -> bool {
         status.as_str(),
         "CANCELLED" | "CANCELED" | "REJECTED" | "EXPIRED" | "COMPLETED" | "COMPLETE"
     )
+}
+
+async fn live_clear_rejection(state: &AppState, user_id: Uuid, detail: String) -> AppError {
+    let _ = risk::set_reconciliation_health(state, user_id, false, &detail).await;
+    AppError::BadRequest(detail)
+}
+
+/// Perform the authoritative, read-only broker inventory required before an
+/// administrator may remove local LIVE history. This function deliberately
+/// exposes no broker mutation path: any unavailable or structurally unknown
+/// response fails closed and marks LIVE reconciliation unhealthy.
+pub(crate) async fn verify_broker_safe_for_live_clear(
+    state: &AppState,
+    user_id: Uuid,
+) -> AppResult<()> {
+    let credentials = match state.credentials.load(user_id).await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            return Err(live_clear_rejection(
+                state,
+                user_id,
+                format!("Clear LIVE requires a connected, readable Angel account: {error}"),
+            )
+            .await);
+        }
+    };
+    let order_book = match angel::order_book(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ =
+                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+            return Err(AppError::BadRequest(format!(
+                "Clear LIVE refused because the Angel order book is unreadable; broker state is unknown: {error}"
+            )));
+        }
+    };
+    let positions = match angel::positions(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ =
+                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+            return Err(AppError::BadRequest(format!(
+                "Clear LIVE refused because Angel positions are unreadable; broker state is unknown: {error}"
+            )));
+        }
+    };
+    let trade_book = match angel::trade_book(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ =
+                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+            return Err(AppError::BadRequest(format!(
+                "Clear LIVE refused because the Angel trade book is unreadable; broker state is unknown: {error}"
+            )));
+        }
+    };
+    let conditional_rules = match angel::conditional_rules(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ =
+                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+            return Err(AppError::BadRequest(format!(
+                "Clear LIVE refused because Angel conditional/GTT state is unreadable; broker state is unknown: {error}"
+            )));
+        }
+    };
+
+    let broker_positions = if positions.is_null() {
+        Vec::new()
+    } else {
+        let Some(raw) = positions.as_array() else {
+            return Err(live_clear_rejection(
+                state,
+                user_id,
+                "Clear LIVE refused because Angel returned malformed position data.".into(),
+            )
+            .await);
+        };
+        let parsed = parse_broker_positions(&positions);
+        if parsed.len() != raw.len() {
+            return Err(live_clear_rejection(
+                state,
+                user_id,
+                "Clear LIVE refused because an Angel position could not be classified safely."
+                    .into(),
+            )
+            .await);
+        }
+        parsed
+    };
+    let open_positions = broker_positions
+        .iter()
+        .filter(|position| position.net_quantity != 0)
+        .count();
+    if open_positions > 0 {
+        return Err(live_clear_rejection(
+            state,
+            user_id,
+            format!("Clear LIVE refused because Angel reports {open_positions} open broker position(s). Close and reconcile broker exposure first."),
+        )
+        .await);
+    }
+
+    if !order_book.is_null() {
+        let Some(orders) = order_book.as_array() else {
+            return Err(live_clear_rejection(
+                state,
+                user_id,
+                "Clear LIVE refused because Angel returned malformed order-book data.".into(),
+            )
+            .await);
+        };
+        let unsafe_orders = orders
+            .iter()
+            .filter(|order| {
+                let status = broker_text(order, &["status", "orderstatus", "orderStatus"])
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                status.is_empty() || !broker_order_is_terminal(&status)
+            })
+            .count();
+        if unsafe_orders > 0 {
+            return Err(live_clear_rejection(
+                state,
+                user_id,
+                format!("Clear LIVE refused because Angel reports {unsafe_orders} active or structurally unknown broker order(s)."),
+            )
+            .await);
+        }
+    }
+    if !trade_book.is_null() && !trade_book.is_array() {
+        return Err(live_clear_rejection(
+            state,
+            user_id,
+            "Clear LIVE refused because Angel returned malformed trade-book data.".into(),
+        )
+        .await);
+    }
+    let active_conditionals = conditional_rules
+        .iter()
+        .filter(|rule| conditional_rule_is_active(rule))
+        .count();
+    if active_conditionals > 0 {
+        return Err(live_clear_rejection(
+            state,
+            user_id,
+            format!("Clear LIVE refused because Angel reports {active_conditionals} active conditional/GTT rule(s)."),
+        )
+        .await);
+    }
+    Ok(())
 }
 
 async fn reconcile_live_user_with_scope(
@@ -11965,7 +12145,7 @@ mod tests {
     }
 
     #[test]
-    fn supertrend_entry_window_is_0915_through_1519_ist() {
+    fn supertrend_entry_window_is_0915_through_1509_ist() {
         let offset = FixedOffset::east_opt(19_800).unwrap();
         let at = |hour, minute| {
             offset
@@ -11975,9 +12155,11 @@ mod tests {
         };
         assert!(!supertrend_entry_allowed(at(9, 14)));
         assert!(supertrend_entry_allowed(at(9, 15)));
-        assert!(supertrend_entry_allowed(at(15, 19)));
-        assert!(!supertrend_entry_allowed(at(15, 20)));
-        assert!(option_square_off_due(at(15, 20)));
+        assert!(supertrend_entry_allowed(at(15, 9)));
+        assert!(!option_square_off_due(at(15, 9)));
+        assert!(!supertrend_entry_allowed(at(15, 10)));
+        assert!(option_square_off_due(at(15, 10)));
+        assert!(option_square_off_due(at(15, 11)));
     }
 
     #[test]
@@ -12321,7 +12503,7 @@ mod tests {
             recorded_exit_reason(
                 SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
                 "SL1",
-                "stsq-20260812-1520"
+                "stsq-20260812-1510"
             ),
             "MARKET_CLOSED"
         );
@@ -14155,7 +14337,7 @@ mod tests {
             seed_live_supertrend_square_off_fixture(&state).await;
         *fake.quote_unavailable.lock().await = true;
         let offset = FixedOffset::east_opt(19_800).unwrap();
-        let local = ist_now().date_naive().and_hms_opt(15, 21, 0).unwrap();
+        let local = ist_now().date_naive().and_hms_opt(15, 10, 0).unwrap();
         let now = offset.from_local_datetime(&local).single().unwrap();
 
         let quote_error = process_supertrend_square_off(&state, now)
@@ -14219,6 +14401,51 @@ mod tests {
         assert_eq!(result.3, 1, "exactly one active market close is allowed");
         assert_eq!(result.4, "submitted");
         assert_eq!(fake.placed_orders.lock().await.len(), 1);
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn supertrend_1510_demo_square_off_is_kill_safe_idempotent_and_broker_free() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, _, trade_id, _stop_id, token, _) =
+            seed_live_supertrend_square_off_fixture(&state).await;
+        sqlx::query("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE trades SET execution_mode='demo',safety_status='DEMO',broker_net_quantity=NULL,last_position_reconciled_at=NULL WHERE id=$1")
+            .bind(trade_id).execute(&state.db).await.unwrap();
+        sqlx::query(
+            "UPDATE strategy_orders SET execution_mode='demo',broker_order_id='' WHERE trade_id=$1",
+        )
+        .bind(trade_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE,reason='15:10 demo exit test'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        fake.quote_ltps.lock().await.insert(token, 101.0);
+        let offset = FixedOffset::east_opt(19_800).unwrap();
+        let local = ist_now().date_naive().and_hms_opt(15, 10, 0).unwrap();
+        let now = offset.from_local_datetime(&local).single().unwrap();
+
+        process_supertrend_square_off(&state, now).await.unwrap();
+        process_supertrend_square_off(&state, now).await.unwrap();
+        let result: (String, String, i64) = sqlx::query_as(
+            "SELECT status,exit_reason,(SELECT COUNT(*) FROM strategy_orders WHERE trade_id=t.id AND role='EMERGENCY_CLOSE') FROM trades t WHERE id=$1",
+        )
+        .bind(trade_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(result, ("closed".into(), "MARKET_CLOSED".into(), 1));
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
         broker_task.abort();
     }
 
@@ -15068,6 +15295,249 @@ mod tests {
             !active_after,
             "legitimate demo cleanup must remove only the active-state blocker"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_clear_live_and_all_are_scoped_idempotent_and_preserve_account_configuration() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let admin_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        for (id, username, admin) in [
+            (admin_id, "clear-scope-admin", true),
+            (user_id, "clear-scope-user", false),
+            (other_id, "clear-scope-other", false),
+        ] {
+            sqlx::query("INSERT INTO users(id,username,email,password_hash,can_administer) VALUES($1,$2,$3,'test-only',$4)")
+                .bind(id).bind(username).bind(format!("{username}@example.test")).bind(admin)
+                .execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,error,contract_token,contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,execution_key) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','','clear-live-token','CLEARLIVEFUT',CURRENT_DATE+30,10,'MCX','CARRYFORWARD','clear-live-safe')")
+            .bind(snapshot_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        let live_trade = Uuid::new_v4();
+        let demo_trade = Uuid::new_v4();
+        let other_trade = Uuid::new_v4();
+        for (trade_id, owner, mode) in [
+            (live_trade, user_id, "live"),
+            (demo_trade, user_id, "demo"),
+            (other_trade, other_id, "live"),
+        ] {
+            sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,exit_datetime,instrument_label,contract_symbol,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status,broker_net_quantity,last_position_reconciled_at) VALUES($1,$2,$3,'closed','BUY',10,100,101,10,NOW()-INTERVAL '1 day',NOW(),'GOLDTEN','CLEARLIVEFUT',$4,$5,1,0,CASE WHEN $3='live' THEN 'CLOSED' ELSE 'DEMO' END,CASE WHEN $3='live' THEN 0 END,CASE WHEN $3='live' THEN NOW() END)")
+                .bind(trade_id).bind(owner).bind(mode).bind(STRATEGY_KEY).bind(snapshot_id)
+                .execute(&state.db).await.unwrap();
+        }
+        let live_order = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,status,broker_order_id,idempotency_key,client_order_id,filled_quantity,processed_quantity) VALUES($1,$2,$3,$4,'clear-live-terminal','BUY_ENTRY','BUY','MARKET','live',1,10,100,'filled','CLEAR-LIVE-BROKER','clear-live-key','CLEARLIVETAG',10,10)")
+            .bind(live_order).bind(user_id).bind(snapshot_id).bind(live_trade)
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots) VALUES($1,$2,'GOLDTEN',TRUE,2)")
+            .bind(user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        let egress_id: Uuid = sqlx::query_scalar("INSERT INTO broker_egress_ips(ip_address,configuration_status,verification_status) VALUES('192.0.2.44','CONFIGURED','VERIFIED') RETURNING id")
+            .fetch_one(&state.db).await.unwrap();
+        state
+            .credentials
+            .put(
+                user_id,
+                &[("api_key", "clear-api"), ("jwt_token", "clear-jwt")],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE,reason='clear scope test'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let admin = AuthUser {
+            id: admin_id,
+            username: "clear-scope-admin".into(),
+            can_administer: true,
+            can_live_trade: false,
+            can_backtest: false,
+            can_backtest_on_trading_days: false,
+            trading_mode: "demo".into(),
+            session_id: Uuid::new_v4(),
+        };
+
+        sqlx::query("UPDATE risk_kill_switches SET enabled=FALSE")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for scope in [
+            crate::auth::ClearTradeScope::Demo,
+            crate::auth::ClearTradeScope::Live,
+            crate::auth::ClearTradeScope::All,
+        ] {
+            let error = crate::auth::clear_user_trade_logs(
+                State(state.clone()),
+                Extension(admin.clone()),
+                HeaderMap::new(),
+                None,
+                Json(crate::auth::AdminClearTradesMutation {
+                    username: "clear-scope-user".into(),
+                    scope,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("global kill switch"));
+        }
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let forbidden = crate::auth::clear_user_trade_logs(
+            State(state.clone()),
+            Extension(AuthUser {
+                can_administer: false,
+                ..admin.clone()
+            }),
+            HeaderMap::new(),
+            None,
+            Json(crate::auth::AdminClearTradesMutation {
+                username: "clear-scope-user".into(),
+                scope: crate::auth::ClearTradeScope::Demo,
+            }),
+        )
+        .await;
+        assert!(matches!(forbidden, Err(AppError::Forbidden(_))));
+
+        for expected_deleted in [1_u64, 0] {
+            let response = crate::auth::clear_user_trade_logs(
+                State(state.clone()),
+                Extension(admin.clone()),
+                HeaderMap::new(),
+                None,
+                Json(crate::auth::AdminClearTradesMutation {
+                    username: "clear-scope-user".into(),
+                    scope: crate::auth::ClearTradeScope::Live,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["deleted_live_trades"], expected_deleted);
+        }
+        let scoped: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='live'),(SELECT COUNT(*) FROM trades WHERE user_id=$1 AND execution_mode='demo'),(SELECT COUNT(*) FROM trades WHERE user_id=$2)")
+            .bind(user_id).bind(other_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(scoped, (0, 1, 1));
+        let preserved: (i64, Option<Uuid>, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM broker_secrets WHERE user_id=$1),p.broker_egress_ip_id,(SELECT COUNT(*) FROM user_strategy_configs WHERE user_id=$1),(SELECT COUNT(*) FROM users WHERE id=$1),(SELECT COUNT(*) FROM broker_egress_ips WHERE id=$2) FROM user_profiles p WHERE p.user_id=$1")
+            .bind(user_id).bind(egress_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(preserved, (2, None, 1, 1, 1));
+
+        let all = crate::auth::clear_user_trade_logs(
+            State(state.clone()),
+            Extension(admin),
+            HeaderMap::new(),
+            None,
+            Json(crate::auth::AdminClearTradesMutation {
+                username: "clear-scope-user".into(),
+                scope: crate::auth::ClearTradeScope::All,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.0["deleted_demo_trades"], 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trades WHERE user_id=$1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn admin_clear_live_fails_closed_for_broker_or_durable_exposure_without_mutations() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let user_id = seed_flat_linked_live_account(&state, "clear-live-blocked").await;
+        sqlx::query("UPDATE risk_kill_switches SET enabled=TRUE,reason='clear blocked test'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let invoke = || {
+            crate::auth::clear_user_trade_logs(
+                State(state.clone()),
+                Extension(AuthUser {
+                    id: Uuid::new_v4(),
+                    username: "test-admin".into(),
+                    can_administer: true,
+                    can_live_trade: false,
+                    can_backtest: false,
+                    can_backtest_on_trading_days: false,
+                    trading_mode: "demo".into(),
+                    session_id: Uuid::new_v4(),
+                }),
+                HeaderMap::new(),
+                None,
+                Json(crate::auth::AdminClearTradesMutation {
+                    username: "clear-live-blocked-user".into(),
+                    scope: crate::auth::ClearTradeScope::Live,
+                }),
+            )
+        };
+
+        *fake.positions.lock().await = vec![
+            json!({"exchange":"MCX","symboltoken":"1","tradingsymbol":"OPEN","producttype":"CARRYFORWARD","netqty":"10","avgnetprice":"100"}),
+        ];
+        assert!(
+            invoke()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("open broker position")
+        );
+        fake.positions.lock().await.clear();
+        *fake.order_book.lock().await = vec![json!({"orderid":"ACTIVE","status":"open"})];
+        assert!(
+            invoke()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("broker order")
+        );
+        fake.order_book.lock().await.clear();
+        *fake.conditional_rules.lock().await = vec![json!({"id":"GTT-1","status":"ACTIVE"})];
+        assert!(
+            invoke()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conditional/GTT")
+        );
+        fake.conditional_rules.lock().await.clear();
+        *fake.conditional_unavailable.lock().await = true;
+        assert!(
+            invoke()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unreadable")
+        );
+        *fake.conditional_unavailable.lock().await = false;
+        sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,detail) VALUES($1,'open',1,'test unresolved mutation')")
+            .bind(user_id).execute(&state.db).await.unwrap();
+        assert!(
+            invoke()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("durable LIVE exposure")
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+        broker_task.abort();
     }
 
     #[tokio::test]
