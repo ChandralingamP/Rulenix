@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     credential_primary_version: int = Field(default=1, validation_alias=AliasChoices("CREDENTIAL_PRIMARY_VERSION", "CREDENTIAL_ENCRYPTION_PRIMARY_VERSION"))
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     live_trading_enabled: bool = Field(default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED")
+    egress_helper_socket: str = Field(default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET")
 
     @field_validator("live_trading_enabled")
     @classmethod

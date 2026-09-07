@@ -1499,3 +1499,55 @@ PYTHON LIVE ORDERS CANCELLED: 0
 PRODUCTION MODIFIED: NO
 PHASE 3 GATE: PASS — READY FOR PER-USER STATIC EGRESS
 ```
+
+## 39. Phase 4 — Python per-user static egress parity
+
+Phase 4 continues from the Phase 3 Python branch and preserves the Rust production backend as
+authoritative. Python now reuses `broker_egress_ips` and `user_profiles.broker_egress_ip_id`; no
+duplicate schema or production migration was added. A NULL assignment resolves to `None` and uses
+the normal OS route. An explicit assignment is accepted only when the existing inventory row is a
+globally routable IPv4 with `configuration_status=CONFIGURED` and
+`verification_status=VERIFIED`. Any missing row, malformed address, stale status, helper failure,
+bind failure, or verification mismatch raises a non-retryable egress error; there is no default
+fallback.
+
+The resolver reproduces Rust's deterministic `100.64.0.0/10` alias function. REST clients use
+httpx/httpcore's `local_address` socket option, so the source address is bound at TCP creation,
+not represented by a request header. WebSocket reconnects use the same resolved alias through
+`local_address=(source_ip, 0)`. The typed Unix-socket helper client sends only the existing
+`configure_and_verify` JSON operation, bounds responses/timeouts, and never runs shell commands.
+Startup rehydration re-verifies configured inventory and marks failures fail-closed. Unassignment
+only clears the database foreign key; it never removes a configured host address.
+
+Admin-only inventory, registration, verification, assignment, and NULL-unassignment routes enforce
+CSRF through the existing session dependency. Assignments use PostgreSQL advisory transaction
+locks and the existing partial unique index, so concurrent users cannot claim one dedicated IP.
+
+### 39.1 Test evidence
+
+| Area | Result | Evidence |
+|---|---|---|
+| Rust alias/validation parity | PASS | Phase 4 unit tests cover public ranges and deterministic alias |
+| Actual REST source binding | PASS | Loopback TCP server observed explicit `127.0.0.2` peer and default `127.0.0.1` |
+| Helper protocol safety | PASS | Typed request/response, bounded response, timeout, and Unix-only test |
+| PostgreSQL resolver | PASS | Executed against isolated `rulenix_test_clear_trades`; schema and NULL/default resolution verified |
+| Phase 2/3 regression | PASS | Full Python suite with `TEST_DATABASE_URL`: all tests passed |
+| Mutation guard | PASS | No Python Angel mutation HTTP request exists or was emitted |
+
+Production host networking and the Rust service were not changed. No production IP is hard-coded;
+the only addresses in tests are loopback fixtures. Remaining later work is broker session/profile
+integration and the authorized trading/order state machine.
+
+```text
+CURRENT PHASE: 4
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 2 COMMIT: 0dd6782
+PHASE 3 COMMIT: b60a5bf
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION NETWORK CONFIG MODIFIED: NO
+PRODUCTION MODIFIED: NO
+PHASE 4 GATE: PASS — READY FOR TRADING DOMAIN AND ORDER STATE MACHINE
+```
