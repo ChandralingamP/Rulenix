@@ -1551,3 +1551,102 @@ PRODUCTION NETWORK CONFIG MODIFIED: NO
 PRODUCTION MODIFIED: NO
 PHASE 4 GATE: PASS — READY FOR TRADING DOMAIN AND ORDER STATE MACHINE
 ```
+
+## 40. Phase 5 — Python trading domain and durable order state
+
+Phase 5 continues from Phase 4 commit `a6e2c7c` on a new branch. Rust remains the live oracle and
+no Rust source, production service, or database migration was changed. Python adds a pure domain
+and repository layer over the existing Rust-owned PostgreSQL schema; it does not add duplicate
+trading tables and it accepts no broker client.
+
+### 40.1 Rust inventory and exact values
+
+The mapped tables are `trades`, `strategy_orders`, `broker_order_events`,
+`strategy_signals`, `strategy_execution_intents`, `strategy_reversal_intents`,
+`manual_trade_close_intents`, `broker_reconciliation_health`,
+`broker_reconciliation_blockers`, and `broker_position_incidents`. Existing snapshot, user,
+profile, and credential foreign keys remain authoritative.
+
+Python enum values preserve PostgreSQL/Rust spelling:
+
+* `TradeMode`: `demo`, `live`; `TradeStatus`: `open`, `closed`; `Side`: `BUY`, `SELL`.
+* `OrderRole`: `BUY_ENTRY`, `SELL_ENTRY`, `TARGET`, `SL1`, `SL2`, `EMERGENCY_CLOSE`.
+* `OrderStatus`: `pending`, `submitting`, `ambiguous`, `submitted`, `partially_filled`,
+  `processing`, `filled`, `failed`, `rejected`, `cancelling`, `cancelled`.
+* `IntentStatus`: `pending`, `claimed`, `retry_wait`, `submitted`, `completed`, `skipped`,
+  `failed`, `expired`.
+* `ProtectionStatus`: `DEMO`, `PROTECTION_REQUIRED`, `PROTECTION_SUBMITTING`,
+  `PROTECTION_UNCERTAIN`, `PROTECTED`, `PROTECTION_FAILED`, `CLOSING`, `EMERGENCY_CLOSING`,
+  `RECONCILIATION_REQUIRED`, `CLOSED`.
+* Reversal and manual-close status values match their migration checks, including
+  `processing/waiting/submitted/completed/failed/cancelled` and
+  `requested/cancelling_protection/submitted/partially_filled/ambiguous/completed/failed/
+  reconciliation_required`.
+  Exit attribution preserves Rust values including `MANUAL_BROKER_CLOSE`; exposure origin remains
+  `strategy_entry` or `broker_over_close`.
+
+The actual order trigger graph is represented explicitly: pending can submit/ack/fail/reject or
+cancel; submitting can acknowledge, become ambiguous, fail, reject, or cancel; ambiguous,
+submitted, partially-filled, and processing can be reconciled through fills or cancellation;
+cancelling can return to a broker-active state or become terminal; failed can return only to
+pending. Terminal states cannot regress. Trade status is open-to-closed only, and the safety
+trigger's closed/emergency terminal restrictions are preserved by the Python validator.
+
+### 40.2 Durable intents, claims, and locking
+
+`TradingRepository` uses ownership-scoped compare-and-set updates, caller-controlled explicit
+transactions, PostgreSQL `FOR UPDATE`, and the same `FOR UPDATE SKIP LOCKED` claim query used by
+Rust. Claims persist `status='claimed'`, increment `attempts`, and set `claimed_at`; stale claims
+can be moved to `retry_wait` for deterministic recovery. Intent completion validates the claimed
+transition and never assumes an unacknowledged broker write failed.
+
+Entry intent uniqueness remains the existing `(signal_id,user_id,action,role)` partial unique
+index; square-off uniqueness remains `(trade_id,action)`. SL2 reversal creation uses the existing
+`source_trade_id` primary key and stable `r-<trade-id>` session, so repeated confirmed SL2 events
+create exactly one intent. Manual close creation uses the existing `trade_id` primary key and the
+stable `mc-<trade-id>` session, so concurrent/repeated requests converge to one durable intent.
+
+### 40.3 Fill, protection, ambiguity, and P&L behavior
+
+Fill ingestion preserves the Rust cumulative watermark rule (`max(filled_quantity,
+processed_quantity + business_delta)`), computes only the unprocessed delta, and updates weighted
+average price with `Decimal`. Duplicate or out-of-order observations produce zero new quantity;
+partial cumulative quantity remains `partially_filled`, never `filled`. Unknown/ambiguous writes
+remain represented as `ambiguous`; broker read failure is not converted into flat/closed state.
+
+The repository exposes protection and reconciliation transitions without transmitting SL, target,
+emergency-close, reversal, or manual-close orders. `request_manual_close` records ownership,
+requested quantity, and the opposite close side. SL2 plans preserve the full original lot count
+and opposite direction. P&L uses Rust's BUY/SELL movement and instrument point-value mapping
+(`GOLDM=10`, `GOLDTEN=1`, `SILVERM=5`, `SILVERMIC=1`, `NATGASMINI=250`) with fixed-point Decimal
+arithmetic. Time values remain timezone-aware at the database boundary; strategy scheduling is
+deferred.
+
+### 40.4 Test evidence and deferred work
+
+Nineteen pure-domain tests cover the complete order graph, forbidden transitions,
+terminal/unknown states, partial/duplicate/out-of-order fills, reversal/manual-close session
+stability, and P&L fixtures. Three real PostgreSQL tests execute against isolated
+`rulenix_test_clear_trades` and cover `SKIP LOCKED` concurrent claims, intent uniqueness, trigger
+rejection of invalid transitions, fill deduplication, manual-close uniqueness, rollback, and
+cross-user ownership rejection. The complete Phase 2–5 Python suite passed 41 tests with one
+Windows-only Unix-helper test skipped; that skip does not hide a production-critical guarantee.
+Mutation-guard, egress, WebSocket, helper, and Rust regression suites all passed.
+
+No execution worker, risk engine, kill-switch enforcement, strategy signal calculation, broker
+reconciliation orchestration, or Angel mutation path is added. Those remain Phase 6–8 work.
+
+```text
+CURRENT PHASE: 5
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 2 COMMIT: 0dd6782
+PHASE 3 COMMIT: b60a5bf
+PHASE 4 COMMIT: a6e2c7c
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION MODIFIED: NO
+PHASE 5 GATE: PASS — READY FOR RISK AND TRADING SAFETY ENGINE
+```
