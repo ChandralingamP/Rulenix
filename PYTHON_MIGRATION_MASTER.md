@@ -1387,3 +1387,115 @@ LIVE ORDERS MODIFIED: 0
 LIVE ORDERS CANCELLED: 0
 PHASE 2 GATE: PASS — FOUNDATION ONLY; BROKER LAYER DEFERRED
 ```
+
+## 38. Phase 3 Broker Parity — Angel One REST + WebSocket (2026-09-07)
+
+Phase 3 continues from Phase 2 commit `0dd6782` on branch `phase3-python-broker` in
+`.runlogs/python-foundation`. The authoritative Rust production baseline remains
+`3f788f2a842ef9b1b66366d439431867850e3753`; no Rust source, production service, egress helper,
+proxy, Angel configuration, or production database was modified.
+
+### 38.1 Rust reference and Python module map
+
+The reference implementation was read from `backend/src/angel.rs`, `market_ws.rs`, `credentials.rs`,
+and `egress.rs`. Python now has the following separated modules:
+
+| Rust capability | Python module | Status |
+|---|---|---|
+| Angel envelope/header/session login | `app/broker/angel/auth.py` | implemented |
+| encrypted/session-shaped account context | `models.py`, `session.py` | implemented; persistence callback only |
+| REST transport/read operations | `rest.py` | implemented |
+| broker error classification | `errors.py`, `auth.py` | implemented with raw evidence retained |
+| pacing/cooldowns/retry | `retry.py`, `rest.py` | implemented |
+| SmartAPI V2 market WebSocket | `websocket.py` | implemented |
+| per-account factory | `factory.py`, `client.py` | implemented |
+| source-IP binding boundary | `egress.py` | interface only; Phase 4 helper remains deferred |
+| order mutation transport | `mutation_guard.py` | hard-blocked before transport |
+
+### 38.2 REST parity and normalized evidence
+
+The Python read client uses `httpx.AsyncClient`, Rust-compatible headers (`x-privatekey`,
+`x-usertype=USER`, `x-sourceid=WEB`, client IP/MAC headers, and bearer authorization), a 15-second
+read timeout, 8-second login timeout, and exact production paths for order book, trade book,
+positions, conditional/GTT inventory, historical candles, quotes, RMS limits, and margin reads.
+Conditional inventory uses the Rust 100-page safety bound. Login retries once after 350 ms; candles
+and refresh retry once after 400 ms; ordinary reads are not blindly retried. Per-account/path
+cooldowns honor bounded 5–300 second rate-limit windows, and pacing retains the Rust request classes.
+
+`BrokerError` preserves category, operation, status, broker code, retry-after, raw response evidence,
+and a redacted diagnostic. Categories include authentication expired/invalid, timeout, transport
+failure, rate limited, malformed response, broker rejected, `AB1007` order-not-found, unsupported,
+ambiguous, and unknown. `safe_*` read methods return typed success/failure results, so a successful
+empty list is structurally distinct from any failure. A read failure is never converted to flat/empty
+broker state.
+
+The Rust release does not contain a standalone individual-order-detail endpoint; order-book records
+retain broker IDs/status/timestamps/price/quantity/error fields for later evidence work. Recovering
+the missing production individual-order/classifier artifact remains a documented parity gap rather
+than an invented endpoint.
+
+### 38.3 WebSocket behavior and isolation
+
+`AngelWebSocketClient` sends the Rust-compatible authorization, API key, client code, and feed token
+headers; subscribes with SmartAPI V2 `action=1` grouped token messages; responds to ping/pong;
+parses the Rust binary tick layout and rejects corrupt/future timestamps; sends a 10-second heartbeat;
+and re-subscribes after bounded reconnects with exponential backoff capped at 90 seconds. Reconnect
+attempts are bounded and disconnects are observable typed failures.
+
+Every REST and WebSocket client is constructed from an explicit `AccountContext` containing one
+Rulenix user, client code, credential revision, and secret-bearing token set. There is no
+`global_angel_client`. Factory/concurrency tests prove API keys, bearer tokens, feed tokens,
+subscriptions, and source-IP selection do not cross accounts.
+
+### 38.4 Egress interface and fail-closed semantics
+
+`EgressBinding` accepts a user ID and returns either NULL/default routing or an explicit source IP.
+An explicit selection without a binding-capable transport raises `EgressBindingError` before any
+request; it cannot silently fall back to default networking. WebSocket explicit selections map to
+`local_address=(source_ip, 0)`. Public-IP inventory, privileged alias creation, helper socket
+protocol, and verification remain Phase 4 work; no production IP is hard-coded in Python.
+
+### 38.5 Mutation guard
+
+Only three typed mutation-shaped methods are defined in Phase 3: `place_order`, `cancel_order`, and
+`manual_close`. Each calls `MutationGuard` before transport and deterministically raises
+`MutationBlockedError`; an optional audit sink receives only operation/user/outcome fields and no
+credential. No `placeOrder`, `modifyOrder`, `cancelOrder`, or GTT create/modify/cancel HTTP path is
+registered. Rust has no modify/GTT mutation primitive, so Python does not invent one.
+
+### 38.6 Test evidence
+
+| Area | Result | Evidence |
+|---|---|---|
+| Python formatting/lint | PASS | `python -m ruff check app tests` |
+| Python type checking | PASS | `python -m mypy app --ignore-missing-imports` |
+| REST construction/parsing/errors/retry | PASS | 4 broker REST tests |
+| account isolation/egress | PASS | 2 concurrency/fail-closed tests |
+| WebSocket parser/headers/subscription/reconnect | PASS | 3 WebSocket tests |
+| mutation guard | PASS | 1 test; outgoing mutation HTTP requests = 0 |
+| PostgreSQL integration | PASS | 1 test executed against loopback `rulenix_test_clear_trades`; temp-table transaction passed |
+| Phase 2 regression + broker suite | PASS | `python -m pytest -q` — 15 passed with `TEST_DATABASE_URL`, 1 optional test skipped without it |
+| Rust reference regression | PASS | `cargo test` — 131 passed, 0 failed, 31 ignored |
+
+The PostgreSQL test uses the pre-existing explicitly disposable loopback database and only a
+transaction-scoped temporary table; it does not use production PostgreSQL or require `CREATEDB`.
+
+### 38.7 Deferred work / Phase 4 prerequisites
+
+Per-user static egress inventory/helper configuration and observed-source-IP integration remain
+deferred to Phase 4. Durable token persistence wiring, full broker profile/session verification,
+individual-order/classifier recovery, operational reconciliation, read-only API exposure, and all
+order/GTT/protection mutation support remain deferred to later authorized phases. Python is not
+deployed and is not a live writer.
+
+```text
+CURRENT PHASE: 3
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 2 COMMIT: 0dd6782
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION MODIFIED: NO
+PHASE 3 GATE: PASS — READY FOR PER-USER STATIC EGRESS
+```

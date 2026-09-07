@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     session_absolute_hours: int = Field(default=24, validation_alias="SESSION_ABSOLUTE_HOURS")
     otp_hash_key: str = Field(default="development-only-otp-key", validation_alias="OTP_HASH_KEY")
     credential_keys: str = Field(default="", validation_alias="CREDENTIAL_ENCRYPTION_KEYS")
-    credential_primary_version: int = Field(default=1, validation_alias="CREDENTIAL_PRIMARY_VERSION")
+    credential_primary_version: int = Field(default=1, validation_alias=AliasChoices("CREDENTIAL_PRIMARY_VERSION", "CREDENTIAL_ENCRYPTION_PRIMARY_VERSION"))
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     live_trading_enabled: bool = Field(default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED")
 
@@ -49,4 +49,3 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.validate_production()
     return settings
-

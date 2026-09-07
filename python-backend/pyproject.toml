@@ -17,6 +17,7 @@ dependencies = [
   "argon2-cffi>=23.1",
   "cryptography>=43",
   "httpx>=0.28",
+  "websockets>=13",
 ]
 
 [project.optional-dependencies]
