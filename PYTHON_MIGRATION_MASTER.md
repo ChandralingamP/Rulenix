@@ -1650,3 +1650,84 @@ PYTHON LIVE ORDERS CANCELLED: 0
 PRODUCTION MODIFIED: NO
 PHASE 5 GATE: PASS — READY FOR RISK AND TRADING SAFETY ENGINE
 ```
+
+## 41. Phase 6 — Python risk and trading safety engine
+
+Phase 6 continues from Phase 5 commit `871b342` on dedicated branch
+`phase6-risk-safety`. Rust remains the authoritative LIVE backend. No migration, Rust source,
+production service, networking, or Angel mutation transport was changed.
+
+### 41.1 Rust safety inventory and Python decision contract
+
+The Rust audit covered `risk.rs`, strategy safety transitions, reconciliation readiness, the
+deployment-safety view, kill-switch cancellation behavior, egress assignment, and the durable
+intent/order/trade tables. The exact production reconciliation rule is revision-bound and fresh
+within five minutes: `healthy=TRUE`, `broker_credential_revision` equal to the current profile
+revision, and `checked_at > NOW() - INTERVAL '5 minutes'`. A read failure is never treated as a
+flat broker account. Explicit egress must be both `CONFIGURED` and `VERIFIED`; NULL assignment
+retains default-network semantics.
+
+`app/risk/domain.py` provides typed `ActionClass`, `ActionKind`, `ReasonCode`, `SafetyRequest`,
+`SafetyState`, and immutable `SafetyDecision` values. Actions are classified by trading
+semantics: entries and SL2 reversals increase exposure; SL, target, manual close, EOD,
+emergency, protection recovery, and safe entry cancellation reduce risk; broker/reconciliation
+reads are non-mutating. Exit intent remains a reduction classification while quantity and
+attribution checks reject over-close attempts, so an oversized opposite order cannot use an
+exit exemption to reverse a position.
+
+### 41.2 Gates and durable blockers
+
+`SafetyRepository.final_pre_mutation_check()` takes the same shared global and per-user
+PostgreSQL advisory locks as Rust, reloads all state in a fresh transaction, records an
+auditable decision in the existing `risk_decisions` table, and has no approval-token bypass.
+The gate enforces global and user kill switches, account activity and LIVE permission,
+credential/session status, revision-bound five-minute reconciliation, broker evidence,
+explicit egress readiness, ownership and attributable quantity, safety/protection incidents,
+open reconciliation blockers, unresolved intents/reversals/manual closes, ambiguous orders,
+duplicate strategy/instrument exposure, and configured exposure limits. Any internal database
+or malformed-state failure blocks exposure-increasing actions. DEMO evaluation remains isolated
+from LIVE broker readiness and has no Angel transport.
+
+Kill-switch enablement blocks new entries and SL2 (which is new opposite exposure), while valid
+risk-reducing exits remain eligible. A final call always rechecks current state, so an approval
+obtained before a kill-switch, readiness, credential, or blocker change cannot be replayed.
+Manual close, EOD, protective and emergency actions still require ownership, an open attributable
+position, and a non-overclosing quantity. Clear Trades has an explicit safety classification;
+destructive cleanup remains deferred to the later API phase.
+
+Stable reason codes include `GLOBAL_KILL_SWITCH`, `USER_KILL_SWITCH`, `LIVE_NOT_PERMITTED`,
+`BROKER_EVIDENCE_UNAVAILABLE`, `CREDENTIAL_REVISION_MISMATCH`, `RECONCILIATION_STALE`,
+`EXPLICIT_EGRESS_UNAVAILABLE`, `PENDING_INTENT`, `AMBIGUOUS_MUTATION`, `PROTECTION_INCIDENT`,
+`DUPLICATE_EXPOSURE`, `OVER_CLOSE`, `OWNERSHIP_MISMATCH`, `LIMIT_EXCEEDED`, and
+`INTERNAL_ERROR`. No secrets are placed in the decision audit record.
+
+### 41.3 Evidence and deferred work
+
+Ten pure safety tests cover classification, kill-switch exemptions, TOCTOU, revision/freshness,
+broker evidence failure, egress, pending/ambiguous/duplicate blockers, ownership/over-close,
+DEMO isolation, and Clear Trades classification. One real PostgreSQL test executes the final
+gate, persistent kill-switch TOCTOU, credential revision invalidation, advisory locking, and
+rollback cleanup against isolated `rulenix_test_clear_trades`. The complete Phase 2–6 Python
+suite passed 52 tests with one Windows-only Unix-helper test skipped (the Linux-only helper
+protocol); Ruff and Mypy passed. Rust regression remained `131 passed, 0 failed, 31 ignored`.
+
+Execution workers, strategy signal scheduling, broker reconciliation orchestration, protective
+order submission, Clear Trades destructive endpoints, and all Angel mutations remain deferred to
+Phase 7+. This phase only supplies the reusable decision layer immediately before a future
+mutation.
+
+```text
+CURRENT PHASE: 6
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 2 COMMIT: 0dd6782
+PHASE 3 COMMIT: b60a5bf
+PHASE 4 COMMIT: a6e2c7c
+PHASE 5 COMMIT: 871b342
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION MODIFIED: NO
+PHASE 6 GATE: PASS — READY FOR STRATEGY AND EXECUTION ENGINE
+```
