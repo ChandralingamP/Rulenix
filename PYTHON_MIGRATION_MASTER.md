@@ -1731,3 +1731,87 @@ PYTHON LIVE ORDERS CANCELLED: 0
 PRODUCTION MODIFIED: NO
 PHASE 6 GATE: PASS — READY FOR STRATEGY AND EXECUTION ENGINE
 ```
+
+## 42. Phase 7 — Python strategy and execution engine
+
+Phase 7 continues from Phase 6 commit `530e3a4` on dedicated branch
+`phase7-strategy-execution`. Rust remains the authoritative LIVE backend and no production
+service, Rust source, schema migration, or Angel mutation transport was changed.
+
+### 42.1 Future Breakout v3 parity
+
+`app/strategy/futures_breakout.py` ports the authoritative four-candle calculation: `HH4` and
+`LL4` use all four candles, `HH2`/`LL2` use the last two, and the entry buffer is exactly
+`0.0012`. BUY entry is `HH4*(1+0.0012)` and SELL entry is `LL4*(1-0.0012)`. Targets use the
+1.5% movement from the actual entry. BUY stops are `max(entry*(1-0.015), LL2*(1-0.0012))` and
+`max(entry*(1-0.015), LL4*(1-0.0012))`; SELL stops use the exact Rust mirrored `min` forms with
+`1+0.0012`. Missed-entry comparisons are inclusive and independent for BUY/SELL; opening-range
+entries use the same 0.12% buffer. Gap classification compares the market open directly to
+HH4/LL4 (UP/DOWN/NEUTRAL) and never uses a previous close. Directional tick rounding is BUY
+ceiling and SELL floor, matching the instrument-master behavior.
+
+### 42.2 SuperTrend index options parity
+
+`app/strategy/supertrend.py` ports Wilder RMA ATR period 7, factor 2, true-range construction,
+upper-band initial seed, continuous previous-direction state, closed-candle transitions, and
+CALL/PUT mapping. SENSEX uses BSE/BFO token `99919000`, default target/stop 40/25; NIFTY uses
+NSE/NFO token `99926000`, default target/stop 25/15. Candidate contracts are expiry-filtered,
+sorted by expiry/strike, then selected nearest ATM with expiry/strike tie-breaks. The continuous
+window validator preserves the previous session (at least ATR+2 candles), removes duplicate
+candle timestamps, rejects missing completed candles, and spans weekends without inventing a
+holiday subsystem.
+
+Explicit timing is centralized in `Asia/Kolkata`: SuperTrend entry is 09:15 through 15:09,
+15:10 and later is EOD square-off due, while Future Breakout uses its independent day/evening
+session windows (09:00–15:20 and 17:00–23:25). All public time helpers reject naive datetimes.
+
+`SUPER TREND EOD: 15:10 ASIA/KOLKATA`
+
+### 42.3 Durable signals, scheduling, and execution boundary
+
+`SignalRepository` persists a strategy signal before fan-out and uses the Rust unique signal key
+`(strategy_key,instrument,session_key,signal_type)` plus the existing per-user intent uniqueness
+constraints. `StrategyScheduler` uses the existing scheduler-run uniqueness row to make repeated
+ticks, restarts, and concurrent workers converge on one run. EOD is represented by a durable
+`SQUARE_OFF`/`EMERGENCY_CLOSE` intent through the same pipeline; it never closes a LIVE trade by
+local status assignment.
+
+`ExecutionOrchestrator` claims durable entry work with Phase 5 `FOR UPDATE SKIP LOCKED`, loads
+fresh intent state, calls the Phase 6 final safety gate, constructs a typed
+`BrokerActionRequest`, and then stops. DEMO returns `DEMO_SIMULATED` and completes the durable
+intent without an Angel call. LIVE returns the explicit
+`LIVE_MUTATION_DISABLED_DURING_MIGRATION` outcome and leaves the intent retryable; it does not
+mark a broker order submitted/filled and never fabricates a broker order ID. Protective exits,
+manual close, EOD, and SL2 actions use the same action classification and final recheck. Phase 5
+SL2 persistence remains source-trade keyed and therefore emits one opposite-side intent for
+repeated confirmed SL2 observations; Phase 6 blocks its new exposure when safety is not valid.
+
+### 42.4 Evidence and deferred work
+
+Seventeen pure strategy/execution tests cover Future Breakout formulas, gaps, missed-entry
+boundaries, tick rounding, SuperTrend RMA/transition/continuity/selection, IST timing, scheduler
+independence, typed requests, and durable EOD intent construction. One isolated PostgreSQL test
+covers concurrent durable signal fan-out and intent uniqueness. Full Phase 2–7 Python regression
+passed 70 tests with one Windows-only Unix-helper test skipped (Linux-only helper protocol);
+Ruff and Mypy passed. Rust regression remained `131 passed, 0 failed, 31 ignored`.
+
+Full broker reconciliation, position/order/trade-book recovery, external incident resolution,
+background reconciliation workers, and production Angel execution remain Phase 8 work. Python
+LIVE mutation transmission remains intentionally blocked.
+
+```text
+CURRENT PHASE: 7
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 2 COMMIT: 0dd6782
+PHASE 3 COMMIT: b60a5bf
+PHASE 4 COMMIT: a6e2c7c
+PHASE 5 COMMIT: 871b342
+PHASE 6 COMMIT: 530e3a4
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION MODIFIED: NO
+PHASE 7 GATE: PASS — READY FOR RECONCILIATION, RECOVERY AND BACKGROUND WORKERS
+```
