@@ -81,7 +81,7 @@ def exit_levels_for_entry(
 
 def calculate_levels(highs: list[Decimal | str], lows: list[Decimal | str]) -> FuturesLevels:
     if len(highs) != 4 or len(lows) != 4:
-        raise ValueError("Future Breakout requires exactly four historical candles.")
+        raise ValueError("insufficient breakout history")
     hs, ls = [Decimal(str(v)) for v in highs], [Decimal(str(v)) for v in lows]
     if not _positive(tuple(hs + ls)):
         raise ValueError("Historical prices must be positive finite values.")

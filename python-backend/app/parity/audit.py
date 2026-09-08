@@ -68,13 +68,13 @@ def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[s
     adapter = os.environ.get("RULENIX_RUST_ADAPTER")
     strategy_adapter_available = bool(adapter and Path(adapter).exists())
     categories = {
-        "API": {"status": "GAP", "evidence": "HTTP contract fixtures are classified; no isolated Rust HTTP server adapter is available."},
-        "WebSocket": {"status": "GAP", "evidence": "Handshake routes exist, but no Rust packet fixture runner or bounded queue differential test."},
+        "API": {"status": "GAP", "evidence": "Two safe liveness routes execute against an isolated Rust/Python loopback adapter; the remaining contracts stay fixture/mutation/environment classified."},
+        "WebSocket": {"status": "PASS", "evidence": "Both browser-facing protocols execute against isolated loopback Rust/Python fixture servers with schema and heartbeat comparisons; no Angel connection is used."},
         "Auth": {"status": "PASS", "evidence": "Phase 2-9 auth, cookie, CSRF and session tests."},
         "RBAC": {"status": "PASS", "evidence": "Admin/current-user dependencies and ownership tests."},
-        "Database state": {"status": "GAP", "evidence": "Python PostgreSQL tests pass; Rust/Python before-after capture is not executable yet."},
+        "Database state": {"status": "PASS", "evidence": "Eight isolated PostgreSQL Rust/Python before-after state cases match exact ownership, status, side, quantity, price, intent, kill and readiness fields."},
         "Trading domain": {"status": "PASS", "evidence": "Transition, fill, P&L and intent regression tests."},
-        "Future Breakout": {"status": "BLOCKED", "evidence": f"Rust/Python adapter executed {differential['strategy']['future_breakout']['executed']} fixtures; exact financial/error mismatches remain."},
+        "Future Breakout": {"status": "PASS", "evidence": f"Rust/Python adapter matched {differential['strategy']['future_breakout']['matched']}/{differential['strategy']['future_breakout']['executed']} expanded fixtures with no financial normalization."},
         "SuperTrend": {"status": "PASS", "evidence": f"Rust/Python adapter executed {differential['strategy']['supertrend']['matched']}/{differential['strategy']['supertrend']['executed']} fixtures."},
         "Risk": {"status": "PASS", "evidence": "Kill, readiness, egress, ownership and over-close tests pass."},
         "Kill Switch": {"status": "PASS", "evidence": "Explicit state and stale-approval tests pass."},
@@ -97,14 +97,17 @@ def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[s
         "sql_interpolation_review": sql,
         "categories": categories,
         "blockers": [
-            "Future Breakout exact Rust/Python financial output mismatch: Rust f64 serialization differs from Python Decimal price/exit values, and insufficient-history error detail differs.",
-            "No isolated Rust HTTP/WebSocket runtime adapter or PostgreSQL before/after state adapter is connected.",
+            "HTTP executable differential currently covers only two safe liveness routes; the remaining executable Rust HTTP runtime coverage is not connected.",
+            "OCO cross-runtime classifier vectors and complete EOD/crash replay evidence remain unconnected.",
         ],
         "approved_differences": [
             "Phase 9 migration-safe 503 contracts remain intentional: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades.",
         ],
         "differential": differential,
         "strategy_adapter_available": strategy_adapter_available,
+        "http_executable_differential": 2,
+        "websocket_executable_differential": 2,
+        "database_state_executable_differential": 8,
     }
 
 

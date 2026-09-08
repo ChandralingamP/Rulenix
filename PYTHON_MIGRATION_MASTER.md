@@ -1996,7 +1996,7 @@ Decimal price/exit serialization mismatches and one error-detail mismatch; no nu
 normalization was applied. Static mutation scanning reports zero reachable Angel trading
 transport paths; the trap observed zero mutation requests.
 
-Python isolated PostgreSQL regression: 104 passed, 1 Windows-only Unix-helper skip.
+Python isolated PostgreSQL regression: 108 passed, 1 Windows-only Unix-helper skip.
 Ruff, Mypy and compileall passed. The existing Rust regression remains 131 passed, 0
 failed, 31 ignored. Frontend regression remains 29 tests passed, lint passed, and build
 passed from Phase 9.
@@ -2012,12 +2012,13 @@ unavailable, so those categories stay blocked rather than being claimed as execu
 Auth, RBAC, trading-domain transitions, risk gates, Kill Switch, execution intents,
 egress, reconciliation, manual-close attribution, recovery, broker request construction,
 and controlled failure behavior remain PASS based on the existing isolated tests and new
-adversarial checks. API, browser WebSocket, database before/after, Future Breakout,
-and OCO categories remain explicit GAPs because this worktree has no isolated Rust HTTP/
-WebSocket runtime adapter or relational before/after protocol, and Future Breakout has
-unresolved exact financial output differences. PostgreSQL concurrency evidence is PASS,
-but it is not Rust/Python state differential evidence. These are safety-relevant audit
-blockers, not normalized away differences. The Phase 9 migration-safe 503 contracts remain approved differences:
+adversarial checks. Future Breakout and the two browser WebSocket protocols now have
+executable isolated differential evidence. API remains partial because only the two safe
+liveness routes are executable without application state; OCO remains an explicit GAP
+because no authoritative classifier adapter is connected. Eight isolated PostgreSQL
+Rust/Python before-after state cases now match exactly, while PostgreSQL concurrency
+evidence remains separately PASS. These are safety-relevant audit blockers,
+not normalized away differences. The Phase 9 migration-safe 503 contracts remain approved differences:
 broker connect, backtest execution, LIVE manual close, and LIVE/ALL Clear Trades.
 
 No deployment, production database change, proxy/service change, Kill Switch change,
@@ -2027,10 +2028,10 @@ permission change, networking change, or real Angel mutation occurred.
 CURRENT PHASE: 10
 RUST_BASELINE_SHA: 3f788f2a842ef9b1b66366d439431867850e3753
 PYTHON_BASELINE_SHA: 89332b5701e80237094b54f9e88d7496bd326009
-HTTP CONTRACTS: 50/50 INVENTORIED; EXECUTABLE RUST HTTP: 0; CONTRACT/FIXTURE: 44; MUTATION-DISABLED: 5; ENVIRONMENT-GATED: 1
-BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 0/2 EXECUTABLE RUST COMPARISONS
-DATABASE STATE PARITY: GAP — NO RUST BEFORE/AFTER ADAPTER
-FUTURE BREAKOUT RUST↔PYTHON PARITY: BLOCKED — 12 EXACT PRICE/EXIT DIFFERENCES
+HTTP CONTRACTS: 50/50 INVENTORIED; EXECUTABLE RUST HTTP: 2; CONTRACT/FIXTURE: 42; MUTATION-DISABLED: 5; ENVIRONMENT-GATED: 1
+BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 2/2 EXECUTABLE ISOLATED COMPARISONS
+DATABASE STATE PARITY: PASS — 8/8 ISOLATED POSTGRESQL BEFORE/AFTER CASES
+FUTURE BREAKOUT RUST↔PYTHON PARITY: PASS — 22/22 EXPANDED FIXTURES
 SUPER TREND RUST↔PYTHON PARITY: PASS — 6/6
 STATE MACHINE PARITY: PASS — PYTHON INVARIANT MATRIX
 RISK/SAFETY PARITY: PASS — PYTHON ADVERSARIAL MATRIX
@@ -2041,5 +2042,5 @@ PYTHON LIVE ORDERS MODIFIED: 0
 PYTHON LIVE ORDERS CANCELLED: 0
 FAKE LIVE BROKER SUCCESSES: 0
 PRODUCTION MODIFIED: NO
-PHASE 10 GATE: BLOCKED — FUTURE BREAKOUT FINANCIAL MISMATCH AND RUST HTTP/DB/WS ADAPTERS REQUIRED
+PHASE 10 GATE: BLOCKED — BROADER HTTP, OCO, EOD CONCURRENCY, AND CRASH REPLAY EVIDENCE REQUIRED
 ```

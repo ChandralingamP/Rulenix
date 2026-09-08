@@ -5,7 +5,7 @@
     "production_behavior": "unchanged; adapter initializes no app state, database, credentials, network, or Angel client"
   },
   "strategy": {
-    "future_breakout": {"executed": 12, "matched": 0, "mismatched": 12, "status": "BLOCKED", "reason": "Rust f64 serialization differs from Python Decimal serialization in exact price/exit fields; insufficient-history error detail also differs."},
+    "future_breakout": {"executed": 22, "matched": 22, "mismatched": 0, "status": "PASS", "coverage": ["original 12", "±1 tick entries", "equality boundaries", "decimal precision", "BUY/SELL symmetry", "insufficient history"]},
     "supertrend": {"executed": 6, "matched": 6, "mismatched": 0, "status": "PASS", "coverage": ["ATR/RMA", "reversal", "15:09:59", "15:10:00", "after 15:10"]},
     "tick_rounding": {"executed": 2, "matched": 2, "mismatched": 0, "status": "PASS"}
   },

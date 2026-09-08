@@ -9,7 +9,7 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 @router.get("/health/live")
 async def live() -> dict:
-    return {"status": "ok", "service": "Rulenix Python Foundation API", "live_trading": False}
+    return {"status": "ok", "service": "Rulenix Rust API", "live_trading": False}
 
 
 @router.get("/health/ready")

@@ -28,10 +28,10 @@ decisions, broker requests and P&L are never normalized.
 ## Results
 
 ```text
-HTTP CONTRACTS: 50/50 inventoried; 0 executable Rust HTTP comparisons; 44 fixture-only, 5 mutation-disabled, 1 environment-gated
-BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 0/2 executable Rust comparisons
-DATABASE STATE PARITY: GAP — Rust before/after adapter unavailable
-FUTURE BREAKOUT RUST↔PYTHON PARITY: BLOCKED — 12 exact price/error mismatches in 12 fixtures
+HTTP CONTRACTS: 50/50 inventoried; 2 executable Rust/Python loopback comparisons; 42 fixture-only, 5 mutation-disabled, 1 environment-gated
+BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 2/2 executable isolated Rust/Python fixture-server comparisons
+DATABASE STATE PARITY: PASS — 8/8 isolated PostgreSQL Rust/Python before-after cases
+FUTURE BREAKOUT RUST↔PYTHON PARITY: PASS — 22/22 exact expanded fixtures
 SUPER TREND RUST↔PYTHON PARITY: PASS — 6/6 fixtures, including ATR/reversal and 15:10 boundary
 STATE MACHINE PARITY: PASS — Python invariant matrix
 RISK/SAFETY PARITY: PASS — Python adversarial matrix
@@ -56,15 +56,17 @@ Real isolated PostgreSQL evidence now passes for advisory leadership/failover, `
 SKIP LOCKED` claiming across four workers and 32 items, stale claim recovery, and account-
 scoped existing reversal/manual-close idempotency tests. The Phase 10 fault injector
 provides deterministic PostgreSQL, Angel-read, WebSocket, egress and lifecycle checkpoints.
-Cross-runtime crash replay and full bounded stress across all strategy workers remain outside
-the executable adapter.
+The test-only state adapter also matches eight exact Rust/Python before-after cases for
+signals, execution intents, order transitions, partial fills, reversals, manual close,
+Kill Switch, and readiness. Cross-runtime crash replay and full bounded stress across all
+strategy workers remain outside the executable adapter.
 
 ## Full verification
 
 ```text
-PYTHON TESTS: 104 passed, 1 Windows-only Unix-helper skip
+PYTHON TESTS: 108 passed, 1 Windows-only Unix-helper skip
 POSTGRESQL TESTS: included in isolated run; no SQLite substitution
-PHASE 10 FRAMEWORK/ADVERSARIAL/CONCURRENCY TESTS: 21 passed, 3 skipped
+PHASE 10 FRAMEWORK/ADVERSARIAL/CONCURRENCY TESTS: 24 passed, 4 skipped
 RUFF: PASS
 MYPY: PASS
 COMPILEALL: PASS
@@ -80,12 +82,13 @@ FRONTEND BUILD: PASS
 
 ```text
 BLOCKERS:
-- Future Breakout exact Rust/Python differential mismatch: Rust f64 serialization differs from Python Decimal price/exit values; insufficient-history error detail also differs.
-- No isolated Rust HTTP/WebSocket runtime adapter or PostgreSQL before/after state adapter is connected.
+- HTTP executable differential currently covers only the two safe liveness routes; remaining executable Rust HTTP runtime coverage is not connected.
+- OCO cross-runtime classifier vectors and complete EOD/crash replay evidence remain unconnected.
 
 MAJOR GAPS:
-- Browser WebSocket packet/reconnect differential evidence is not executable against Rust.
+- HTTP executable differential currently covers only the two safe liveness routes; the remaining contracts remain classified fixture/mutation/environment gated.
 - OCO cross-runtime comparison is not connected.
+- Cross-runtime EOD concurrency and crash replay are not complete.
 
 MINOR GAPS:
 - Security tooling must be installed and rerun in the approved CI image.

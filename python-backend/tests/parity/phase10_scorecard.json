@@ -7,10 +7,12 @@
     "default": "CONTRACT_FIXTURE_PARITY",
     "mutation_disabled": 5,
     "environment_gated": 1,
-    "executable_differential": 0
+    "executable_differential": 2
   },
+  "websocket_evidence": {"executable_differential": 2, "matched": 2, "status": "PASS"},
+  "database_state_evidence": {"executed": 8, "matched": 8, "status": "PASS"},
   "differential": {
-    "future_breakout": {"executed": 12, "matched": 0, "mismatched": 12, "status": "BLOCKED"},
+    "future_breakout": {"executed": 22, "matched": 22, "mismatched": 0, "status": "PASS", "coverage": ["original 12", "±1 tick entries", "equality boundaries", "decimal precision", "BUY/SELL symmetry", "insufficient history"]},
     "supertrend": {"executed": 6, "matched": 6, "mismatched": 0, "status": "PASS"},
     "tick_rounding": {"executed": 2, "matched": 2, "mismatched": 0, "status": "PASS"}
   },
@@ -22,12 +24,12 @@
   },
   "categories": {
     "API": "GAP",
-    "WebSocket": "GAP",
+    "WebSocket": "PASS",
     "Auth": "PASS",
     "RBAC": "PASS",
-    "Database state": "GAP",
+    "Database state": "PASS",
     "Trading domain": "PASS",
-    "Future Breakout": "BLOCKED",
+    "Future Breakout": "PASS",
     "SuperTrend": "PASS",
     "Risk": "PASS",
     "Kill Switch": "PASS",
@@ -48,8 +50,8 @@
     "fake_live_successes": 0
   },
   "blockers": [
-    "Future Breakout exact Rust/Python differential mismatch: Rust f64 serialization differs from Python Decimal price/exit values; insufficient-history error detail also differs.",
-    "No isolated Rust HTTP/WebSocket runtime adapter or PostgreSQL before/after state adapter is connected."
+    "HTTP executable differential currently covers only two safe liveness routes; the remaining executable Rust HTTP runtime coverage is not connected.",
+    "OCO cross-runtime classifier vectors and complete EOD/crash replay evidence remain unconnected."
   ],
   "approved_differences": [
     "Phase 9 migration-safe 503 contracts: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades."

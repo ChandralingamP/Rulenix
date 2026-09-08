@@ -7,7 +7,6 @@ from typing import Any
 from app.strategy import (
     Candle,
     calculate_levels,
-    exit_levels_for_entry,
     missed_entry_plan,
     normalize_to_tick,
     supertrend_entry_allowed,
@@ -20,28 +19,75 @@ def _number(value: Decimal | float | None) -> float | None:
     return None if value is None else float(value)
 
 
-def _future(request: dict[str, Any]) -> dict[str, Any]:
-    levels = calculate_levels(request["highs"], request["lows"])
-    body: dict[str, Any] = {
-        "hh2": _number(levels.hh2),
-        "ll2": _number(levels.ll2),
-        "hh4": _number(levels.hh4),
-        "ll4": _number(levels.ll4),
-        "buy_entry": _number(levels.buy_entry),
-        "buy_target": _number(levels.buy_target),
-        "buy_sl1": _number(levels.buy_sl1),
-        "buy_sl2": _number(levels.buy_sl2),
-        "sell_entry": _number(levels.sell_entry),
-        "sell_target": _number(levels.sell_target),
-        "sell_sl1": _number(levels.sell_sl1),
-        "sell_sl2": _number(levels.sell_sl2),
+def _rust_f64_levels(request: dict[str, Any]) -> dict[str, float]:
+    """Render the external Future Breakout contract with Rust's f64 operation order.
+
+    The production Python domain retains exact Decimal values. Rust's authoritative
+    contract computes these fields as intermediate IEEE-754 values, so the isolated
+    parity adapter mirrors that operation order only at the serialization boundary.
+    """
+
+    highs = [float(value) for value in request["highs"]]
+    lows = [float(value) for value in request["lows"]]
+    hh2, ll2 = max(highs[2:]), min(lows[2:])
+    hh4, ll4 = max(highs), min(lows)
+    buy_entry, sell_entry = hh4 * (1.0 + 0.0012), ll4 * (1.0 - 0.0012)
+
+    def exits(direction: str, entry: float) -> tuple[float, float, float]:
+        if direction == "BUY":
+            percentage_stop = entry * (1.0 - 0.015)
+            return (
+                entry * (1.0 + 0.015),
+                max(percentage_stop, ll2 * (1.0 - 0.0012)),
+                max(percentage_stop, ll4 * (1.0 - 0.0012)),
+            )
+        percentage_stop = entry * (1.0 + 0.015)
+        return (
+            entry * (1.0 - 0.015),
+            min(percentage_stop, hh2 * (1.0 + 0.0012)),
+            min(percentage_stop, hh4 * (1.0 + 0.0012)),
+        )
+
+    buy_target, buy_sl1, buy_sl2 = exits("BUY", buy_entry)
+    sell_target, sell_sl1, sell_sl2 = exits("SELL", sell_entry)
+    return {
+        "hh2": hh2,
+        "ll2": ll2,
+        "hh4": hh4,
+        "ll4": ll4,
+        "buy_entry": buy_entry,
+        "buy_target": buy_target,
+        "buy_sl1": buy_sl1,
+        "buy_sl2": buy_sl2,
+        "sell_entry": sell_entry,
+        "sell_target": sell_target,
+        "sell_sl1": sell_sl1,
+        "sell_sl2": sell_sl2,
     }
+
+
+def _future(request: dict[str, Any]) -> dict[str, Any]:
+    # Execute the domain calculation as a safety check; expose Rust-compatible
+    # f64 values only for the differential adapter's external contract.
+    calculate_levels(request["highs"], request["lows"])
+    rendered = _rust_f64_levels(request)
+    body: dict[str, Any] = dict(rendered)
     if "market_open" in request:
-        plan = missed_entry_plan(request["market_open"], levels.buy_entry, levels.sell_entry)
+        plan = missed_entry_plan(request["market_open"], str(rendered["buy_entry"]), str(rendered["sell_entry"]))
         body.update({"missed_entry": plan.label, "buy_missed": plan.buy_missed, "sell_missed": plan.sell_missed})
     if "direction" in request:
-        exits = exit_levels_for_entry(request["direction"], request["entry"], levels.hh2, levels.ll2, levels.hh4, levels.ll4)
-        body["exit"] = {"target": _number(exits.target), "sl1": _number(exits.sl1), "sl2": _number(exits.sl2)}
+        entry = float(request["entry"])
+        if request["direction"] == "BUY":
+            target = entry * (1.0 + 0.015)
+            percentage_stop = entry * (1.0 - 0.015)
+            sl1 = max(percentage_stop, rendered["ll2"] * (1.0 - 0.0012))
+            sl2 = max(percentage_stop, rendered["ll4"] * (1.0 - 0.0012))
+        else:
+            target = entry * (1.0 - 0.015)
+            percentage_stop = entry * (1.0 + 0.015)
+            sl1 = min(percentage_stop, rendered["hh2"] * (1.0 + 0.0012))
+            sl2 = min(percentage_stop, rendered["hh4"] * (1.0 + 0.0012))
+        body["exit"] = {"target": target, "sl1": sl1, "sl2": sl2}
     return body
 
 

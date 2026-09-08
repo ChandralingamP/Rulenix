@@ -25,6 +25,8 @@ mod strategy;
 
 #[cfg(feature = "phase10-adapter")]
 mod phase10_adapter;
+#[cfg(feature = "phase10-adapter")]
+mod phase10_http_adapter;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -73,6 +75,10 @@ async fn main() -> Result<()> {
     #[cfg(feature = "phase10-adapter")]
     if std::env::args().nth(1).as_deref() == Some("--phase10-fixture-adapter") {
         return phase10_adapter::run().await;
+    }
+    #[cfg(feature = "phase10-adapter")]
+    if std::env::args().nth(1).as_deref() == Some("--phase10-http-server") {
+        return phase10_http_adapter::run().await;
     }
     dotenvy::dotenv().ok();
     let app_env_for_logs = std::env::var("APP_ENV").unwrap_or_else(|_| "development".into());

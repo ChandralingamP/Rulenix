@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from app.parity.models import RuntimeResult
 from app.parity.normalize import NormalizationRules, normalize_result
 from app.parity.runner import CallableAdapter, JsonSubprocessAdapter, execute_fixtures
 from app.parity.strategy_adapter import execute_strategy_result
+from app.strategy.futures_breakout import calculate_levels
 
 FIXTURES = Path(__file__).with_name("parity") / "phase10_fixtures.json"
 SCORECARD = Path(__file__).with_name("parity") / "phase10_scorecard.json"
@@ -34,10 +36,10 @@ def test_scorecard_freezes_baselines_and_exposes_blockers():
     assert scorecard["blockers"]
 
 
-def test_differential_results_record_exact_financial_mismatch_without_normalization():
+def test_differential_results_record_exact_financial_parity_without_normalization():
     results = json.loads(DIFFERENTIAL_RESULTS.read_text(encoding="utf-8"))
-    assert results["strategy"]["future_breakout"]["status"] == "BLOCKED"
-    assert results["strategy"]["future_breakout"]["mismatched"] == 12
+    assert results["strategy"]["future_breakout"]["status"] == "PASS"
+    assert results["strategy"]["future_breakout"]["matched"] == 22
     assert results["strategy"]["supertrend"]["matched"] == 6
     assert results["normalization"] == "none for financial values; only explicit fixture normalizers may be used"
 
@@ -104,15 +106,13 @@ async def test_rust_python_strategy_differential_fixtures():
         differences = compare_results(left, right)
         if differences:
             mismatches.append({"fixture": fixture.name, "differences": [difference.path for difference in differences]})
-    mismatch_names = {item["fixture"] for item in mismatches}
-    allowed_numeric_names = {
-        "fb-neutral", "fb-gap-up", "fb-gap-down", "fb-open-equals-hh4", "fb-open-equals-ll4",
-        "fb-buy", "fb-sell", "fb-buffer-target-sl", "fb-missed-boundary-buy",
-        "fb-missed-boundary-sell", "fb-duplicate-evaluation", "fb-insufficient-history",
-    }
-    allowed_paths = {"body.message", "body.buy_entry", "body.sell_entry", "body.buy_sl1", "body.buy_sl2", "body.sell_sl1", "body.sell_sl2", "body.sell_target", "body.exit.sl1", "body.exit.sl2", "body.exit.target"}
-    assert mismatch_names == allowed_numeric_names
-    assert all(set(item["differences"]) <= allowed_paths for item in mismatches)
+    assert mismatches == []
+
+
+def test_future_breakout_internal_decimal_calculation_remains_exact():
+    levels = calculate_levels([100, 110, 105, 108], [90, 92, 94, 93])
+    assert levels.buy_sl1 == Decimal("108.48002")
+    assert levels.sell_target == Decimal("88.54362")
 
 
 @pytest.mark.parametrize("bad_value", [None, "", [], 0])
