@@ -74,12 +74,12 @@ struct SuperTrendMarketSelection {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct IntradayCandle {
-    at: NaiveDateTime,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
+pub(crate) struct IntradayCandle {
+    pub(crate) at: NaiveDateTime,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,13 +135,13 @@ impl IndexOptionConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SuperTrendDirection {
+pub(crate) enum SuperTrendDirection {
     Up,
     Down,
 }
 
 impl SuperTrendDirection {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Up => "UP",
             Self::Down => "DOWN",
@@ -150,10 +150,10 @@ impl SuperTrendDirection {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SuperTrendPoint {
-    candle: IntradayCandle,
-    value: f64,
-    direction: SuperTrendDirection,
+pub(crate) struct SuperTrendPoint {
+    pub(crate) candle: IntradayCandle,
+    pub(crate) value: f64,
+    pub(crate) direction: SuperTrendDirection,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,19 +267,19 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Levels {
-    hh2: f64,
-    ll2: f64,
-    hh4: f64,
-    ll4: f64,
-    buy_entry: f64,
-    buy_target: f64,
-    buy_sl1: f64,
-    buy_sl2: f64,
-    sell_entry: f64,
-    sell_target: f64,
-    sell_sl1: f64,
-    sell_sl2: f64,
+pub(crate) struct Levels {
+    pub(crate) hh2: f64,
+    pub(crate) ll2: f64,
+    pub(crate) hh4: f64,
+    pub(crate) ll4: f64,
+    pub(crate) buy_entry: f64,
+    pub(crate) buy_target: f64,
+    pub(crate) buy_sl1: f64,
+    pub(crate) buy_sl2: f64,
+    pub(crate) sell_entry: f64,
+    pub(crate) sell_target: f64,
+    pub(crate) sell_sl1: f64,
+    pub(crate) sell_sl2: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -383,7 +383,7 @@ pub(crate) fn futures_exit_levels_for_entry(
         .then_some(FuturesExitLevels { target, sl1, sl2 })
 }
 
-fn calculate(highs: &[f64], lows: &[f64]) -> Option<Levels> {
+pub(crate) fn calculate(highs: &[f64], lows: &[f64]) -> Option<Levels> {
     if highs.len() != 4 || lows.len() != 4 {
         return None;
     }
@@ -445,7 +445,7 @@ fn rma(values: &[f64], period: usize) -> Vec<Option<f64>> {
     result
 }
 
-fn supertrend_points(
+pub(crate) fn supertrend_points(
     candles: &[IntradayCandle],
     atr_period: usize,
     factor: f64,
@@ -608,12 +608,12 @@ fn option_minute_of_day(now: DateTime<FixedOffset>) -> u32 {
     now.hour() * 60 + now.minute()
 }
 
-fn supertrend_entry_allowed(now: DateTime<FixedOffset>) -> bool {
+pub(crate) fn supertrend_entry_allowed(now: DateTime<FixedOffset>) -> bool {
     let minute = option_minute_of_day(now);
     (SUPERTREND_ENTRY_START_MINUTE..OPTION_SQUARE_OFF_MINUTE).contains(&minute)
 }
 
-fn option_square_off_due(now: DateTime<FixedOffset>) -> bool {
+pub(crate) fn option_square_off_due(now: DateTime<FixedOffset>) -> bool {
     option_minute_of_day(now) >= OPTION_SQUARE_OFF_MINUTE
 }
 
@@ -674,7 +674,7 @@ fn parse_tick_size(value: &str) -> Option<f64> {
     (tick.is_finite() && tick > 0.0).then_some(tick)
 }
 
-fn normalize_to_tick(price: f64, tick_size: f64, side: &str) -> Option<f64> {
+pub(crate) fn normalize_to_tick(price: f64, tick_size: f64, side: &str) -> Option<f64> {
     const SCALE: f64 = 1_000_000.0;
     if !price.is_finite() || price <= 0.0 || !tick_size.is_finite() || tick_size <= 0.0 {
         return None;

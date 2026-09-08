@@ -4,6 +4,12 @@
   "active_react_api_calls": 35,
   "python_compatible_react_calls": 35,
   "incompatible_react_calls": 0,
+  "http_evidence_default": "CONTRACT_FIXTURE_PARITY",
+  "http_evidence_overrides": {
+    "MUTATION_DISABLED": ["POST /home/connect/", "PUT /account/trading-mode", "POST /backtesting/run", "POST /pnl/trades/{trade_id}/close", "DELETE /auth/admin/users/trade-logs/"],
+    "ENVIRONMENT_GATED": ["GET /metrics"]
+  },
+  "websocket_evidence_default": "ENVIRONMENT_GATED",
   "http": [
     {"method":"GET","path":"/health","auth":"public","python":"matched","react":null},
     {"method":"GET","path":"/health/live","auth":"public","python":"matched","react":null},

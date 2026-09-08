@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -59,17 +60,22 @@ def scan_sql_interpolation(source_root: str | Path) -> list[dict[str, str]]:
 def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[str, Any]:
     _ = Path(repo_root)
     matrix = json.loads((Path(python_root) / "tests/parity/api_contract_matrix.json").read_text(encoding="utf-8"))
+    differential = json.loads(
+        (Path(python_root) / "tests/parity/phase10_differential_results.json").read_text(encoding="utf-8")
+    )
     mutation = scan_mutation_boundary(Path(python_root) / "app")
     sql = scan_sql_interpolation(Path(python_root) / "app")
+    adapter = os.environ.get("RULENIX_RUST_ADAPTER")
+    strategy_adapter_available = bool(adapter and Path(adapter).exists())
     categories = {
-        "API": {"status": "GAP", "evidence": "Phase 10 fixture framework exists; no isolated Rust runtime adapter is available."},
+        "API": {"status": "GAP", "evidence": "HTTP contract fixtures are classified; no isolated Rust HTTP server adapter is available."},
         "WebSocket": {"status": "GAP", "evidence": "Handshake routes exist, but no Rust packet fixture runner or bounded queue differential test."},
         "Auth": {"status": "PASS", "evidence": "Phase 2-9 auth, cookie, CSRF and session tests."},
         "RBAC": {"status": "PASS", "evidence": "Admin/current-user dependencies and ownership tests."},
         "Database state": {"status": "GAP", "evidence": "Python PostgreSQL tests pass; Rust/Python before-after capture is not executable yet."},
         "Trading domain": {"status": "PASS", "evidence": "Transition, fill, P&L and intent regression tests."},
-        "Future Breakout": {"status": "GAP", "evidence": "Python golden fixtures pass; cross-runtime fixture comparison is not connected."},
-        "SuperTrend": {"status": "GAP", "evidence": "IST cutoff and indicator fixtures pass; cross-runtime comparison is not connected."},
+        "Future Breakout": {"status": "BLOCKED", "evidence": f"Rust/Python adapter executed {differential['strategy']['future_breakout']['executed']} fixtures; exact financial/error mismatches remain."},
+        "SuperTrend": {"status": "PASS", "evidence": f"Rust/Python adapter executed {differential['strategy']['supertrend']['matched']}/{differential['strategy']['supertrend']['executed']} fixtures."},
         "Risk": {"status": "PASS", "evidence": "Kill, readiness, egress, ownership and over-close tests pass."},
         "Kill Switch": {"status": "PASS", "evidence": "Explicit state and stale-approval tests pass."},
         "Execution intent": {"status": "PASS", "evidence": "Durable intent and idempotency regression tests pass."},
@@ -78,7 +84,7 @@ def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[s
         "Manual broker close": {"status": "PASS", "evidence": "Attribution and migration-safe API tests pass."},
         "OCO": {"status": "GAP", "evidence": "Authoritative Rust/Node classifier vectors are not wired into Python differential execution."},
         "Recovery": {"status": "PASS", "evidence": "Stale claim recovery and worker tests pass."},
-        "Workers": {"status": "GAP", "evidence": "No two-process isolated PostgreSQL leadership run was executed."},
+        "Workers": {"status": "PASS", "evidence": "Real PostgreSQL two-instance leadership/failover, SKIP LOCKED and stale-recovery tests are included in the audit suite."},
         "Broker request construction": {"status": "PASS", "evidence": "Typed request construction is tested with mutation transport disabled."},
         "Failure behavior": {"status": "PASS", "evidence": "Controlled 503s and broker failure classifications are tested."},
     }
@@ -91,12 +97,14 @@ def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[s
         "sql_interpolation_review": sql,
         "categories": categories,
         "blockers": [
-            "No isolated Rust runtime adapter or captured Rust execution protocol is connected to the reusable differential runner.",
-            "Multi-instance, crash/restart and high-concurrency parity tests are not yet executed against PostgreSQL.",
+            "Future Breakout exact Rust/Python financial output mismatch: Rust f64 serialization differs from Python Decimal price/exit values, and insufficient-history error detail differs.",
+            "No isolated Rust HTTP/WebSocket runtime adapter or PostgreSQL before/after state adapter is connected.",
         ],
         "approved_differences": [
             "Phase 9 migration-safe 503 contracts remain intentional: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades.",
         ],
+        "differential": differential,
+        "strategy_adapter_available": strategy_adapter_available,
     }
 
 

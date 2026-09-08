@@ -15,8 +15,11 @@ database, networking, permission, Kill Switch, or broker mutation operation was 
 
 `python-backend/app/parity/` contains reusable fixture loading, callable and JSON
 subprocess runtime adapters, narrow path-scoped normalization, and structured comparison.
-`tests/parity/phase10_fixtures.json` is sanitized and contains four executable fixture
-comparisons. `tests/parity/phase10_scorecard.json` is the machine-readable scorecard.
+`tests/parity/phase10_fixtures.json` is sanitized and contains the framework smoke
+comparisons. The test-only Rust adapter is compiled with the `phase10-adapter` feature and
+consumes `tests/parity/strategy_differential_fixtures.json` through JSON stdin/stdout.
+`tests/parity/phase10_differential_results.json` records the exact comparison results and
+`tests/parity/phase10_scorecard.json` is the machine-readable scorecard.
 
 Normalization is limited to explicitly named UUID/timestamp fields and explicitly unordered
 collections. Financial values, quantities, sides, statuses, reason codes, readiness, safety
@@ -25,11 +28,11 @@ decisions, broker requests and P&L are never normalized.
 ## Results
 
 ```text
-HTTP CONTRACTS DIFFERENTIAL-COVERED: 4/50 fixture cases (50/50 inventoried)
+HTTP CONTRACTS: 50/50 inventoried; 0 executable Rust HTTP comparisons; 44 fixture-only, 5 mutation-disabled, 1 environment-gated
 BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 0/2 executable Rust comparisons
 DATABASE STATE PARITY: GAP — Rust before/after adapter unavailable
-FUTURE BREAKOUT PARITY: GAP — Python golden tests only
-SUPER TREND PARITY: GAP — Python golden tests only
+FUTURE BREAKOUT RUST↔PYTHON PARITY: BLOCKED — 12 exact price/error mismatches in 12 fixtures
+SUPER TREND RUST↔PYTHON PARITY: PASS — 6/6 fixtures, including ATR/reversal and 15:10 boundary
 STATE MACHINE PARITY: PASS — Python invariant matrix
 RISK/SAFETY PARITY: PASS — Python adversarial matrix
 ```
@@ -49,17 +52,19 @@ connect, backtest execution, LIVE manual close, and LIVE/ALL Clear Trades.
 
 ## Concurrency and recovery
 
-Existing single-database advisory-lock, row-claim, stale-recovery and worker lifecycle tests
-pass. The Phase 10 fault injector provides deterministic PostgreSQL, Angel-read, WebSocket,
-egress and lifecycle checkpoints for isolated tests. A two-process leadership/failover run,
-crash-point replay across both runtimes, and high-concurrency stress run were not executed.
+Real isolated PostgreSQL evidence now passes for advisory leadership/failover, `FOR UPDATE
+SKIP LOCKED` claiming across four workers and 32 items, stale claim recovery, and account-
+scoped existing reversal/manual-close idempotency tests. The Phase 10 fault injector
+provides deterministic PostgreSQL, Angel-read, WebSocket, egress and lifecycle checkpoints.
+Cross-runtime crash replay and full bounded stress across all strategy workers remain outside
+the executable adapter.
 
 ## Full verification
 
 ```text
-PYTHON TESTS: 98 passed, 1 Windows-only Unix-helper skip
+PYTHON TESTS: 104 passed, 1 Windows-only Unix-helper skip
 POSTGRESQL TESTS: included in isolated run; no SQLite substitution
-PHASE 10 FRAMEWORK/ADVERSARIAL TESTS: 19 passed
+PHASE 10 FRAMEWORK/ADVERSARIAL/CONCURRENCY TESTS: 21 passed, 3 skipped
 RUFF: PASS
 MYPY: PASS
 COMPILEALL: PASS
@@ -75,12 +80,12 @@ FRONTEND BUILD: PASS
 
 ```text
 BLOCKERS:
-- No isolated Rust runtime adapter or captured Rust execution protocol is connected to the differential runner.
-- No two-instance PostgreSQL leadership, crash/restart, or high-concurrency parity evidence.
+- Future Breakout exact Rust/Python differential mismatch: Rust f64 serialization differs from Python Decimal price/exit values; insufficient-history error detail also differs.
+- No isolated Rust HTTP/WebSocket runtime adapter or PostgreSQL before/after state adapter is connected.
 
 MAJOR GAPS:
 - Browser WebSocket packet/reconnect differential evidence is not executable against Rust.
-- Future Breakout, SuperTrend and OCO cross-runtime comparisons are not connected.
+- OCO cross-runtime comparison is not connected.
 
 MINOR GAPS:
 - Security tooling must be installed and rerun in the approved CI image.

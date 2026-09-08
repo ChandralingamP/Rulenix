@@ -40,7 +40,11 @@ class JsonSubprocessAdapter:
     timeout_seconds: float = 30.0
 
     async def execute(self, fixture: Fixture) -> RuntimeResult:
-        payload = json.dumps({"name": fixture.name, "category": fixture.category, "request": fixture.request})
+        payload_value = {"name": fixture.name, "fixture_id": fixture.name, "category": fixture.category, "request": fixture.request}
+        if isinstance(fixture.request, dict) and "operation" in fixture.request:
+            payload_value["operation"] = fixture.request["operation"]
+            payload_value["request"] = fixture.request.get("request", {})
+        payload = json.dumps(payload_value)
 
         def run() -> RuntimeResult:
             completed = subprocess.run(

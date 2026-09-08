@@ -23,6 +23,9 @@ mod security;
 mod state;
 mod strategy;
 
+#[cfg(feature = "phase10-adapter")]
+mod phase10_adapter;
+
 use anyhow::{Context, Result};
 use axum::{
     Router,
@@ -67,6 +70,10 @@ fn configured_initial_admin(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "phase10-adapter")]
+    if std::env::args().nth(1).as_deref() == Some("--phase10-fixture-adapter") {
+        return phase10_adapter::run().await;
+    }
     dotenvy::dotenv().ok();
     let app_env_for_logs = std::env::var("APP_ENV").unwrap_or_else(|_| "development".into());
     if app_env_for_logs.eq_ignore_ascii_case("production")

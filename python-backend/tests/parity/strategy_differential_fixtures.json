@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {"name":"fb-neutral","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":100}}},
+    {"name":"fb-gap-up","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":111}}},
+    {"name":"fb-gap-down","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":89}}},
+    {"name":"fb-open-equals-hh4","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":110}}},
+    {"name":"fb-open-equals-ll4","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":90}}},
+    {"name":"fb-buy","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"direction":"BUY","entry":110.132}}},
+    {"name":"fb-sell","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"direction":"SELL","entry":89.892}}},
+    {"name":"fb-buffer-target-sl","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[123.45,126.78,124.11,125.55],"lows":[119.02,120.14,121.33,120.88],"direction":"BUY","entry":126.93132}}},
+    {"name":"fb-missed-boundary-buy","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":110.132}}},
+    {"name":"fb-missed-boundary-sell","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":89.892}}},
+    {"name":"fb-insufficient-history","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105],"lows":[90,92,94]}}},
+    {"name":"fb-duplicate-evaluation","category":"Future Breakout","request":{"operation":"future_breakout","request":{"highs":[100,110,105,108],"lows":[90,92,94,93],"market_open":100}}},
+    {"name":"st-eod-before","category":"SuperTrend","request":{"operation":"supertrend","request":{"candles":[],"at":"2026-09-08T15:09:59+05:30"}}},
+    {"name":"st-eod-boundary","category":"SuperTrend","request":{"operation":"supertrend","request":{"candles":[],"at":"2026-09-08T15:10:00+05:30"}}},
+    {"name":"st-eod-after","category":"SuperTrend","request":{"operation":"supertrend","request":{"candles":[],"at":"2026-09-08T15:10:01+05:30"}}},
+    {"name":"st-atr-and-reversal","category":"SuperTrend","request":{"operation":"supertrend","request":{"atr_period":3,"factor":1,"candles":[{"at":"2026-09-08T09:15:00","open":100,"high":102,"low":98,"close":100},{"at":"2026-09-08T09:20:00","open":99,"high":101,"low":97,"close":99},{"at":"2026-09-08T09:25:00","open":98,"high":100,"low":96,"close":98},{"at":"2026-09-08T09:30:00","open":97,"high":99,"low":95,"close":97},{"at":"2026-09-08T09:35:00","open":96,"high":98,"low":94,"close":96},{"at":"2026-09-08T09:40:00","open":95,"high":97,"low":93,"close":95},{"at":"2026-09-08T09:45:00","open":100,"high":104,"low":99,"close":103}],"at":"2026-09-08T09:50:00+05:30"}}},
+    {"name":"tick-buy","category":"Future Breakout","request":{"operation":"tick","request":{"price":100.021,"tick_size":0.05,"side":"BUY"}}},
+    {"name":"tick-sell","category":"Future Breakout","request":{"operation":"tick","request":{"price":100.021,"tick_size":0.05,"side":"SELL"}}}
+  ]
+}
