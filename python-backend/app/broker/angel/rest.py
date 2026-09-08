@@ -58,6 +58,20 @@ class AngelRestClient:
     async def order_book(self) -> list[OrderRecord]:
         return [OrderRecord.from_payload(item) for item in _list_data(await self._request("order-book", "GET", "/rest/secure/angelbroking/order/v1/getOrderBook"))]
 
+    async def individual_order(self, order_id: str) -> OrderRecord:
+        """Read one order without changing it.
+
+        SmartAPI exposes this as the order-details resource.  AB1007 is left as
+        ``BrokerErrorCategory.ORDER_NOT_FOUND`` so OCO classification can
+        distinguish a proven absence from a timeout or authentication failure.
+        """
+        if not order_id.strip():
+            raise ValueError("order_id must not be empty")
+        payload = await self._request("individual-order", "POST", "/rest/secure/angelbroking/order/v1/details", {"orderid": order_id})
+        if not isinstance(payload, dict):
+            raise BrokerError(BrokerErrorCategory.MALFORMED_RESPONSE, "Angel One individual-order response is malformed.", "individual-order", raw=payload)
+        return OrderRecord.from_payload(payload)
+
     async def trade_book(self) -> list[TradeRecord]:
         return [TradeRecord.from_payload(item) for item in _list_data(await self._request("trade-book", "GET", "/rest/secure/angelbroking/order/v1/getTradeBook"))]
 
@@ -97,6 +111,9 @@ class AngelRestClient:
 
     async def safe_order_book(self):
         return await _safe_read(self.order_book)
+
+    async def safe_individual_order(self, order_id: str):
+        return await _safe_read(lambda: self.individual_order(order_id))
 
     async def safe_trade_book(self):
         return await _safe_read(self.trade_book)

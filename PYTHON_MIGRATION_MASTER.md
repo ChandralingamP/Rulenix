@@ -1813,5 +1813,70 @@ PYTHON LIVE ORDERS PLACED: 0
 PYTHON LIVE ORDERS MODIFIED: 0
 PYTHON LIVE ORDERS CANCELLED: 0
 PRODUCTION MODIFIED: NO
+PHASE 8 GATE: PASS — READY FOR REMAINING APIS AND REACT COMPATIBILITY
 PHASE 7 GATE: PASS — READY FOR RECONCILIATION, RECOVERY AND BACKGROUND WORKERS
+```
+
+## 43. Phase 8 — Reconciliation, recovery and background workers
+
+Phase 8 continues from Phase 7 commit `8638f63` on branch `phase8-reconciliation-recovery`.
+Rust `3f788f2a842ef9b1b66366d439431867850e3753` remains authoritative LIVE; production,
+deployment, networking, schema, permissions and Angel mutation transport were not changed.
+
+The Rust audit records thirteen logical roles: strategy scheduler, broker reconciliation,
+protection recovery, execution-intent recovery, SL2 reversal recovery, manual-close recovery,
+square-off/expiry recovery, market feed, session maintenance, session cleanup, notifications,
+OTP cleanup and admin job runner. Their cadences are respectively five seconds (the first seven),
+WebSocket heartbeat/freshness, 30 minutes, hourly, one minute, daily and on-demand. The scheduler
+uses a PostgreSQL advisory singleton leader; durable work uses account locks, `FOR UPDATE SKIP
+LOCKED`, uniqueness, bounded backoff and startup claim recovery. Python exposes this inventory as
+`RUST_WORKER_ROLES`; `BackgroundWorkerManager` owns cancellation and idempotent lifecycle, and
+`RecoveryWorker.run_once()` is bounded and account-isolated.
+
+`app/reconciliation/domain.py` adds explicit typed evidence for positions, order book, trade book,
+individual-order lookup, conditional inventory, account/session validation, credential revision,
+timestamps and egress identity. `SUCCESS`, `FAILED`, `TIMED_OUT`, `AUTH_FAILED`, `MALFORMED` and
+`UNAVAILABLE` remain distinct; failed reads never become empty collections. A snapshot is
+authoritative only when all required reads and account validation succeed with matching current
+revision and account/egress context. The read-only SmartAPI order-details method preserves
+`AB1007 Order not found` separately from timeout/auth/malformed failures.
+
+Reconciliation is account-locked and persists health, blockers and incidents. Position mismatches
+become `RECONCILIATION_REQUIRED`; terminal/partial/missing/ambiguous orders stay distinct; actual
+broker fills use Decimal weighted prices and existing watermarks. Manual broker close requires one
+local open trade, successful positions/order/trade evidence, authoritative flatness, compatible
+symbol/token/exchange, opposite-side external fills after entry, exact remaining quantity and no
+executable sibling. Ambiguity never closes locally or fabricates protection cancellation.
+
+Synthetic Android OCO requires the exact conjunction of Android shape, successful flat positions,
+individual lookup `AB1007`, successful conditional inventory with no matching rule, successful
+trade book with no exact trade, and no executable sibling; all missing/failed/contradictory cases
+are `UNKNOWN_UNSAFE`. LIVE readiness remains current-revision, fresh, egress-valid, blocker-free
+authoritative reconciliation. Offline, login-only, old-revision and partial accounts are not
+LIVE-ready; deployment-safe is a separate durable inventory classification.
+
+Stale execution claims, reversals, manual-close protection claims and uncertain orders recover into
+durable retry/reconciliation states without duplicate actions. SL2/manual-close uniqueness and fill
+watermarks make restart idempotent. Ambiguous writes are reconciled before retry. SuperTrend EOD
+remains `15:10 Asia/Kolkata`; LIVE is never closed without broker evidence. All place/cancel,
+protection, reversal, manual-close, square-off and refresh actions remain behind the existing
+mutation guard.
+
+Phase 8 adds five pure tests and three real PostgreSQL tests. Full Phase 2–8 Python regression:
+`78 passed, 1 skipped` (the Windows-only Unix-helper protocol); Ruff and Mypy passed; Rust:
+`131 passed, 0 failed, 31 ignored`. Phase 9+ retains API/frontend/React compatibility,
+deployment wiring, approved real mutation implementation, broader Rust fixture parity and
+operational observability/runbooks.
+
+```text
+CURRENT PHASE: 8
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 7 COMMIT: 8638f63
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PRODUCTION MODIFIED: NO
+PHASE 8 GATE: PASS — READY FOR REMAINING APIS AND REACT COMPATIBILITY
 ```

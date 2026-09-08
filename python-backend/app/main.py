@@ -12,6 +12,7 @@ from .broker.angel.helper import EgressHelperClient
 from .config import get_settings
 from .db import make_engine, make_session_factory
 from .errors import DomainError, domain_error_handler, validation_error_handler
+from .reconciliation.workers import BackgroundWorkerManager
 
 
 @asynccontextmanager
@@ -20,10 +21,12 @@ async def lifespan(app: FastAPI):
     app.state.engine = make_engine(app.state.settings.async_database_url)
     app.state.session_factory = make_session_factory(app.state.engine)
     app.state.last_dev_otp = None
+    app.state.worker_manager = BackgroundWorkerManager()
     if app.state.session_factory and Path(app.state.settings.egress_helper_socket).exists():
         async with app.state.session_factory() as session:
             await rehydrate_configured_ips(session, EgressHelperClient(app.state.settings.egress_helper_socket))
     yield
+    await app.state.worker_manager.stop()
     if app.state.engine:
         await app.state.engine.dispose()
 
