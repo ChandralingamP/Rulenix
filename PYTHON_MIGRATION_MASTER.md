@@ -1954,3 +1954,79 @@ FAKE LIVE BROKER SUCCESSES: 0
 PRODUCTION MODIFIED: NO
 PHASE 9 GATE: PASS — READY FOR RUST-PYTHON PARITY AND SECURITY AUDIT
 ```
+
+## 45. Phase 10 — Rust ↔ Python parity framework and security audit
+
+Phase 10 is frozen against Rust production SHA
+`3f788f2a842ef9b1b66366d439431867850e3753` and Python Phase 9 SHA
+`89332b5701e80237094b54f9e88d7496bd326009` on dedicated branch
+`phase10-parity-security-audit`. Rust source and production infrastructure remain
+untouched.
+
+### 45.1 Reusable parity framework
+
+`python-backend/app/parity/` provides fixture loading, runtime adapters, structured
+comparisons, and path-scoped normalization. The only normalization rules permitted by
+the framework are explicit UUID/timestamp paths and explicitly unordered collections;
+prices, quantities, sides, statuses, reason codes, readiness, safety decisions and P&L
+are never normalized. The sanitized bundle is
+`python-backend/tests/parity/phase10_fixtures.json`, with the machine-readable scorecard
+at `python-backend/tests/parity/phase10_scorecard.json`.
+
+The reproducible isolated command is:
+
+```powershell
+.\scripts\run-phase10-audit.ps1
+```
+
+It runs the scorecard audit, Ruff, Mypy, compileall and the complete Python suite. It
+does not require production credentials, a production database, or Angel mutation access.
+
+### 45.2 Audit evidence
+
+The framework and adversarial tests cover fixture comparison, status/error differences,
+fill bounds, terminal transition fences, kill-switch/revision TOCTOU checks, over-close
+protection, SL2 directionality, the exact 15:10 Asia/Kolkata SuperTrend boundary, and a
+network mutation trap. Static mutation scanning reports zero reachable Angel trading
+transport paths; the trap observed zero mutation requests.
+
+Python isolated PostgreSQL regression: 98 passed, 1 Windows-only Unix-helper skip.
+Ruff, Mypy and compileall passed. The existing Rust regression remains 131 passed, 0
+failed, 31 ignored. Frontend regression remains 29 tests passed, lint passed, and build
+passed from Phase 9.
+
+### 45.3 Scorecard and unresolved blockers
+
+Auth, RBAC, trading-domain transitions, risk gates, Kill Switch, execution intents,
+egress, reconciliation, manual-close attribution, recovery, broker request construction,
+and controlled failure behavior remain PASS based on the existing isolated tests and new
+adversarial checks. API, browser WebSocket, database before/after, Future Breakout,
+SuperTrend, OCO and worker categories remain explicit GAPs because this worktree has no
+isolated Rust runtime adapter/captured execution protocol and no two-instance PostgreSQL
+leadership or crash/restart run. These are safety-relevant audit blockers, not normalized
+away differences. The Phase 9 migration-safe 503 contracts remain approved differences:
+broker connect, backtest execution, LIVE manual close, and LIVE/ALL Clear Trades.
+
+No deployment, production database change, proxy/service change, Kill Switch change,
+permission change, networking change, or real Angel mutation occurred.
+
+```text
+CURRENT PHASE: 10
+RUST_BASELINE_SHA: 3f788f2a842ef9b1b66366d439431867850e3753
+PYTHON_BASELINE_SHA: 89332b5701e80237094b54f9e88d7496bd326009
+HTTP CONTRACTS DIFFERENTIAL-COVERED: 4/50 FIXTURE CASES (50/50 INVENTORIED)
+BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 0/2 EXECUTABLE RUST COMPARISONS
+DATABASE STATE PARITY: GAP — NO RUST BEFORE/AFTER ADAPTER
+FUTURE BREAKOUT PARITY: GAP — PYTHON GOLDENS ONLY
+SUPER TREND PARITY: GAP — PYTHON GOLDENS ONLY
+STATE MACHINE PARITY: PASS — PYTHON INVARIANT MATRIX
+RISK/SAFETY PARITY: PASS — PYTHON ADVERSARIAL MATRIX
+REACHABLE PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+FAKE LIVE BROKER SUCCESSES: 0
+PRODUCTION MODIFIED: NO
+PHASE 10 GATE: BLOCKED — DIFFERENTIAL RUNTIME AND CONCURRENCY EVIDENCE REQUIRED
+```

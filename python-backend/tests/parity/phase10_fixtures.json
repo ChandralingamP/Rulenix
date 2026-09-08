@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "normalization": {
+    "uuid_paths": ["body.request_id", "state.id"],
+    "timestamp_paths": ["body.created_at", "state.updated_at"],
+    "unordered_paths": ["body.items"]
+  },
+  "fixtures": [
+    {
+      "name": "risk-kill-switch-blocks-entry",
+      "category": "RISK",
+      "request": {"action": "ENTRY", "execution_mode": "live", "global_kill": true},
+      "rust": {"status": 200, "body": {"allowed": false, "reason_code": "global_kill_switch"}},
+      "python": {"status": 200, "body": {"allowed": false, "reason_code": "global_kill_switch"}}
+    },
+    {
+      "name": "broker-read-failure-is-not-flat",
+      "category": "RECONCILIATION",
+      "request": {"positions": "timeout", "orders": "ok"},
+      "rust": {"status": 200, "body": {"classification": "unknown", "safe_to_clear": false}},
+      "python": {"status": 200, "body": {"classification": "unknown", "safe_to_clear": false}}
+    },
+    {
+      "name": "manual-live-close-shadow-boundary",
+      "category": "API",
+      "request": {"method": "POST", "path": "/api/pnl/trades/{trade_id}/close", "execution_mode": "live"},
+      "rust": {"status": 503, "body": {"code": "python_live_mutation_disabled"}},
+      "python": {"status": 503, "body": {"code": "python_live_mutation_disabled"}},
+      "approved_differences": ["body.detail"]
+    },
+    {
+      "name": "duplicate-fixture-ordering",
+      "category": "DATABASE_STATE",
+      "request": {"items": ["a", "b"]},
+      "rust": {"status": 200, "body": {"items": ["a", "b"]}},
+      "python": {"status": 200, "body": {"items": ["b", "a"]}}
+    }
+  ]
+}

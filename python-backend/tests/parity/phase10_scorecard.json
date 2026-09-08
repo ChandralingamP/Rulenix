@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "rust_baseline_sha": "3f788f2a842ef9b1b66366d439431867850e3753",
+  "python_baseline_sha": "89332b5701e80237094b54f9e88d7496bd326009",
+  "contracts": {"http": 50, "websockets": 2},
+  "normalization": {
+    "uuid_paths": ["body.request_id", "state.id"],
+    "timestamp_paths": ["body.created_at", "state.updated_at"],
+    "unordered_paths": ["body.items"],
+    "forbidden_normalization": ["price", "quantity", "side", "status", "reason_code", "safety", "readiness", "pnl"]
+  },
+  "categories": {
+    "API": "GAP",
+    "WebSocket": "GAP",
+    "Auth": "PASS",
+    "RBAC": "PASS",
+    "Database state": "GAP",
+    "Trading domain": "PASS",
+    "Future Breakout": "GAP",
+    "SuperTrend": "GAP",
+    "Risk": "PASS",
+    "Kill Switch": "PASS",
+    "Execution intent": "PASS",
+    "Egress": "PASS",
+    "Reconciliation": "PASS",
+    "Manual broker close": "PASS",
+    "OCO": "GAP",
+    "Recovery": "PASS",
+    "Workers": "GAP",
+    "Broker request construction": "PASS",
+    "Failure behavior": "PASS"
+  },
+  "mutation_boundary": {
+    "reachable_paths": 0,
+    "network_requests": 0,
+    "fake_live_successes": 0
+  },
+  "blockers": [
+    "No isolated Rust runtime adapter or captured Rust execution protocol is connected to the reusable differential runner.",
+    "Multi-instance, crash/restart and high-concurrency parity tests are not yet executed against PostgreSQL."
+  ],
+  "approved_differences": [
+    "Phase 9 migration-safe 503 contracts: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades."
+  ]
+}

@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+from typing import Any
+
+MUTATION_MARKERS = (
+    "/" + "place" + "order",
+    "/" + "modify" + "order",
+    "/" + "cancel" + "order",
+    "/" + "create" + "rule",
+    "/" + "modify" + "rule",
+    "/" + "cancel" + "rule",
+)
+
+
+def scan_mutation_boundary(source_root: str | Path) -> dict[str, Any]:
+    """Static, conservative proof that no Angel mutation URL is wired."""
+
+    root = Path(source_root)
+    findings: list[dict[str, str]] = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts or path.name in {"mutation_audit.py", "audit.py"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        lowered = text.lower()
+        for marker in MUTATION_MARKERS:
+            if marker in lowered:
+                findings.append({"file": str(path), "marker": marker})
+    return {"markers": list(MUTATION_MARKERS), "findings": findings, "reachable_paths": len(findings)}
+
+
+def scan_sql_interpolation(source_root: str | Path) -> list[dict[str, str]]:
+    """Find f-string SQL calls for manual review; fixed-column builders are not auto-failed."""
+
+    findings: list[dict[str, str]] = []
+    root = Path(source_root)
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            findings.append({"file": str(path), "line": "0", "reason": "syntax_error"})
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "text"
+                and node.args
+                and isinstance(node.args[0], ast.JoinedStr)
+            ):
+                findings.append({"file": str(path), "line": str(node.lineno), "reason": "f_string_passed_to_sql_text"})
+    return findings
+
+
+def build_scorecard(*, repo_root: str | Path, python_root: str | Path) -> dict[str, Any]:
+    _ = Path(repo_root)
+    matrix = json.loads((Path(python_root) / "tests/parity/api_contract_matrix.json").read_text(encoding="utf-8"))
+    mutation = scan_mutation_boundary(Path(python_root) / "app")
+    sql = scan_sql_interpolation(Path(python_root) / "app")
+    categories = {
+        "API": {"status": "GAP", "evidence": "Phase 10 fixture framework exists; no isolated Rust runtime adapter is available."},
+        "WebSocket": {"status": "GAP", "evidence": "Handshake routes exist, but no Rust packet fixture runner or bounded queue differential test."},
+        "Auth": {"status": "PASS", "evidence": "Phase 2-9 auth, cookie, CSRF and session tests."},
+        "RBAC": {"status": "PASS", "evidence": "Admin/current-user dependencies and ownership tests."},
+        "Database state": {"status": "GAP", "evidence": "Python PostgreSQL tests pass; Rust/Python before-after capture is not executable yet."},
+        "Trading domain": {"status": "PASS", "evidence": "Transition, fill, P&L and intent regression tests."},
+        "Future Breakout": {"status": "GAP", "evidence": "Python golden fixtures pass; cross-runtime fixture comparison is not connected."},
+        "SuperTrend": {"status": "GAP", "evidence": "IST cutoff and indicator fixtures pass; cross-runtime comparison is not connected."},
+        "Risk": {"status": "PASS", "evidence": "Kill, readiness, egress, ownership and over-close tests pass."},
+        "Kill Switch": {"status": "PASS", "evidence": "Explicit state and stale-approval tests pass."},
+        "Execution intent": {"status": "PASS", "evidence": "Durable intent and idempotency regression tests pass."},
+        "Egress": {"status": "PASS", "evidence": "Isolation, fail-closed and helper protocol tests pass."},
+        "Reconciliation": {"status": "PASS", "evidence": "Broker read failure remains distinct from flat evidence."},
+        "Manual broker close": {"status": "PASS", "evidence": "Attribution and migration-safe API tests pass."},
+        "OCO": {"status": "GAP", "evidence": "Authoritative Rust/Node classifier vectors are not wired into Python differential execution."},
+        "Recovery": {"status": "PASS", "evidence": "Stale claim recovery and worker tests pass."},
+        "Workers": {"status": "GAP", "evidence": "No two-process isolated PostgreSQL leadership run was executed."},
+        "Broker request construction": {"status": "PASS", "evidence": "Typed request construction is tested with mutation transport disabled."},
+        "Failure behavior": {"status": "PASS", "evidence": "Controlled 503s and broker failure classifications are tested."},
+    }
+    return {
+        "schema_version": 1,
+        "rust_baseline_sha": "3f788f2a842ef9b1b66366d439431867850e3753",
+        "python_baseline_sha": "89332b5701e80237094b54f9e88d7496bd326009",
+        "contracts": {"http": len(matrix["http"]), "websockets": len(matrix["websockets"])},
+        "mutation_boundary": mutation,
+        "sql_interpolation_review": sql,
+        "categories": categories,
+        "blockers": [
+            "No isolated Rust runtime adapter or captured Rust execution protocol is connected to the reusable differential runner.",
+            "Multi-instance, crash/restart and high-concurrency parity tests are not yet executed against PostgreSQL.",
+        ],
+        "approved_differences": [
+            "Phase 9 migration-safe 503 contracts remain intentional: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades.",
+        ],
+    }
+
+
+def main() -> int:
+    repo_root = Path(__file__).resolve().parents[3]
+    python_root = repo_root / "python-backend"
+    print(json.dumps(build_scorecard(repo_root=repo_root, python_root=python_root), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
