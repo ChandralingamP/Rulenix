@@ -1880,3 +1880,77 @@ PYTHON LIVE ORDERS CANCELLED: 0
 PRODUCTION MODIFIED: NO
 PHASE 8 GATE: PASS — READY FOR REMAINING APIS AND REACT COMPATIBILITY
 ```
+
+## 44. Phase 9 — Remaining APIs and React compatibility
+
+Phase 9 continues from `8002e62c7b5602bb584e4e2fe64c43d6de323f0f` on dedicated branch
+`phase9-api-react-compat`. Rust remains the LIVE oracle and React source remains unchanged.
+
+### 44.1 Contract inventory and parity matrix
+
+The authoritative Rust route audit contains 50 HTTP method/path contracts and two browser
+WebSockets (`/ws/market`, `/ws/strategy`). The machine-readable matrix is
+`python-backend/tests/parity/api_contract_matrix.json`; it records auth/CSRF, React consumers,
+Python status, and intentional migration-safe shadow behavior. All contracts are represented;
+there are no missing active React calls and no frontend source changes.
+
+Python now exposes account/home, P&L/export/manual-close, strategy catalog/configuration/activation,
+backtesting history/export, logs, scheduler, risk limits and per-user kill switch, admin user
+management/clear-trades/daily reports, metrics, and both browser WebSocket paths. Response keys,
+snake_case naming, nullable values, pagination parameters, session cookies, CSRF checks, and
+`{"detail":...,"retry_after":...}` errors remain compatible with the Rust/React contract.
+
+### 44.2 Security and safety
+
+Session authentication remains HttpOnly/Secure/SameSite-compatible through the existing cookie
+handlers; state-changing routes require the existing CSRF token. Admin routes use `admin_only`,
+all trade/configuration queries are user-scoped, and WebSocket handshakes validate the session
+cookie before accepting. Log file names are path-confined. Clear Trades requires the global Kill
+Switch and deployment-safety inventory; LIVE cleanup refuses any unresolved exposure or broker
+unknown and never closes/cancels Angel state.
+
+LIVE trading mode, broker connect, backtest execution, and manual LIVE close return explicit
+migration-safe 503 responses where Python cannot complete the authoritative broker operation.
+Manual-close requests may persist a durable intent, but Python never reports a fabricated closed,
+filled, cancelled, protection-active, or broker-order state.
+
+### 44.3 WebSockets and frontend verification
+
+Both browser sockets enforce per-session isolation, reject unauthenticated connections, send the
+Rust-compatible connected handshake, heartbeat under idle clients, and use bounded lifecycle-owned
+tasks. Strategy messages cannot cross users; market subscriptions require non-empty tokens. The
+existing React frontend required zero source changes. Frontend verification passed 29 Vitest tests,
+ESLint, and the Vite production build.
+
+Backend verification passed 80 Python tests with one Windows-only Unix-helper skip when run against
+isolated PostgreSQL; Ruff and Mypy passed. Rust remained unchanged and its regression remains
+`131 passed, 0 failed, 31 ignored`.
+
+Phase 10 prerequisites are a Rust/Python differential harness against sanitized fixtures, full
+broker-connect/read-only WebSocket integration fixtures, exact XLSX byte-format parity for export,
+production observability/runbooks, and any approved future Angel mutation transport. No production
+deployment occurred.
+
+```text
+CURRENT PHASE: 9
+CURRENT_AUTHORITATIVE_RUST_PRODUCTION_COMMIT: 3f788f2a842ef9b1b66366d439431867850e3753
+PHASE 8 COMMIT: 8002e62c7b5602bb584e4e2fe64c43d6de323f0f
+RUST HTTP CONTRACTS: 50
+PYTHON HTTP CONTRACTS MATCHED: 50
+HTTP CONTRACTS MISSING: 0
+RUST BROWSER WEBSOCKETS: 2
+PYTHON BROWSER WEBSOCKETS MATCHED: 2
+WEBSOCKETS MISSING: 0
+ACTIVE REACT API CALLS: 35
+PYTHON-COMPATIBLE REACT CALLS: 35
+INCOMPATIBLE REACT CALLS: 0
+REACT SOURCE CHANGES: 0
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+FAKE LIVE BROKER SUCCESSES: 0
+PRODUCTION MODIFIED: NO
+PHASE 9 GATE: PASS — READY FOR RUST-PYTHON PARITY AND SECURITY AUDIT
+```

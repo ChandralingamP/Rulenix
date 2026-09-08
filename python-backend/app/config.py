@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     live_trading_enabled: bool = Field(default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED")
     egress_helper_socket: str = Field(default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET")
+    log_directory: str = Field(default="./logs", validation_alias="RULENIX_LOG_DIRECTORY")
 
     @field_validator("live_trading_enabled")
     @classmethod

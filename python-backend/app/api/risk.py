@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..dependencies import Principal, admin_only, get_db
+from ..errors import DomainError
 
 router = APIRouter(prefix="/risk/admin", tags=["risk"])
 
@@ -51,4 +52,25 @@ async def put_limits(body: Limits, user: Principal = Depends(admin_only), db: As
     await db.execute(text(f"INSERT INTO risk_limits(user_id,{','.join(values for values in body.model_dump())},updated_by,updated_at) VALUES(NULL,{','.join(':'+k for k in body.model_dump())},:actor,NOW()) ON CONFLICT ((TRUE)) WHERE user_id IS NULL DO UPDATE SET {cols},updated_by=:actor,updated_at=NOW()"), values)
     await db.commit()
     return {"detail": "Risk limits updated."}
+
+
+@router.put("/limits/{user_id}")
+async def put_user_limits(user_id: str, body: Limits, _: Principal = Depends(admin_only), db: AsyncSession = Depends(get_db)):
+    values = body.model_dump(exclude_unset=True)
+    if not values:
+        raise DomainError(422, "At least one limit is required.")
+    values["user_id"] = user_id
+    columns = ",".join(["user_id", *body.model_dump().keys()])
+    binds = ",".join(f":{key}" for key in ["user_id", *body.model_dump().keys()])
+    updates = ",".join(f"{key}=EXCLUDED.{key}" for key in values)
+    await db.execute(text(f"INSERT INTO risk_limits({columns}) VALUES({binds}) ON CONFLICT(user_id) DO UPDATE SET {updates},updated_at=NOW()"), values | {key: body.model_dump().get(key) for key in body.model_dump()})
+    await db.commit()
+    return {"detail": "Risk limits updated.", "user_id": user_id}
+
+
+@router.put("/kill-switch/{user_id}")
+async def put_user_kill(user_id: str, body: KillSwitch, actor: Principal = Depends(admin_only), db: AsyncSession = Depends(get_db)):
+    await db.execute(text("INSERT INTO risk_kill_switches(user_id,enabled,reason,updated_by,updated_at) VALUES(:user,:enabled,:reason,:actor,NOW()) ON CONFLICT(user_id) DO UPDATE SET enabled=EXCLUDED.enabled,reason=EXCLUDED.reason,updated_by=EXCLUDED.updated_by,updated_at=NOW()"), {"user": user_id, "enabled": body.enabled, "reason": body.reason.strip(), "actor": actor.id})
+    await db.commit()
+    return {"user_id": user_id, "enabled": body.enabled, "reason": body.reason.strip()}
 
