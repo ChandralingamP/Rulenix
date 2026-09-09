@@ -2097,6 +2097,26 @@ or rollback test was performed. Resume only after normal Rust/Angel lifecycle pr
 both orders and intents terminal, then repeat the complete read-only audit and create/restore-verify
 a fresh encrypted backup. Do not cancel or modify the LIVE orders merely to unblock Phase 11.
 
+### 46.3 Continuation preflight
+
+Phase 11 was re-entered from clean preparation commit
+`c3ce4b038a6afa0133cf9cd67c9de1f176b6cec4` on 2026-09-09. No preparation work was
+repeated. The deployed production broker-safety scripts were SHA-256 identical to the reviewed
+release files, and the gate performed fresh Angel position, order-book, trade-book, conditional/
+GTT, and classifier-required individual-order reads.
+
+The LIVE account was fully broker-readable. The broker reported zero open positions, two active
+orders, zero unknown orders, zero synthetic records, and zero active conditional rules. Rust's
+durable state matched: zero open LIVE trades, the same two quantity-20 Futures Breakout entry
+orders freshly reconciled at 18:23:14 UTC as `submitted / trigger pending` with zero fills, and two
+submitted execution intents. All other durable LIVE blocker categories were zero. The resulting
+deployment-safety total remains four.
+
+One credential-less non-LIVE account was explicitly classified `offline_locally_flat` and not
+LIVE-ready; broker unreadability was not interpreted as broker-flat. The direct LIVE evidence was
+authoritative, current, and exposure-positive, so `DEPLOYMENT_GATE=BLOCK`. No deployment action
+was taken and no broker or durable trading state was altered.
+
 ```text
 CURRENT PHASE: 11
 PRODUCTION RUST RELEASE: 3f788f2a842ef9b1b66366d439431867850e3753

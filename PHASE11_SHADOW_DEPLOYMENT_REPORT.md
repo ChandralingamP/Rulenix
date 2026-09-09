@@ -1,5 +1,47 @@
 # Phase 11 production shadow deployment report
 
+## Continuation safety recheck — 2026-09-09 18:23 UTC
+
+Phase 11 resumed from preparation commit
+`c3ce4b038a6afa0133cf9cd67c9de1f176b6cec4`. The worktree was clean and the prepared
+architecture was not rebuilt. A completely fresh read-only production preflight was performed
+before any deployment action. The deployed broker-safety inventory, gate, decision library, OCO
+classifier, and runner were SHA-256 identical to the reviewed release files.
+
+```text
+OPEN LIVE TRADES: 0
+UNRESOLVED LIVE ORDERS: 2
+UNRESOLVED EXECUTION INTENTS: 2
+OTHER DURABLE LIVE BLOCKERS: 0
+BROKER OPEN POSITIONS: 0
+BROKER NONTERMINAL ORDERS: 2
+DEPLOYMENT-SAFETY BLOCKERS: 4
+BROKER EVIDENCE AUTHORITATIVE: YES FOR THE LIVE ACCOUNT
+```
+
+The established production safety gate freshly read Angel positions, order book, trade book,
+individual-order evidence where required by the strict classifier, and the complete conditional/
+GTT inventory. All four broker reads succeeded for the LIVE account. It reported zero net-open
+positions, two active orders, zero unknown orders, zero synthetic records, and zero active
+conditional rules. Both active records match the two durable Futures Breakout `BUY_ENTRY` and
+`SELL_ENTRY` orders, quantity 20 each. Rust reconciled them at 18:23:14 UTC as `submitted`,
+`trigger pending`, filled quantity zero, and processed quantity zero. Their two execution intents
+remain `submitted`.
+
+The durable safety view also reports zero unresolved closed LIVE trades, reversals, manual-close
+intents, position incidents, reconciliation mutations, and protection-state blockers. The LIVE
+account is active, LIVE-permitted, broker-token connected, credential-revision matched, and its
+Rust reconciliation is healthy and current. No Kill Switch row is enabled.
+
+Three of four configured accounts were broker-readable. The account without an API key is a
+non-LIVE account with zero durable blockers; it was explicitly classified
+`offline_locally_flat`, not broker-flat, and not LIVE-ready. No failed or missing broker read was
+used as proof of safety.
+
+The production gate returned `DEPLOYMENT_GATE=BLOCK`. No Phase 11 role/schema provisioning,
+backup, build, transfer, network addition, proxy/container start, or routing change was attempted.
+The active orders were not cancelled, modified, closed, or otherwise manipulated.
+
 ## Fresh read-only preflight
 
 Preflight was performed on 2026-09-09 without changing production. The LIVE exposure gate was
