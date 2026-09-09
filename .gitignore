@@ -6,6 +6,7 @@ frontend/dist/
 backend/target/
 backend/.env
 backend/logs/*.log
+secrets/
 
 # Editors / OS
 .idea/

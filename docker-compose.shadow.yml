@@ -1,0 +1,75 @@
+services:
+  shadow-db-proxy:
+    image: haproxy:3.0-alpine
+    restart: on-failure:5
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    volumes:
+      - ./infra/phase11/haproxy-shadow-db.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - production_db_path
+      - shadow_internal
+    mem_limit: 32m
+    cpus: 0.10
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  python-shadow:
+    build:
+      context: ./python-backend
+      dockerfile: Dockerfile.shadow
+    restart: on-failure:5
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      RULENIX_SHADOW_ONLY: required
+      SHADOW_SOURCE_DATABASE_URL_FILE: /run/secrets/shadow_source_database_url
+      SHADOW_SINK_DATABASE_URL_FILE: /run/secrets/shadow_sink_database_url
+      SHADOW_PSEUDONYM_KEY_FILE: /run/secrets/shadow_pseudonym_key
+      SHADOW_RELEASE: ${SHADOW_RELEASE:?SHADOW_RELEASE is required}
+      SHADOW_POLL_SECONDS: "15"
+      SHADOW_BATCH_SIZE: "100"
+      SHADOW_LOOKBACK_HOURS: "24"
+      SHADOW_HEALTH_PORT: "8090"
+    secrets:
+      - shadow_source_database_url
+      - shadow_sink_database_url
+      - shadow_pseudonym_key
+    networks:
+      - shadow_internal
+    depends_on:
+      shadow-db-proxy:
+        condition: service_started
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+networks:
+  production_db_path:
+    external: true
+    name: rulenix_default
+  shadow_internal:
+    internal: true
+
+secrets:
+  shadow_source_database_url:
+    file: ./secrets/shadow_source_database_url.txt
+  shadow_sink_database_url:
+    file: ./secrets/shadow_sink_database_url.txt
+  shadow_pseudonym_key:
+    file: ./secrets/shadow_pseudonym_key.txt

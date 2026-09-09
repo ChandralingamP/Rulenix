@@ -1,0 +1,27 @@
+FROM python:3.14-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+RUN groupadd --system --gid 10002 rulenix-shadow \
+    && useradd --system --uid 10002 --gid 10002 --home /nonexistent --shell /usr/sbin/nologin rulenix-shadow
+
+WORKDIR /app
+COPY requirements-shadow.txt /app/requirements-shadow.txt
+RUN pip install --no-cache-dir --requirement /app/requirements-shadow.txt \
+    && mkdir -p /app/app/strategy \
+    && touch /app/app/strategy/__init__.py
+
+# Deliberately copy only the observer and three pure calculation modules. The
+# image contains no API, Angel, credential, egress, reconciliation, trading, or
+# mutation-transport package.
+COPY app/__init__.py /app/app/__init__.py
+COPY app/shadow /app/app/shadow
+COPY app/strategy/common.py /app/app/strategy/common.py
+COPY app/strategy/futures_breakout.py /app/app/strategy/futures_breakout.py
+COPY app/strategy/supertrend.py /app/app/strategy/supertrend.py
+
+USER 10002:10002
+EXPOSE 8090
+ENTRYPOINT ["python", "-m", "app.shadow"]

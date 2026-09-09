@@ -2053,3 +2053,71 @@ FAKE LIVE BROKER SUCCESSES: 0
 PRODUCTION MODIFIED: NO
 PHASE 10 GATE: PASS — READY FOR PRODUCTION SHADOW DEPLOYMENT
 ```
+
+## 46. Phase 11 — production shadow deployment and parity observation
+
+Phase 11 started from Phase 10 commit
+`2dc34f4971ed3ddcf4695d48cf409213322ac23c` on branch
+`phase11-production-shadow`. A fresh read-only production preflight confirmed the running Rust
+release is `3f788f2a842ef9b1b66366d439431867850e3753`; Rust, frontend, PostgreSQL, internal readiness,
+public readiness, Caddy, and the restricted egress helper are healthy. Frontend Nginx still routes
+`/api/` exclusively to Rust.
+
+### 46.1 Shadow-only architecture
+
+The normal Python API is not used because its startup and handler surface can write authoritative
+state. Phase 11 adds a separate minimal `app.shadow` process and a selectively copied image with
+no API, Angel, credential, egress, reconciliation, trading, or mutation-transport packages. It
+opens no Angel session or market subscription and receives no broker secrets.
+
+The process reads exact Rust-persisted strategy and reconciliation evidence through
+`rulenix_shadow_reader`, which is transaction-read-only and column-granted. It writes only through
+`rulenix_shadow_writer` to the isolated `rulenix_shadow` schema. Both roles are non-superuser,
+non-inheriting, non-replicating, and connection-limited. Local isolated PostgreSQL proof confirms
+reader/writer authoritative INSERT, UPDATE, and DELETE attempts are denied while shadow inserts
+work.
+
+Python runs only on an internal Docker network without an external route. A small fixed-destination
+TCP bridge connects that network to production PostgreSQL without attaching or recreating the
+database container. The Python image also lacks broker code and credentials, giving independent
+application, packaging, network, and database controls. CPU, memory, PIDs, DB pools, batches, and
+restart behavior are explicitly bounded. Full design and rollback details are in
+`docs/phase11-shadow-deployment.md`.
+
+### 46.2 Fresh production blocker
+
+Production currently has zero open LIVE trades but two opposite-side Futures Breakout LIVE entry
+orders, quantity 20 each, freshly reconciled by Rust/Angel as `trigger pending`. Their two durable
+execution intents remain `submitted`; the deployment-safety view therefore reports four blockers.
+The Global Kill Switch is disabled. No duplicate Python broker read was made.
+
+Production role/schema provisioning would alter PostgreSQL. Under the Phase 11 LIVE-exposure stop
+rule, no backup, provisioning, image transfer/build, container start, proxy change, network change,
+or rollback test was performed. Resume only after normal Rust/Angel lifecycle processing makes
+both orders and intents terminal, then repeat the complete read-only audit and create/restore-verify
+a fresh encrypted backup. Do not cancel or modify the LIVE orders merely to unblock Phase 11.
+
+```text
+CURRENT PHASE: 11
+PRODUCTION RUST RELEASE: 3f788f2a842ef9b1b66366d439431867850e3753
+PYTHON SHADOW RELEASE: NOT DEPLOYED
+RUST HEALTH: PASS
+FRONTEND HEALTH: PASS
+POSTGRESQL HEALTH: PASS
+PUBLIC READINESS: PASS
+GLOBAL KILL SWITCH: DISABLED
+OPEN LIVE TRADES: 0
+NONTERMINAL LIVE ORDERS: 2
+NONTERMINAL LIVE EXECUTION INTENTS: 2
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PYTHON LIVE POSITIONS CLOSED: 0
+PYTHON AUTHORITATIVE TRADING WRITES: 0
+REACHABLE PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+FAKE LIVE BROKER SUCCESSES: 0
+RUST REMAINS AUTHORITATIVE: YES
+FRONTEND STILL ROUTED TO RUST: YES
+PHASE 11 GATE: BLOCKED - ACTIVE LIVE TRIGGER-PENDING ENTRY ORDERS
+```
