@@ -2135,6 +2135,25 @@ Phase 11 continuation gate requires successful authoritative broker reads. Conse
 evidence is `NO`, Phase 11 remains blocked, and no backup, provisioning, build, network, container,
 routing, or observation action was performed.
 
+### 46.5 Reconnected-session direct-read blocker
+
+Phase 11 resumed from clean evidence commit
+`2c8a7880e12285d88a43c9be68c6a91adf4edb42` on 2026-09-10 without rebuilding the
+shadow implementation. The LIVE account's token state was `connected`, token check `success`,
+credential revision matched, and Rust reconciliation was healthy and fresh. Every durable
+deployment-safety column remained zero.
+
+The unchanged direct broker gate nevertheless received HTTP 403 from at least one required
+LIVE-account read. Its composite account result was `broker_readable=false`. Consequently partial
+numeric zeros for positions, active orders, unknown orders, and conditional rules are not accepted
+as broker-flat. The newer direct failure also supersedes the stored healthy reconciliation row for
+this deployment decision.
+
+The gate's offline-local policy printed `DEPLOYMENT_GATE=PASS`, but Phase 11 forbids that override
+and requires authoritative broker evidence `YES`. The exact blocker is therefore an incomplete
+authoritative broker read, not durable exposure. No backup, provisioning, build, network,
+container, routing, or observation action was performed.
+
 ```text
 CURRENT PHASE: 11
 PRODUCTION RUST RELEASE: 3f788f2a842ef9b1b66366d439431867850e3753
@@ -2147,10 +2166,11 @@ GLOBAL KILL SWITCH: DISABLED
 OPEN LIVE TRADES: 0
 NONTERMINAL LIVE ORDERS: 0
 NONTERMINAL LIVE EXECUTION INTENTS: 0
-BROKER OPEN POSITIONS: UNKNOWN - READ UNAVAILABLE
-BROKER NONTERMINAL ORDERS: UNKNOWN - READ UNAVAILABLE
-UNKNOWN BROKER ORDERS: UNKNOWN - ORDER BOOK UNAVAILABLE
-ACTIVE CONDITIONAL RULES: UNKNOWN - GTT READ UNAVAILABLE
+BROKER SESSION HEALTH: FAIL - REQUIRED DIRECT READ RETURNED HTTP 403
+BROKER OPEN POSITIONS: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
+BROKER NONTERMINAL ORDERS: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
+UNKNOWN BROKER ORDERS: UNKNOWN - ORDER EVIDENCE NOT AUTHORITATIVE
+ACTIVE CONDITIONAL RULES: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
 BROKER EVIDENCE AUTHORITATIVE: NO
 PYTHON LIVE ORDERS PLACED: 0
 PYTHON LIVE ORDERS MODIFIED: 0
@@ -2162,5 +2182,5 @@ PYTHON ANGEL MUTATION HTTP REQUESTS: 0
 FAKE LIVE BROKER SUCCESSES: 0
 RUST REMAINS AUTHORITATIVE: YES
 FRONTEND STILL ROUTED TO RUST: YES
-PHASE 11 GATE: BLOCKED - AUTHORITATIVE BROKER READS UNAVAILABLE
+PHASE 11 GATE: BLOCKED - REQUIRED BROKER READ RETURNED HTTP 403
 ```

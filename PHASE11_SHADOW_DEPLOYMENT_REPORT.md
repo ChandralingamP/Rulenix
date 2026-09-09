@@ -1,5 +1,46 @@
 # Phase 11 production shadow deployment report
 
+## Continuation safety recheck — 2026-09-10 00:38 IST
+
+Phase 11 resumed from evidence commit
+`2c8a7880e12285d88a43c9be68c6a91adf4edb42`. The worktree was clean, the shadow
+implementation was not rebuilt, production remained on Rust release
+`3f788f2a842ef9b1b66366d439431867850e3753`, and all deployed safety-gate files remained
+SHA-256 identical to the reviewed baseline.
+
+At 2026-09-09 19:08 UTC the durable production safety view remained completely clear. The LIVE
+account was active and LIVE-permitted; its credential revision matched, token state was
+`connected`, last token check was `success`, and Rust reconciliation was healthy and less than
+five minutes old. No Kill Switch row was enabled.
+
+```text
+BROKER SESSION HEALTH: FAIL - REQUIRED DIRECT READ RETURNED HTTP 403
+OPEN LIVE TRADES: 0
+UNRESOLVED LIVE ORDERS: 0
+UNRESOLVED EXECUTION INTENTS: 0
+OTHER DURABLE BLOCKERS: 0
+BROKER OPEN POSITIONS: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
+BROKER NONTERMINAL ORDERS: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
+UNKNOWN BROKER ORDERS: UNKNOWN - ORDER EVIDENCE NOT AUTHORITATIVE
+ACTIVE CONDITIONAL RULES: UNKNOWN - COMPOSITE BROKER READ INCOMPLETE
+DEPLOYMENT-SAFETY BLOCKERS: 0 IN DURABLE VIEW; REQUIRED BROKER-EVIDENCE BLOCKER: 1
+BROKER EVIDENCE AUTHORITATIVE: NO
+```
+
+The unchanged direct safety gate attempted fresh position, order-book, trade-book, and conditional/
+GTT reads, with classifier-required individual-order reads when applicable. At least one required
+LIVE-account read returned HTTP 403. The gate's partial result object contained numerical zeros,
+but its `broker_readable` value was false. Those partial zeros are not accepted as observed flat
+state. The other accounts also lacked current JWT/API credentials.
+
+The gate runner again printed `DEPLOYMENT_GATE=PASS` under its offline-local policy. Phase 11
+explicitly disallows that override: a failed required broker read is not flat, unknown is not safe,
+and the previously stored healthy reconciliation row cannot supersede the newer direct HTTP 403.
+
+Phase 11 stopped before backup, provisioning, build, transfer, network creation, container start,
+routing, or observation. No credential, order, intent, Kill Switch, reconciliation, or broker state
+was changed merely to obtain a pass.
+
 ## Continuation safety recheck — 2026-09-10 00:31 IST
 
 Phase 11 resumed from evidence commit
