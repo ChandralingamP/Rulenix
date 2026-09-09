@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from fastapi import APIRouter, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,16 +26,28 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     username: str
     password: str
 
 
 class OtpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: str
-    purpose: str = "signup"
+    username: str
+
+
+class ResetOtpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
 
 
 class SignupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     username: str
     user_id: str = ""
     api_key: str = ""
@@ -47,6 +59,8 @@ class SignupRequest(BaseModel):
 
 
 class ResetVerify(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: str
     otp: str
 
@@ -103,26 +117,34 @@ async def logout(request: Request, response: Response, db: AsyncSession = __impo
 
 @router.post("/request-otp/")
 async def request_otp(body: OtpRequest, request: Request, db: AsyncSession = __import__("fastapi").Depends(get_db)):
-    if not valid_email(body.email) or body.purpose not in {"signup", "password_reset", "profile_update"}:
-        raise DomainError(422, "Invalid email or OTP purpose.")
+    if not valid_email(body.email) or not valid_username(body.username):
+        raise DomainError(400, "A valid email and username are required.")
     otp = f"{secrets.randbelow(1_000_000):06d}"
     settings = request.app.state.settings
-    await db.execute(text("UPDATE email_otps SET is_used=TRUE,invalidated_at=NOW() WHERE LOWER(email)=LOWER(:email) AND purpose=:purpose AND is_used=FALSE"), {"email": body.email, "purpose": body.purpose})
-    await db.execute(text("INSERT INTO email_otps (id,email,otp_hash,purpose,expires_at) VALUES (:id,:email,:hash,:purpose,NOW()+INTERVAL '10 minutes')"), {"id": uuid4(), "email": body.email, "hash": otp_digest(settings.otp_hash_key, body.email, body.purpose, otp), "purpose": body.purpose})
-    await db.commit()
-    if not settings.smtp_host and settings.app_env == "development":
-        request.app.state.last_dev_otp = otp
-    return {"detail": "If the address is eligible, an OTP has been sent."}
+    exists = await db.scalar(
+        text(
+            "SELECT NOT EXISTS(SELECT 1 FROM users "
+            "WHERE LOWER(username)=LOWER(:username) OR LOWER(email)=LOWER(:email))"
+        ),
+        {"username": body.username, "email": body.email},
+    )
+    if exists:
+        await db.execute(text("UPDATE email_otps SET is_used=TRUE,invalidated_at=NOW() WHERE LOWER(email)=LOWER(:email) AND purpose='signup' AND is_used=FALSE"), {"email": body.email})
+        await db.execute(text("INSERT INTO email_otps (id,email,otp_hash,purpose,expires_at) VALUES (:id,:email,:hash,'signup',NOW()+INTERVAL '10 minutes')"), {"id": uuid4(), "email": body.email, "hash": otp_digest(settings.otp_hash_key, body.email, "signup", otp)})
+        await db.commit()
+        if not settings.smtp_host and settings.app_env == "development":
+            request.app.state.last_dev_otp = otp
+    return {"detail": "If the supplied details can be used, a verification code has been sent."}
 
 
 @router.post("/signup/")
 async def signup(body: SignupRequest, request: Request, response: Response, db: AsyncSession = __import__("fastapi").Depends(get_db)):
     if not valid_username(body.username) or not valid_email(body.email) or body.password != body.confirm_password:
-        raise DomainError(422, "Invalid signup details.")
+        raise DomainError(400, "Invalid signup details.")
     if (err := password_error(body.username, body.email, body.password)):
-        raise DomainError(422, err)
+        raise DomainError(400, err)
     if not body.user_id or not body.api_key:
-        raise DomainError(422, "Brokerage user ID and API key are required.")
+        raise DomainError(400, "Invalid signup details.")
     otp = (await db.execute(text("SELECT id,otp_hash,expires_at FROM email_otps WHERE LOWER(email)=LOWER(:email) AND purpose='signup' AND is_used=FALSE AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE"), {"email": body.email})).mappings().first()
     if not otp or otp["expires_at"] < datetime.now(UTC) or otp_digest(request.app.state.settings.otp_hash_key, body.email, "signup", body.otp) != otp["otp_hash"]:
         raise DomainError(400, "Invalid or expired OTP.")
@@ -142,9 +164,22 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
 
 
 @router.post("/password/request-reset/")
-async def request_reset(body: OtpRequest, request: Request, db: AsyncSession = __import__("fastapi").Depends(get_db)):
-    body.purpose = "password_reset"
-    return await request_otp(body, request, db)
+async def request_reset(body: ResetOtpRequest, request: Request, db: AsyncSession = __import__("fastapi").Depends(get_db)):
+    if not valid_email(body.email):
+        raise DomainError(400, "Enter a valid email address.")
+    exists = await db.scalar(
+        text("SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email)=LOWER(:email))"),
+        {"email": body.email},
+    )
+    if exists:
+        otp = f"{secrets.randbelow(1_000_000):06d}"
+        settings = request.app.state.settings
+        await db.execute(text("UPDATE email_otps SET is_used=TRUE,invalidated_at=NOW() WHERE LOWER(email)=LOWER(:email) AND purpose='password_reset' AND is_used=FALSE"), {"email": body.email})
+        await db.execute(text("INSERT INTO email_otps (id,email,otp_hash,purpose,expires_at) VALUES (:id,:email,:hash,'password_reset',NOW()+INTERVAL '10 minutes')"), {"id": uuid4(), "email": body.email, "hash": otp_digest(settings.otp_hash_key, body.email, "password_reset", otp)})
+        await db.commit()
+        if not settings.smtp_host and settings.app_env == "development":
+            request.app.state.last_dev_otp = otp
+    return {"detail": "If an account matches that email, a verification code has been sent."}
 
 
 @router.post("/password/verify-otp/")
@@ -158,12 +193,12 @@ async def verify_reset(body: ResetVerify, request: Request, db: AsyncSession = _
 @router.post("/password/reset/")
 async def reset_password(body: ResetPassword, request: Request, db: AsyncSession = __import__("fastapi").Depends(get_db)):
     if body.password != body.confirm_password:
-        raise DomainError(422, "Passwords do not match.")
+        raise DomainError(400, "Passwords do not match.")
     row = (await db.execute(text("SELECT id,username FROM users WHERE LOWER(email)=LOWER(:email)"), {"email": body.email})).mappings().first()
     if not row:
         raise DomainError(400, "Invalid or expired OTP.")
     if (err := password_error(row["username"], body.email, body.password)):
-        raise DomainError(422, err)
+        raise DomainError(400, err)
     await db.execute(text("UPDATE users SET password_hash=:hash,password_changed_at=NOW(),failed_login_attempts=0,locked_until=NULL,updated_at=NOW() WHERE id=:id"), {"hash": hash_password(body.password), "id": row["id"]})
     await db.execute(text("UPDATE user_sessions SET revoked_at=NOW() WHERE user_id=:id AND revoked_at IS NULL"), {"id": row["id"]})
     await db.commit()

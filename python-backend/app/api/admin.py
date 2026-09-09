@@ -1,3 +1,5 @@
+from datetime import date as Date
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +22,7 @@ async def update_user(payload: dict, actor: Principal = Depends(admin_only), db:
     if not target:
         raise DomainError(422, "user_id is required.")
     if str(target) == str(actor.id) and "can_administer" in payload and not payload["can_administer"]:
-        raise DomainError(400, "You cannot remove your own administrator permission.")
+        raise DomainError(400, "You cannot change your own administration permission.")
     allowed = {k: payload[k] for k in ("can_administer", "can_live_trade", "can_backtest", "can_backtest_on_trading_days", "is_active") if k in payload}
     if not allowed:
         raise DomainError(422, "At least one permission is required.")
@@ -60,7 +62,7 @@ async def clear_trade_logs(payload: dict, _: Principal = Depends(admin_only), db
         raise DomainError(404, "User was not found.")
     kill = bool(await db.scalar(text("SELECT COALESCE(enabled,FALSE) FROM risk_kill_switches WHERE user_id IS NULL")))
     if not kill:
-        raise DomainError(400, "Global Kill Switch must be enabled before clearing trading records.")
+        raise DomainError(400, "Clear Trades requires the global kill switch to be enabled.")
     if scope in {"live", "all"}:
         # Python has no broker-read capability in this migration phase.  A
         # local readiness view is not proof that Angel is flat, so fail closed
@@ -77,7 +79,46 @@ async def clear_trade_logs(payload: dict, _: Principal = Depends(admin_only), db
 
 
 @router.get("/trades/daily/")
-async def daily_trades(date: str | None = Query(None), _: Principal = Depends(admin_only), db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(text("SELECT t.id,t.user_id,u.username,t.status,t.execution_mode,t.direction,t.quantity,t.entry_price,t.exit_price,t.pnl,t.entry_datetime,t.exit_datetime,t.instrument_label,t.contract_symbol,t.exit_reason FROM trades t JOIN users u ON u.id=t.user_id WHERE (:date IS NULL OR COALESCE(t.entry_datetime,t.created_at)::date=CAST(:date AS date)) ORDER BY COALESCE(t.entry_datetime,t.created_at) DESC LIMIT 1000"), {"date": date})).mappings().all()
-    return {"trades": [dict(row) for row in rows], "date": date}
+async def daily_trades(date: Date | None = Query(None), _: Principal = Depends(admin_only), db: AsyncSession = Depends(get_db)):
+    if date is None:
+        date = await db.scalar(text("SELECT (NOW() AT TIME ZONE 'Asia/Kolkata')::date"))
+    rows = (await db.execute(text("""
+      WITH pnl_counts AS (
+        SELECT user_id,COUNT(*)::bigint AS pnl_trades,
+               COUNT(*) FILTER (WHERE execution_mode='demo')::bigint AS demo_trades,
+               COUNT(*) FILTER (WHERE execution_mode='live')::bigint AS live_trades,
+               COUNT(*) FILTER (WHERE status='open')::bigint AS open_trades,
+               COUNT(*) FILTER (WHERE status='closed')::bigint AS closed_trades
+          FROM trades
+         WHERE (entry_datetime AT TIME ZONE 'Asia/Kolkata')::date=CAST(:date AS date)
+         GROUP BY user_id
+      ), backtest_counts AS (
+        SELECT run.user_id,COUNT(trade.id)::bigint AS backtest_trades
+          FROM backtest_runs run JOIN backtest_trades trade ON trade.run_id=run.id
+         WHERE (trade.entry_time AT TIME ZONE 'Asia/Kolkata')::date=CAST(:date AS date)
+         GROUP BY run.user_id
+      )
+      SELECT u.id AS user_id,u.username,
+             (COALESCE(p.pnl_trades,0)+COALESCE(b.backtest_trades,0))::bigint AS total_trades,
+             COALESCE(p.pnl_trades,0)::bigint AS pnl_trades,
+             COALESCE(b.backtest_trades,0)::bigint AS backtest_trades,
+             COALESCE(p.demo_trades,0)::bigint AS demo_trades,
+             COALESCE(p.live_trades,0)::bigint AS live_trades,
+             COALESCE(p.open_trades,0)::bigint AS open_trades,
+             COALESCE(p.closed_trades,0)::bigint AS closed_trades
+        FROM users u LEFT JOIN pnl_counts p ON p.user_id=u.id
+        LEFT JOIN backtest_counts b ON b.user_id=u.id
+       ORDER BY (COALESCE(p.pnl_trades,0)+COALESCE(b.backtest_trades,0)) DESC,u.username
+    """), {"date": date})).mappings().all()
+    users = [dict(row) for row in rows]
+    return {
+        "date": date.isoformat(),
+        "timezone": "Asia/Kolkata",
+        "total_trades": sum(row["total_trades"] for row in users),
+        "pnl_trades": sum(row["pnl_trades"] for row in users),
+        "backtest_trades": sum(row["backtest_trades"] for row in users),
+        "demo_trades": sum(row["demo_trades"] for row in users),
+        "live_trades": sum(row["live_trades"] for row in users),
+        "users": users,
+    }
 

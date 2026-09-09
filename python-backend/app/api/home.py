@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,21 +16,60 @@ router = APIRouter(tags=["home"])
 
 async def _details(db: AsyncSession, user_id: str) -> dict:
     row = (await db.execute(text("""
-        SELECT u.username,COALESCE(p.brokerage_user_id,'') AS brokerage_user_id,
-               COALESCE(p.broker_credential_revision,0) AS broker_credential_revision,
+        SELECT COALESCE(p.brokerage_user_id,'') AS client_id,p.updated_at AS last_updated,
                COALESCE(p.token_state,'missing') AS token_state,p.token_received_at,
-               COALESCE(p.last_token_status,'missing') AS last_token_status,
+               p.last_token_check_at,COALESCE(p.last_token_status,'missing') AS last_token_status,
                COALESCE(p.last_token_message,'') AS last_token_message,
-               COALESCE(h.healthy,FALSE) AS reconciliation_healthy,h.checked_at AS reconciliation_checked_at,
-               h.broker_credential_revision AS reconciliation_revision,
-               CASE WHEN p.brokerage_user_id IS NOT NULL AND p.brokerage_user_id<>'' THEN TRUE ELSE FALSE END AS configured
-          FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id
-          LEFT JOIN broker_reconciliation_health h ON h.user_id=u.id WHERE u.id=:user
+               EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=u.id AND s.secret_kind='api_key') AS api_key_configured,
+               EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=u.id AND s.secret_kind='jwt_token')
+               AND EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=u.id AND s.secret_kind='refresh_token')
+               AND EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=u.id AND s.secret_kind='feed_token') AS has_all_session_tokens
+          FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=:user
     """), {"user": user_id})).mappings().first()
     if not row:
         raise DomainError(404, "User profile not found.")
-    connected = row["last_token_status"] in {"success", "refreshed", "connected"} and row["token_received_at"] is not None
-    return {"username": row["username"], "brokerage_user_id": row["brokerage_user_id"], "connection_state": "connected" if connected else "disconnected", "connection_message": row["last_token_message"] or ("Brokerage session is connected." if connected else "Connect Angel One before using broker features."), "last_connected_at": row["token_received_at"], "authenticated": connected, "configured": row["configured"], "deployment_safe": False, "live_permitted": False, "live_ready": bool(row["reconciliation_healthy"] and row["reconciliation_revision"] == row["broker_credential_revision"]), "reconciliation_healthy": bool(row["reconciliation_healthy"]), "reconciliation_checked_at": row["reconciliation_checked_at"], "credential_revision": row["broker_credential_revision"]}
+    received = row["token_received_at"]
+    connected_today = bool(
+        row["api_key_configured"]
+        and row["has_all_session_tokens"]
+        and received is not None
+        and received.astimezone(ZoneInfo("Asia/Kolkata")).date()
+        == datetime.now(UTC).astimezone(ZoneInfo("Asia/Kolkata")).date()
+    )
+    token_state = row["token_state"]
+    last_status = row["last_token_status"]
+    if connected_today and (
+        token_state in {"verification_unavailable", "refresh_required"}
+        or last_status in {"invalid", "expired", "failed"}
+    ):
+        connection_state = "unavailable"
+    elif connected_today:
+        connection_state = "connected"
+    elif token_state in {"verification_unavailable", "refresh_required"}:
+        connection_state = "unavailable"
+    elif last_status in {"invalid", "expired", "unavailable", "failed"}:
+        connection_state = last_status
+    elif not row["has_all_session_tokens"]:
+        connection_state = "idle"
+    else:
+        connection_state = "connected"
+    if connection_state in {"connected", "idle"}:
+        message = None
+    elif connection_state == "unavailable":
+        message = "Angel One is temporarily unavailable. Rulenix will retry automatically."
+    else:
+        message = row["last_token_message"]
+    return {
+        "client_id": row["client_id"],
+        "api_key_configured": bool(row["api_key_configured"]),
+        "last_updated": row["last_updated"],
+        "connection_state": connection_state,
+        "token_state": token_state,
+        "connection_message": message,
+        "connected_for_today": connected_today,
+        "last_connected_at": received,
+        "last_verified_at": row["last_token_check_at"],
+    }
 
 
 @router.get("/home/status/")

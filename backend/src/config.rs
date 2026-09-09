@@ -52,7 +52,7 @@ impl Config {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "phase10-adapter"))]
     pub(crate) fn for_isolated_test(database_url: &str, angel_api_base: &str) -> Self {
         let mut config = Self::from_lookup(|key| match key {
             "APP_ENV" => Some("test".into()),

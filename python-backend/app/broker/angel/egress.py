@@ -24,7 +24,7 @@ def validate_public_ipv4(value: str) -> IPv4Address:
         or (o[0] == 198 and o[1] in (18, 19)) or (o[0] == 198 and o[1] == 51 and o[2] == 100)
         or (o[0] == 203 and o[1] == 0 and o[2] == 113))
     if invalid:
-        raise ValueError("The Angel egress address must be globally routable public IPv4.")
+        raise ValueError("The Angel egress address must be a globally routable public IPv4 address.")
     return ip
 
 

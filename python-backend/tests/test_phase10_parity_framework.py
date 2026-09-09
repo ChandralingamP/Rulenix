@@ -28,12 +28,14 @@ def test_fixture_bundle_is_reproducible_and_approved_differences_are_explicit():
     assert fixtures[2].approved_differences == ("body.detail",)
 
 
-def test_scorecard_freezes_baselines_and_exposes_blockers():
+def test_scorecard_freezes_baselines_and_has_no_remaining_blockers():
     scorecard = json.loads(SCORECARD.read_text(encoding="utf-8"))
     assert scorecard["rust_baseline_sha"] == "3f788f2a842ef9b1b66366d439431867850e3753"
     assert scorecard["python_baseline_sha"] == "89332b5701e80237094b54f9e88d7496bd326009"
     assert scorecard["mutation_boundary"] == {"reachable_paths": 0, "network_requests": 0, "fake_live_successes": 0}
-    assert scorecard["blockers"]
+    assert scorecard["blockers"] == []
+    assert scorecard["http_evidence"]["unclassified"] == 0
+    assert scorecard["http_evidence"]["executable_mismatches"] == 0
 
 
 def test_differential_results_record_exact_financial_parity_without_normalization():

@@ -12,8 +12,8 @@ from ..errors import DomainError
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
 JOBS = {
     "cleanup_otps": ("Clean expired OTPs", "Deletes expired verification records.", "Daily at 00:00 IST"),
-    "session_audit": ("Audit broker sessions", "Marks stale sessions for reconnection.", "Every 30 minutes"),
-    "strategy_reload": ("Reload strategy engine", "Refreshes strategy state and stuck retries.", "Manual admin recovery"),
+    "session_audit": ("Audit broker sessions", "Marks stale Angel One sessions for reconnection.", "Every 30 minutes"),
+    "strategy_reload": ("Reload strategy engine", "Refreshes Futures Breakout contracts, snapshots, feed state, expiry checks, and stuck retries.", "Manual admin recovery"),
 }
 
 

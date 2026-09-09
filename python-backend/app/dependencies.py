@@ -50,7 +50,7 @@ async def current_user(request: Request, db: Annotated[AsyncSession, Depends(get
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         csrf = request.headers.get("X-CSRF-Token") or request.cookies.get("rulenix_csrf")
         if not csrf or not hmac_compare(digest(csrf), bytes(row["csrf_hash"])):
-            raise DomainError(403, "CSRF validation failed.")
+            raise DomainError(403, "Invalid CSRF token.")
     now = datetime.now(UTC)
     idle = min(row["absolute_expires_at"], now + timedelta(minutes=request.app.state.settings.session_idle_minutes))
     await db.execute(text("UPDATE user_sessions SET last_seen_at=NOW(),idle_expires_at=:idle WHERE id=:id"), {"idle": idle, "id": row["session_id"]})
@@ -65,5 +65,5 @@ def hmac_compare(a: bytes, b: bytes) -> bool:
 
 async def admin_only(user: Annotated[Principal, Depends(current_user)]) -> Principal:
     if not user.can_administer:
-        raise DomainError(403, "Administrator permission required.")
+        raise DomainError(403, "User administration permission required.")
     return user

@@ -4,11 +4,31 @@
   "active_react_api_calls": 35,
   "python_compatible_react_calls": 35,
   "incompatible_react_calls": 0,
-  "http_evidence_default": "CONTRACT_FIXTURE_PARITY",
+  "http_evidence_default": null,
   "http_evidence_overrides": {
-    "EXECUTABLE_DIFFERENTIAL": ["GET /health", "GET /health/live"],
-    "MUTATION_DISABLED": ["POST /home/connect/", "PUT /account/trading-mode", "POST /backtesting/run", "POST /pnl/trades/{trade_id}/close", "DELETE /auth/admin/users/trade-logs/"],
-    "ENVIRONMENT_GATED": ["GET /metrics"]
+    "EXECUTABLE_DIFFERENTIAL": [
+      "GET /health", "GET /health/live", "GET /health/ready",
+      "POST /auth/request-otp/", "POST /auth/signup/", "POST /auth/login/",
+      "POST /auth/password/request-reset/", "POST /auth/password/verify-otp/", "POST /auth/password/reset/",
+      "GET /metrics", "GET /auth/access/", "POST /auth/logout/", "GET /auth/admin/users/",
+      "PATCH /auth/admin/users/", "DELETE /auth/admin/users/", "DELETE /auth/admin/users/trade-logs/",
+      "GET /auth/admin/trades/daily/", "GET /admin/egress-ips", "PUT /admin/users/{user_id}/angel-egress",
+      "GET /home/status/", "GET /account/profile", "PUT /account/trading-mode", "GET /pnl", "GET /pnl/export",
+      "GET /backtesting/runs", "GET /backtesting/runs/{run_id}/export", "GET /logs/files/", "GET /logs/content/",
+      "GET /scheduler/jobs/", "POST /scheduler/trigger/", "GET /risk/admin", "PUT /risk/admin/limits",
+      "PUT /risk/admin/limits/{user_id}", "GET /risk/admin/kill-switch", "PUT /risk/admin/kill-switch",
+      "PUT /risk/admin/kill-switch/{user_id}", "GET /strategy/futures-breakout",
+      "GET /strategies/admin/executions", "POST /strategies/admin/executions/retry"
+    ],
+    "CONTRACT_FIXTURE_PARITY": [],
+    "ENVIRONMENT_GATED": [
+      "POST /home/connect/", "PATCH /home/profile/", "PATCH /account/profile",
+      "POST /account/profile/request-otp", "POST /backtesting/run", "PUT /strategy/futures-breakout",
+      "GET /strategies", "PUT /strategies/{strategy_key}/activation"
+    ],
+    "MUTATION_GATED": [
+      "POST /admin/egress-ips", "POST /admin/egress-ips/{id}/verify", "POST /pnl/trades/{trade_id}/close"
+    ]
   },
   "websocket_evidence_default": "ENVIRONMENT_GATED",
   "http": [

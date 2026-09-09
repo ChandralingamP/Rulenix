@@ -168,7 +168,7 @@ impl CredentialStore {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "phase10-adapter"))]
     pub(crate) fn for_isolated_test(db: PgPool) -> Self {
         let material = STANDARD.encode([0_u8; 32]);
         Self {

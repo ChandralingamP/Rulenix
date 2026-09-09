@@ -1960,15 +1960,16 @@ PHASE 9 GATE: PASS — READY FOR RUST-PYTHON PARITY AND SECURITY AUDIT
 Phase 10 is frozen against Rust production SHA
 `3f788f2a842ef9b1b66366d439431867850e3753` and Python Phase 9 SHA
 `89332b5701e80237094b54f9e88d7496bd326009` on dedicated branch
-`phase10-parity-security-audit`. Rust source and production infrastructure remain
-untouched.
+`phase10-parity-security-audit`. Production Rust behavior and production infrastructure
+remain untouched; Rust additions compile only behind the Phase 10 test-adapter feature.
 
 ### 45.1 Reusable parity framework
 
 `python-backend/app/parity/` provides fixture loading, callable and JSON subprocess runtime
-adapters, structured comparisons, and path-scoped normalization. The test-only Rust adapter
-is compiled with the `phase10-adapter` feature and never initializes application state,
-PostgreSQL, credentials, HTTP, or Angel. The only normalization rules permitted by
+adapters, structured comparisons, and path-scoped normalization. The test-only Rust adapters
+are compiled with the `phase10-adapter` feature, accept only loopback `rulenix_test_*`
+PostgreSQL, start no workers, use no production credentials, and point Angel HTTP at an
+unbound loopback address. The only normalization rules permitted by
 the framework are explicit UUID/timestamp paths and explicitly unordered collections;
 prices, quantities, sides, statuses, reason codes, readiness, safety decisions and P&L
 are never normalized. The sanitized bundle is
@@ -1987,39 +1988,42 @@ does not require production credentials, a production database, or Angel mutatio
 
 ### 45.2 Audit evidence
 
-The framework and adversarial tests cover fixture comparison, status/error differences,
-fill bounds, terminal transition fences, kill-switch/revision TOCTOU checks, over-close
-protection, SL2 directionality, the exact 15:10 Asia/Kolkata SuperTrend boundary, and a
-network mutation trap. Rust↔Python SuperTrend and tick-rounding fixtures pass. Future
-Breakout executes 12 identical Rust/Python fixtures but is BLOCKED by exact f64-versus-
-Decimal price/exit serialization mismatches and one error-detail mismatch; no numeric
-normalization was applied. Static mutation scanning reports zero reachable Angel trading
-transport paths; the trap observed zero mutation requests.
+All 50 HTTP contracts now have exactly one evidence class: 39 execute against actual Rust
+Axum and Python ASGI handlers in isolated loopback runtimes, eight are environment-gated,
+three are mutation-gated, none are fixture-only, and none are unclassified. The 39 executed
+contracts cover public and authenticated requests, admin and non-admin authorization, CSRF,
+validation and error bodies, exports, and deterministic local-state changes with zero
+mismatches. Both browser WebSocket protocols and eight PostgreSQL before/after state cases
+also match exactly.
 
-Python isolated PostgreSQL regression: 108 passed, 1 Windows-only Unix-helper skip.
-Ruff, Mypy and compileall passed. The existing Rust regression remains 131 passed, 0
-failed, 31 ignored. Frontend regression remains 29 tests passed, lint passed, and build
-passed from Phase 9.
+Future Breakout passes 22/22 expanded fixtures, SuperTrend passes 6/6, and tick rounding
+passes 2/2 with no numeric normalization. The synthetic Android OCO suite passes 12/12
+against the authoritative baseline production Node classifier; no Rust classifier exists
+at the frozen baseline. EOD boundary/restart passes 4/4 cross-runtime scenarios and
+crash/restart passes 5/5, with no duplicate close, reversal, protection, or EOD action.
 
 Real PostgreSQL concurrency evidence passes for two-instance advisory leadership/failover,
 `FOR UPDATE SKIP LOCKED` claiming across four workers and 32 items, stale claim recovery,
-and existing concurrent signal/reversal/manual-close idempotency coverage. A Rust HTTP or
-browser-WebSocket server adapter and relational Rust/Python before-after adapter remain
-unavailable, so those categories stay blocked rather than being claimed as executable.
+and concurrent signal/reversal/manual-close idempotency coverage. Static mutation scanning
+reports zero reachable Angel trading transport paths and the network trap observed zero
+mutation requests.
 
-### 45.3 Scorecard and unresolved blockers
+The complete isolated regression passes with 171 Python tests and one established Windows
+Unix-helper skip; Ruff, Mypy, and compileall pass. Rust format, Clippy, and all 131 executed
+Rust tests pass (31 established database-gated tests ignored without an explicit URL).
+Frontend Vitest passes 29/29, lint and build pass, and npm audit reports zero vulnerabilities.
+Cargo audit reports no vulnerabilities and one allowed yanked-package warning. `pip-audit`
+and `bandit` are unavailable in the isolated environment and remain informational CI checks.
+
+### 45.3 Scorecard and gate
 
 Auth, RBAC, trading-domain transitions, risk gates, Kill Switch, execution intents,
-egress, reconciliation, manual-close attribution, recovery, broker request construction,
-and controlled failure behavior remain PASS based on the existing isolated tests and new
-adversarial checks. Future Breakout and the two browser WebSocket protocols now have
-executable isolated differential evidence. API remains partial because only the two safe
-liveness routes are executable without application state; OCO remains an explicit GAP
-because no authoritative classifier adapter is connected. Eight isolated PostgreSQL
-Rust/Python before-after state cases now match exactly, while PostgreSQL concurrency
-evidence remains separately PASS. These are safety-relevant audit blockers,
-not normalized away differences. The Phase 9 migration-safe 503 contracts remain approved differences:
-broker connect, backtest execution, LIVE manual close, and LIVE/ALL Clear Trades.
+egress, reconciliation, manual-close attribution, OCO classification, recovery, workers,
+concurrency, broker request construction, and controlled failure behavior are PASS. No
+Phase 10 blocker or major gap remains. The Phase 9 migration-safe 503 contracts remain
+approved differences: broker connect, backtest execution, LIVE manual close, and LIVE/ALL
+Clear Trades. The eight environment-gated and three mutation-gated HTTP contracts are
+listed with exact reasons in `PHASE10_PARITY_SECURITY_AUDIT.md`.
 
 No deployment, production database change, proxy/service change, Kill Switch change,
 permission change, networking change, or real Angel mutation occurred.
@@ -2028,13 +2032,18 @@ permission change, networking change, or real Angel mutation occurred.
 CURRENT PHASE: 10
 RUST_BASELINE_SHA: 3f788f2a842ef9b1b66366d439431867850e3753
 PYTHON_BASELINE_SHA: 89332b5701e80237094b54f9e88d7496bd326009
-HTTP CONTRACTS: 50/50 INVENTORIED; EXECUTABLE RUST HTTP: 2; CONTRACT/FIXTURE: 42; MUTATION-DISABLED: 5; ENVIRONMENT-GATED: 1
+HTTP CONTRACTS: 50/50 CLASSIFIED; EXECUTABLE: 39; FIXTURE: 0; ENVIRONMENT-GATED: 8; MUTATION-GATED: 3; UNCLASSIFIED: 0; MISMATCHES: 0
 BROWSER WEBSOCKETS DIFFERENTIAL-COVERED: 2/2 EXECUTABLE ISOLATED COMPARISONS
-DATABASE STATE PARITY: PASS — 8/8 ISOLATED POSTGRESQL BEFORE/AFTER CASES
-FUTURE BREAKOUT RUST↔PYTHON PARITY: PASS — 22/22 EXPANDED FIXTURES
-SUPER TREND RUST↔PYTHON PARITY: PASS — 6/6
-STATE MACHINE PARITY: PASS — PYTHON INVARIANT MATRIX
-RISK/SAFETY PARITY: PASS — PYTHON ADVERSARIAL MATRIX
+DATABASE STATE PARITY: PASS - 8/8 ISOLATED POSTGRESQL BEFORE/AFTER CASES
+FUTURE BREAKOUT RUST/PYTHON PARITY: PASS - 22/22 EXPANDED FIXTURES
+SUPER TREND RUST/PYTHON PARITY: PASS - 6/6
+TICK ROUNDING RUST/PYTHON PARITY: PASS - 2/2
+OCO CROSS-RUNTIME PARITY: PASS - 12/12
+EOD CONCURRENCY/REPLAY PARITY: PASS - 4/4
+CRASH/RESTART REPLAY PARITY: PASS - 5/5
+STATE MACHINE PARITY: PASS - PYTHON INVARIANT MATRIX
+RISK/SAFETY PARITY: PASS - PYTHON ADVERSARIAL MATRIX
+POSTGRESQL CONCURRENCY: PASS
 REACHABLE PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
 PYTHON ANGEL MUTATION HTTP REQUESTS: 0
 PYTHON LIVE ORDERS PLACED: 0
@@ -2042,5 +2051,5 @@ PYTHON LIVE ORDERS MODIFIED: 0
 PYTHON LIVE ORDERS CANCELLED: 0
 FAKE LIVE BROKER SUCCESSES: 0
 PRODUCTION MODIFIED: NO
-PHASE 10 GATE: BLOCKED — BROADER HTTP, OCO, EOD CONCURRENCY, AND CRASH REPLAY EVIDENCE REQUIRED
+PHASE 10 GATE: PASS — READY FOR PRODUCTION SHADOW DEPLOYMENT
 ```

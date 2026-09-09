@@ -2,7 +2,7 @@
   "rust_adapter": {
     "binary": "backend/target/debug/rulenix-backend.exe",
     "feature": "phase10-adapter",
-    "production_behavior": "unchanged; adapter initializes no app state, database, credentials, network, or Angel client"
+    "production_behavior": "unchanged; feature-only adapters use disposable loopback test state, start no workers, load no production credentials, and make no Angel request"
   },
   "strategy": {
     "future_breakout": {"executed": 22, "matched": 22, "mismatched": 0, "status": "PASS", "coverage": ["original 12", "±1 tick entries", "equality boundaries", "decimal precision", "BUY/SELL symmetry", "insufficient history"]},

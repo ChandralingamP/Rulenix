@@ -4,18 +4,40 @@
   "python_baseline_sha": "89332b5701e80237094b54f9e88d7496bd326009",
   "contracts": {"http": 50, "websockets": 2},
   "http_evidence": {
-    "default": "CONTRACT_FIXTURE_PARITY",
-    "mutation_disabled": 5,
-    "environment_gated": 1,
-    "executable_differential": 2
+    "executable_differential": 39,
+    "contract_fixture_parity": 0,
+    "environment_gated": 8,
+    "mutation_gated": 3,
+    "unclassified": 0,
+    "executable_mismatches": 0
+  },
+  "http_gated_endpoints": {
+    "environment": {
+      "POST /home/connect/": "broker session and credential exchange",
+      "PATCH /home/profile/": "credential encryption and token invalidation configuration",
+      "PATCH /account/profile": "OTP environment",
+      "POST /account/profile/request-otp": "SMTP and OTP delivery",
+      "POST /backtesting/run": "broker market-data reads",
+      "PUT /strategy/futures-breakout": "Angel contract-master catalog",
+      "GET /strategies": "Angel contract master",
+      "PUT /strategies/{strategy_key}/activation": "Angel contract-master catalog"
+    },
+    "mutation": {
+      "POST /admin/egress-ips": "privileged host-network mutation",
+      "POST /admin/egress-ips/{id}/verify": "privileged host-network verification",
+      "POST /pnl/trades/{trade_id}/close": "live broker mutation boundary"
+    }
   },
   "websocket_evidence": {"executable_differential": 2, "matched": 2, "status": "PASS"},
   "database_state_evidence": {"executed": 8, "matched": 8, "status": "PASS"},
   "differential": {
-    "future_breakout": {"executed": 22, "matched": 22, "mismatched": 0, "status": "PASS", "coverage": ["original 12", "±1 tick entries", "equality boundaries", "decimal precision", "BUY/SELL symmetry", "insufficient history"]},
+    "future_breakout": {"executed": 22, "matched": 22, "mismatched": 0, "status": "PASS", "coverage": ["original 12", "+/-1 tick entries", "equality boundaries", "decimal precision", "BUY/SELL symmetry", "insufficient history"]},
     "supertrend": {"executed": 6, "matched": 6, "mismatched": 0, "status": "PASS"},
     "tick_rounding": {"executed": 2, "matched": 2, "mismatched": 0, "status": "PASS"}
   },
+  "oco_executable_differential": {"executed": 12, "matched": 12, "mismatched": 0, "status": "PASS"},
+  "eod_replay_executable_differential": {"executed": 4, "matched": 4, "mismatched": 0, "status": "PASS"},
+  "crash_restart_executable_differential": {"executed": 5, "matched": 5, "mismatched": 0, "status": "PASS"},
   "normalization": {
     "uuid_paths": ["body.request_id", "state.id"],
     "timestamp_paths": ["body.created_at", "state.updated_at"],
@@ -23,7 +45,7 @@
     "forbidden_normalization": ["price", "quantity", "side", "status", "reason_code", "safety", "readiness", "pnl"]
   },
   "categories": {
-    "API": "GAP",
+    "API": "PASS",
     "WebSocket": "PASS",
     "Auth": "PASS",
     "RBAC": "PASS",
@@ -37,7 +59,7 @@
     "Egress": "PASS",
     "Reconciliation": "PASS",
     "Manual broker close": "PASS",
-    "OCO": "GAP",
+    "OCO": "PASS",
     "Recovery": "PASS",
     "Workers": "PASS",
     "Concurrency": "PASS",
@@ -49,10 +71,23 @@
     "network_requests": 0,
     "fake_live_successes": 0
   },
-  "blockers": [
-    "HTTP executable differential currently covers only two safe liveness routes; the remaining executable Rust HTTP runtime coverage is not connected.",
-    "OCO cross-runtime classifier vectors and complete EOD/crash replay evidence remain unconnected."
-  ],
+  "full_verification": {
+    "python": {"passed": 171, "skipped": 1, "status": "PASS"},
+    "ruff": "PASS",
+    "mypy": {"files": 71, "status": "PASS"},
+    "compileall": "PASS",
+    "rust_format": "PASS",
+    "rust_clippy": "PASS",
+    "rust_tests": {"passed": 131, "failed": 0, "ignored": 31, "status": "PASS"},
+    "frontend_tests": {"passed": 29, "status": "PASS"},
+    "frontend_lint": "PASS",
+    "frontend_build": "PASS",
+    "npm_audit": {"vulnerabilities": 0, "status": "PASS"},
+    "cargo_audit": {"vulnerabilities": 0, "allowed_yanked_warnings": 1, "status": "PASS"},
+    "pip_audit": "NOT EXECUTED - TOOL UNAVAILABLE",
+    "bandit": "NOT EXECUTED - TOOL UNAVAILABLE"
+  },
+  "blockers": [],
   "approved_differences": [
     "Phase 9 migration-safe 503 contracts: broker connect, backtest execution, LIVE manual close, LIVE/ALL Clear Trades."
   ]

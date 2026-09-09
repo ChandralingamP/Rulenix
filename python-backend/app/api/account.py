@@ -14,8 +14,20 @@ router = APIRouter(prefix="/account", tags=["account"])
 
 @router.get("/profile")
 async def profile(user: Principal = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    row = (await db.execute(text("SELECT u.id,u.username,u.email,COALESCE(p.mobile_number,'') mobile_number,COALESCE(p.brokerage_user_id,'') brokerage_user_id,COALESCE(p.trading_mode,'demo') trading_mode FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=:id"), {"id": user.id})).mappings().first()
-    return dict(row) if row else {"username": user.username, "trading_mode": user.trading_mode}
+    row = (await db.execute(text("SELECT u.username,u.email,COALESCE(p.mobile_number,'') mobile_number,COALESCE(p.brokerage_user_id,'') client_id,COALESCE(p.trading_mode,'demo') trading_mode,u.can_administer,u.can_live_trade FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=:id"), {"id": user.id})).mappings().first()
+    if not row:
+        raise DomainError(404, "User not found.")
+    return {
+        "username": row["username"],
+        "email": row["email"],
+        "mobile_number": row["mobile_number"],
+        "client_id": row["client_id"],
+        "trading_mode": row["trading_mode"],
+        "permissions": {
+            "administer_users": bool(row["can_administer"]),
+            "live_trading": bool(row["can_live_trade"]),
+        },
+    }
 
 
 @router.patch("/profile")
@@ -25,8 +37,16 @@ async def update_profile(request: Request, payload: dict, user: Principal = Depe
     username = str(payload.get("new_username", "")).strip().upper()
     mobile = str(payload.get("mobile_number", "")).strip()
     client_id = str(payload.get("client_id", "")).strip().upper()
-    if len(otp) != 6 or not otp.isdigit() or len(username) < 3 or len(username) > 64 or "@" not in email or len(mobile) != 10 or not mobile.isdigit() or not client_id:
-        raise DomainError(400, "Invalid account profile details.")
+    if len(username) < 3 or len(username) > 64 or not all(char.isalnum() or char in ".-_" for char in username):
+        raise DomainError(400, "Username must be 3 to 64 characters and use only letters, numbers, dot, dash, or underscore.")
+    if "@" not in email:
+        raise DomainError(400, "Enter a valid email address.")
+    if len(mobile) != 10 or not mobile.isdigit():
+        raise DomainError(400, "Enter a valid 10-digit mobile number.")
+    if not client_id or len(client_id) > 64:
+        raise DomainError(400, "Client ID is required.")
+    if len(otp) != 6 or not otp.isdigit():
+        raise DomainError(400, "Invalid or expired OTP.")
     current_email = await db.scalar(text("SELECT email FROM users WHERE id=:user"), {"user": user.id})
     otp_row = (await db.execute(text("SELECT id,otp_hash,expires_at FROM email_otps WHERE LOWER(email)=LOWER(:email) AND purpose='profile_update' AND is_used=FALSE AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE"), {"email": current_email})).mappings().first()
     if not otp_row or otp_row["expires_at"] <= datetime.now(UTC) or otp_digest(request.app.state.settings.otp_hash_key, current_email, "profile_update", otp) != otp_row["otp_hash"]:
@@ -49,7 +69,7 @@ async def trading_mode(payload: dict, user: Principal = Depends(current_user), d
         raise DomainError(503, "LIVE mode is disabled in the Python migration shadow.", code="python_live_mutation_disabled")
     await db.execute(text("INSERT INTO user_profiles(user_id,brokerage_user_id,api_key,trading_mode) VALUES(:user,'','',:mode) ON CONFLICT(user_id) DO UPDATE SET trading_mode='demo',updated_at=NOW()"), {"user": user.id, "mode": mode})
     await db.commit()
-    return {"detail": "Trading mode updated.", "mode": mode, "trading_mode": mode}
+    return {"detail": "Trading mode changed to demo.", "profile": await profile(user, db), "trading_mode": mode}
 
 
 @router.post("/profile/request-otp")
