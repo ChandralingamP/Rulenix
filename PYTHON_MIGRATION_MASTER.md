@@ -2117,6 +2117,24 @@ LIVE-ready; broker unreadability was not interpreted as broker-flat. The direct 
 authoritative, current, and exposure-positive, so `DEPLOYMENT_GATE=BLOCK`. No deployment action
 was taken and no broker or durable trading state was altered.
 
+### 46.4 Authoritative-read continuation blocker
+
+On 2026-09-10 Phase 11 resumed from clean evidence commit
+`6465b911e0097a8171c608248f6623b8cf44e2e3`. Rust had normally reconciled the two
+orders to `cancelled` with zero fills and their intents to `skipped`; all durable safety-view
+columns were zero. No local or broker state was changed to reach that result.
+
+The LIVE session was then fresh but unhealthy: its credential revision matched, while its token
+state was `invalid` and Rust reported that the Angel session was disconnected. The direct safety
+gate could not read current positions, order book, trade book, individual-order evidence, or
+conditional/GTT inventory for any configured account because the necessary JWT/API credentials
+were absent. Those unavailable reads are `UNKNOWN`, not zero or broker-flat.
+
+Although the operational gate's offline-local policy printed `DEPLOYMENT_GATE=PASS`, the explicit
+Phase 11 continuation gate requires successful authoritative broker reads. Consequently broker
+evidence is `NO`, Phase 11 remains blocked, and no backup, provisioning, build, network, container,
+routing, or observation action was performed.
+
 ```text
 CURRENT PHASE: 11
 PRODUCTION RUST RELEASE: 3f788f2a842ef9b1b66366d439431867850e3753
@@ -2127,8 +2145,13 @@ POSTGRESQL HEALTH: PASS
 PUBLIC READINESS: PASS
 GLOBAL KILL SWITCH: DISABLED
 OPEN LIVE TRADES: 0
-NONTERMINAL LIVE ORDERS: 2
-NONTERMINAL LIVE EXECUTION INTENTS: 2
+NONTERMINAL LIVE ORDERS: 0
+NONTERMINAL LIVE EXECUTION INTENTS: 0
+BROKER OPEN POSITIONS: UNKNOWN - READ UNAVAILABLE
+BROKER NONTERMINAL ORDERS: UNKNOWN - READ UNAVAILABLE
+UNKNOWN BROKER ORDERS: UNKNOWN - ORDER BOOK UNAVAILABLE
+ACTIVE CONDITIONAL RULES: UNKNOWN - GTT READ UNAVAILABLE
+BROKER EVIDENCE AUTHORITATIVE: NO
 PYTHON LIVE ORDERS PLACED: 0
 PYTHON LIVE ORDERS MODIFIED: 0
 PYTHON LIVE ORDERS CANCELLED: 0
@@ -2139,5 +2162,5 @@ PYTHON ANGEL MUTATION HTTP REQUESTS: 0
 FAKE LIVE BROKER SUCCESSES: 0
 RUST REMAINS AUTHORITATIVE: YES
 FRONTEND STILL ROUTED TO RUST: YES
-PHASE 11 GATE: BLOCKED - ACTIVE LIVE TRIGGER-PENDING ENTRY ORDERS
+PHASE 11 GATE: BLOCKED - AUTHORITATIVE BROKER READS UNAVAILABLE
 ```

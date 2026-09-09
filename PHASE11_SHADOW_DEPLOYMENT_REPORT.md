@@ -1,5 +1,51 @@
 # Phase 11 production shadow deployment report
 
+## Continuation safety recheck — 2026-09-10 00:31 IST
+
+Phase 11 resumed from evidence commit
+`6465b911e0097a8171c608248f6623b8cf44e2e3`. The worktree was clean and the existing
+preparation was not rebuilt. Production remained on Rust release
+`3f788f2a842ef9b1b66366d439431867850e3753`, and all five deployed safety-gate files remained
+SHA-256 identical to the reviewed baseline.
+
+The fresh durable snapshot at 2026-09-09 19:00 UTC showed that normal Rust reconciliation had
+made both former entry orders terminal. The BUY and SELL orders are `cancelled`, filled and
+processed quantities are zero, and their intents are `skipped`. Every column in the durable
+deployment-safety view is now zero. No record was changed to obtain this result.
+
+```text
+OPEN LIVE TRADES: 0
+UNRESOLVED LIVE ORDERS: 0
+UNRESOLVED EXECUTION INTENTS: 0
+REVERSAL BLOCKERS: 0
+MANUAL CLOSE BLOCKERS: 0
+PROTECTION BLOCKERS: 0
+OTHER DURABLE BLOCKERS: 0
+BROKER OPEN POSITIONS: UNKNOWN - READ UNAVAILABLE
+BROKER NONTERMINAL ORDERS: UNKNOWN - READ UNAVAILABLE
+UNKNOWN BROKER ORDERS: UNKNOWN - ORDER BOOK UNAVAILABLE
+ACTIVE CONDITIONAL RULES: UNKNOWN - GTT READ UNAVAILABLE
+DEPLOYMENT-SAFETY BLOCKERS: 0 IN DURABLE VIEW; BROKER EVIDENCE GATE UNSAFE
+BROKER EVIDENCE AUTHORITATIVE: NO
+```
+
+The LIVE account's credential revision matches, but its broker token state is `invalid` and its
+fresh reconciliation health is false: `Angel session is disconnected; LIVE entries remain
+blocked.` The refresh token is invalid or expired. The direct gate could not obtain position,
+order-book, trade-book, individual-order, or conditional/GTT evidence for that account. The other
+configured accounts were also unreadable because JWT/API credentials were absent.
+
+The gate runner's operational policy labels locally flat disconnected accounts
+`offline_locally_flat` and printed `DEPLOYMENT_GATE=PASS`. That result is not accepted for this
+continuation because the explicit Phase 11 rule is stronger: failed or absent broker reads are
+never broker-flat, unknown is never safe, and authoritative broker evidence must be `YES` before
+deployment. Its aggregate broker zeros therefore represent no readable rows, not observed flat
+broker state.
+
+Phase 11 stopped before backup, role/schema provisioning, build, transfer, network creation,
+container startup, routing, or observation. No order, intent, Kill Switch, credential, session,
+or reconciliation record was modified.
+
 ## Continuation safety recheck — 2026-09-09 18:23 UTC
 
 Phase 11 resumed from preparation commit
