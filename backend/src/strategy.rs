@@ -29,7 +29,10 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
 };
 use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
@@ -5710,7 +5713,25 @@ fn retry_alert_severity(message: &str) -> &'static str {
     }
 }
 
+struct BackgroundLease(Arc<AtomicBool>);
+
+impl BackgroundLease {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for BackgroundLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub fn start(state: AppState) {
+    let heartbeat = Arc::new(AtomicI64::new(Utc::now().timestamp()));
+    let scheduler_heartbeat = heartbeat;
     tokio::spawn(async move {
         let _leader_connection = loop {
             match state.db.acquire().await {
@@ -5750,6 +5771,35 @@ pub fn start(state: AppState) {
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         };
+        scheduler_heartbeat.store(Utc::now().timestamp(), Ordering::Release);
+        let watchdog_heartbeat = scheduler_heartbeat.clone();
+        let watchdog_state = state.clone();
+        tokio::spawn(async move {
+            let mut timer = interval(std::time::Duration::from_secs(60));
+            let mut alerted = false;
+            loop {
+                timer.tick().await;
+                let age = Utc::now()
+                    .timestamp()
+                    .saturating_sub(watchdog_heartbeat.load(Ordering::Acquire));
+                if age > 60 && !alerted {
+                    alerted = true;
+                    tracing::error!(age_seconds = age, "strategy scheduler heartbeat is stale");
+                    operational_alert_for(
+                        &watchdog_state,
+                        STRATEGY_KEY,
+                        None,
+                        "",
+                        "strategy_scheduler_stalled",
+                        "critical",
+                        &format!("Strategy scheduler has not advanced for {age} seconds."),
+                    )
+                    .await;
+                } else if age <= 60 {
+                    alerted = false;
+                }
+            }
+        });
         if let Err(error) = sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW(),last_error='Backend restarted while this action was running',updated_at=NOW() WHERE status='running'")
             .execute(&state.db).await {
             tracing::warn!(%error, "could not recover interrupted scheduler runs");
@@ -5791,8 +5841,10 @@ pub fn start(state: AppState) {
         let mut timer = interval(std::time::Duration::from_secs(5));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut dispatched = HashSet::new();
+        let reconciliation_running = Arc::new(AtomicBool::new(false));
         loop {
             timer.tick().await;
+            scheduler_heartbeat.store(Utc::now().timestamp(), Ordering::Release);
             let now = ist_now();
             let date = now.date_naive();
             dispatched.retain(|key: &String| key.starts_with(&date.to_string()));
@@ -5913,24 +5965,45 @@ pub fn start(state: AppState) {
                     {
                         let cloned = state.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = create_snapshot(&cloned, instrument, date).await {
-                                record_snapshot_failure(
-                                    &cloned,
-                                    instrument,
-                                    date,
-                                    &error.to_string(),
-                                )
-                                .await;
-                                tracing::warn!(%instrument, %error, "daily market snapshot failed");
-                                operational_alert(
-                                    &cloned,
-                                    None,
-                                    instrument,
-                                    "snapshot_refresh_failed",
-                                    "error",
-                                    "Market data is temporarily unavailable. No trades will be placed until it recovers",
-                                )
-                                .await;
+                            match create_snapshot(&cloned, instrument, date).await {
+                                Ok(snapshot) if snapshot.status != "ready" => {
+                                    let reason = snapshot
+                                        .error
+                                        .as_deref()
+                                        .unwrap_or("Daily market levels are not ready.");
+                                    tracing::warn!(%instrument, %reason, "daily market snapshot remains missing");
+                                    operational_alert(
+                                        &cloned,
+                                        None,
+                                        instrument,
+                                        "futures_snapshot_missing",
+                                        "error",
+                                        &format!(
+                                            "Futures snapshot is still missing after the preparation window opened: {reason}"
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    record_snapshot_failure(
+                                        &cloned,
+                                        instrument,
+                                        date,
+                                        &error.to_string(),
+                                    )
+                                    .await;
+                                    tracing::warn!(%instrument, %error, "daily market snapshot failed");
+                                    operational_alert(
+                                        &cloned,
+                                        None,
+                                        instrument,
+                                        "snapshot_refresh_failed",
+                                        "error",
+                                        "Market data is temporarily unavailable. No trades will be placed until it recovers",
+                                    )
+                                    .await;
+                                }
                             }
                         });
                     }
@@ -5998,8 +6071,14 @@ pub fn start(state: AppState) {
             if let Err(error) = recover_unprotected_trades(&state).await {
                 tracing::warn!(%error, "trade protection recovery failed");
             }
-            if let Err(error) = reconcile_live(&state).await {
-                tracing::warn!(%error,"strategy order reconciliation failed");
+            if let Some(lease) = BackgroundLease::try_acquire(&reconciliation_running) {
+                let cloned = state.clone();
+                tokio::spawn(async move {
+                    let _lease = lease;
+                    if let Err(error) = reconcile_live(&cloned).await {
+                        tracing::warn!(%error,"strategy order reconciliation failed");
+                    }
+                });
             }
             if let Err(error) = recover_sl2_reversal_intents(&state).await {
                 tracing::warn!(%error, "SL2 reversal recovery failed");
@@ -6687,6 +6766,13 @@ fn position_mismatch_type(broker_quantity: i32, local_quantity: i32) -> Option<&
     }
 }
 
+fn is_aggregate_position_mismatch(incident_type: &str) -> bool {
+    matches!(
+        incident_type,
+        "LOCAL_POSITION_BROKER_FLAT" | "QUANTITY_OR_DIRECTION_MISMATCH" | "AVERAGE_ENTRY_MISMATCH"
+    )
+}
+
 fn parse_broker_positions(value: &Value) -> Vec<BrokerNetPosition> {
     value
         .as_array()
@@ -6766,6 +6852,11 @@ async fn record_position_incident(
     } else {
         "strategy_related"
     };
+    if is_aggregate_position_mismatch(incident_type) {
+        sqlx::query("UPDATE broker_position_incidents SET status='resolved',resolved_at=NOW(),last_detected_at=NOW() WHERE user_id=$1 AND exchange_segment=$2 AND contract_token=$3 AND incident_type IN ('LOCAL_POSITION_BROKER_FLAT','QUANTITY_OR_DIRECTION_MISMATCH','AVERAGE_ENTRY_MISMATCH') AND incident_type<>$4 AND status IN ('open','operator_required')")
+            .bind(user_id).bind(exchange).bind(token).bind(incident_type)
+            .execute(&state.db).await?;
+    }
     sqlx::query("INSERT INTO broker_position_incidents(id,user_id,strategy_key,instrument,exchange_segment,contract_token,contract_symbol,incident_type,status,broker_quantity,local_quantity,broker_average_price,trade_id,detail,product_type,ownership_status,raw_broker_position) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(user_id,exchange_segment,contract_token,incident_type) DO UPDATE SET status=EXCLUDED.status,resolved_at=NULL,broker_quantity=EXCLUDED.broker_quantity,local_quantity=EXCLUDED.local_quantity,broker_average_price=EXCLUDED.broker_average_price,trade_id=EXCLUDED.trade_id,detail=EXCLUDED.detail,product_type=EXCLUDED.product_type,ownership_status=EXCLUDED.ownership_status,raw_broker_position=EXCLUDED.raw_broker_position,last_detected_at=NOW()")
         .bind(Uuid::new_v4()).bind(user_id).bind(strategy_key).bind(instrument).bind(exchange).bind(token).bind(symbol).bind(incident_type).bind(status).bind(broker_quantity).bind(local_quantity).bind(broker_average_price).bind(trade_id).bind(detail).bind(product).bind(ownership_status).bind(raw_broker_position.cloned().unwrap_or_else(|| json!({}))).execute(&state.db).await?;
     if let Some(trade_id) = trade_id {
@@ -12783,6 +12874,25 @@ mod tests {
         assert_eq!(reconciled_state("complete", 2), "filled");
         assert_eq!(reconciled_state("rejected", 0), "rejected");
         assert_eq!(reconciled_state("canceled", 1), "cancelled");
+    }
+
+    #[test]
+    fn aggregate_position_mismatch_types_supersede_each_other() {
+        assert!(is_aggregate_position_mismatch("LOCAL_POSITION_BROKER_FLAT"));
+        assert!(is_aggregate_position_mismatch(
+            "QUANTITY_OR_DIRECTION_MISMATCH"
+        ));
+        assert!(is_aggregate_position_mismatch("AVERAGE_ENTRY_MISMATCH"));
+        assert!(!is_aggregate_position_mismatch("ORPHAN_POSITION"));
+    }
+
+    #[test]
+    fn background_lease_prevents_overlapping_reconciliation_and_releases_on_drop() {
+        let active = Arc::new(AtomicBool::new(false));
+        let lease = BackgroundLease::try_acquire(&active).expect("first lease must be acquired");
+        assert!(BackgroundLease::try_acquire(&active).is_none());
+        drop(lease);
+        assert!(BackgroundLease::try_acquire(&active).is_some());
     }
 
     #[test]
