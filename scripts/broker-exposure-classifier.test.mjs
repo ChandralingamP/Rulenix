@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyBrokerOrder, conditionalRuleIsActive } from "./broker-exposure-classifier.mjs";
+import {
+  classifyBrokerOrder,
+  classifyOrderOwnership,
+  classifyPositionOwnership,
+  conditionalRuleIsActive,
+  ownership,
+} from "./broker-exposure-classifier.mjs";
 
 const synthetic = {
   status: "", orderstatus: "", orderid: "", exchangeorderid: "", parentorderid: "",
@@ -43,4 +49,33 @@ test("only fully proven non-executable synthetic records are exempt", () => {
     ...syntheticContext,
     orders: [synthetic, { tradingsymbol: synthetic.tradingsymbol, status: "open", orderid: "1" }],
   }), "unknown");
+});
+
+const completeOrder = {
+  status: "open", orderid: "BROKER-1", exchange: "NFO", symboltoken: "123",
+  tradingsymbol: "NIFTY26SEP", transactiontype: "BUY", quantity: "50", ordertag: "",
+};
+
+test("durable ID or tag proves Rulenix ownership", () => {
+  assert.equal(classifyOrderOwnership(completeOrder, [{ broker_order_id: "BROKER-1" }]).ownership, ownership.rulenix);
+  assert.equal(classifyOrderOwnership({ ...completeOrder, orderid: "OTHER", ordertag: "RX0123456789ABCDEF01" },
+    [{ client_order_id: "RX0123456789ABCDEF01" }]).ownership, ownership.rulenix);
+});
+
+test("complete unmatched broker order is manual but orphan RX tag is ambiguous", () => {
+  assert.equal(classifyOrderOwnership(completeOrder, []).ownership, ownership.manual);
+  assert.equal(classifyOrderOwnership({ ...completeOrder, ordertag: "RX0123456789ABCDEF01" }, []).ownership,
+    ownership.ambiguous);
+  assert.equal(classifyOrderOwnership({ ...completeOrder, symboltoken: "" }, []).ownership, ownership.ambiguous);
+});
+
+test("position requires exclusive fill attribution", () => {
+  const position = { exchange: "NFO", symboltoken: "123", tradingsymbol: "NIFTY26SEP", netqty: "50" };
+  const trade = { ...completeOrder, status: "complete", fillsize: "50" };
+  assert.equal(classifyPositionOwnership(position, { orders: [completeOrder], trades: [trade] }).ownership,
+    ownership.manual);
+  assert.equal(classifyPositionOwnership(position, {
+    orders: [completeOrder], trades: [trade], knownOrders: [{ broker_order_id: "BROKER-1" }],
+  }).ownership, ownership.rulenix);
+  assert.equal(classifyPositionOwnership(position, { orders: [], trades: [] }).ownership, ownership.ambiguous);
 });

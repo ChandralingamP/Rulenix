@@ -3,6 +3,9 @@
 CREATE TEMP TABLE deployment_safety_inventory (
     user_id UUID PRIMARY KEY,
     username TEXT NOT NULL,
+    is_active BOOLEAN NOT NULL,
+    can_live_trade BOOLEAN NOT NULL,
+    trading_mode TEXT NOT NULL,
     open_live_trades BIGINT NOT NULL,
     unresolved_closed_live_trades BIGINT NOT NULL,
     unresolved_live_orders BIGINT NOT NULL,
@@ -18,7 +21,7 @@ BEGIN
     IF to_regclass('public.broker_deployment_account_safety') IS NOT NULL THEN
         EXECUTE $sql$
             INSERT INTO deployment_safety_inventory
-            SELECT user_id, username, open_live_trades,
+            SELECT user_id, username, is_active, can_live_trade, trading_mode, open_live_trades,
                    unresolved_closed_live_trades, unresolved_live_orders,
                    unresolved_live_execution_intents, unresolved_live_reversals,
                    unresolved_live_manual_closes, unresolved_broker_incidents,
@@ -29,6 +32,9 @@ BEGIN
         INSERT INTO deployment_safety_inventory
         SELECT u.id,
                u.username,
+               u.is_active,
+               u.can_live_trade,
+               COALESCE(p.trading_mode,'demo'),
                (SELECT COUNT(*) FROM trades t
                  WHERE t.user_id=u.id AND t.execution_mode='live' AND t.status='open'),
                (SELECT COUNT(*) FROM trades t
@@ -61,6 +67,9 @@ $inventory$;
 SELECT COALESCE(json_agg(json_build_object(
     'user_id', account.user_id::TEXT,
     'username', account.username,
+    'is_active', account.is_active,
+    'can_live_trade', account.can_live_trade,
+    'trading_mode', account.trading_mode,
     'local', json_build_object(
         'open_live_trades', account.open_live_trades,
         'unresolved_closed_live_trades', account.unresolved_closed_live_trades,
@@ -71,6 +80,8 @@ SELECT COALESCE(json_agg(json_build_object(
         'unresolved_broker_incidents', account.unresolved_broker_incidents
         ,'unresolved_broker_mutations', account.unresolved_broker_mutations
     ),
+    'known_orders', COALESCE(orders.values, '[]'::JSON),
+    'open_local_positions', COALESCE(positions.values, '[]'::JSON),
     'secrets', COALESCE(secrets.values, '{}'::JSON),
     'egress_ip', egress.ip_address,
     'egress_configuration_status', egress.configuration_status,
@@ -86,6 +97,32 @@ LEFT JOIN LATERAL (
     FROM broker_secrets s
     WHERE s.user_id=account.user_id AND s.secret_kind IN ('api_key','jwt_token')
 ) secrets ON TRUE
+LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object(
+        'broker_order_id', o.broker_order_id,
+        'client_order_id', o.client_order_id,
+        'exchange_segment', o.exchange_segment,
+        'contract_token', s.contract_token,
+        'status', o.status
+    )) AS values
+    FROM strategy_orders o
+    LEFT JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+    WHERE o.user_id=account.user_id AND o.execution_mode='live'
+      AND (o.broker_order_id<>'' OR o.client_order_id<>'')
+) orders ON TRUE
+LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object(
+        'exchange_segment', UPPER(s.exchange_segment),
+        'contract_token', s.contract_token,
+        'contract_symbol', COALESCE(t.contract_symbol,''),
+        'direction', t.direction,
+        'quantity', t.quantity
+    )) AS values
+    FROM trades t
+    JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+    WHERE t.user_id=account.user_id AND t.execution_mode='live'
+      AND t.status='open' AND s.contract_token IS NOT NULL
+) positions ON TRUE
 LEFT JOIN LATERAL (
     SELECT host(e.ip_address) AS ip_address,
            e.configuration_status,

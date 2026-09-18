@@ -15,19 +15,29 @@ export function localUnresolvedTotal(local = {}) {
 
 export function deploymentAccountDecision({
   brokerReadable,
-  brokerSafe = false,
+  brokerSafe,
   brokerExposureObserved = false,
+  requiresAuthoritativeBroker = false,
+  rulenixOwnedExposure = 0,
+  ambiguousExposure = 0,
   local = {},
 }) {
   const localUnresolved = localUnresolvedTotal(local);
   if (brokerReadable) {
-    const allow = brokerSafe && localUnresolved === 0;
+    const owned = Math.max(0, Number(rulenixOwnedExposure) || 0);
+    const ambiguous = Math.max(0, Number(ambiguousExposure) || 0);
+    // brokerSafe is retained only for compatibility with older callers/tests.
+    // New callers must supply explicit ownership counts.
+    const legacyUnsafe = brokerSafe === false
+      && rulenixOwnedExposure === 0 && ambiguousExposure === 0;
+    const allow = !legacyUnsafe && owned === 0 && ambiguous === 0 && localUnresolved === 0;
     return {
       allow,
       liveReady: allow,
-      classification: !brokerSafe
-        ? "readable_broker_exposure"
-        : localUnresolved > 0 ? "readable_local_unresolved_live_state" : "readable_safe",
+      classification: owned > 0 ? "readable_rulenix_owned_exposure"
+        : ambiguous > 0 ? "readable_ambiguous_exposure"
+          : legacyUnsafe ? "readable_unclassified_broker_exposure"
+            : localUnresolved > 0 ? "readable_local_unresolved_live_state" : "readable_safe",
       localUnresolved,
     };
   }
@@ -36,6 +46,14 @@ export function deploymentAccountDecision({
       allow: false,
       liveReady: false,
       classification: "unreadable_broker_exposure_observed",
+      localUnresolved,
+    };
+  }
+  if (requiresAuthoritativeBroker) {
+    return {
+      allow: false,
+      liveReady: false,
+      classification: "unreadable_live_capable_account",
       localUnresolved,
     };
   }

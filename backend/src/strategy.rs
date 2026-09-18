@@ -6750,6 +6750,7 @@ struct BrokerNetPosition {
 #[derive(Debug, Clone, PartialEq)]
 struct BrokerTradeFill {
     order_id: String,
+    order_tag: String,
     exchange: String,
     token: String,
     symbol: String,
@@ -6757,6 +6758,138 @@ struct BrokerTradeFill {
     quantity: i32,
     price: f64,
     filled_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerExposureOwnership {
+    RulenixOwned,
+    ManualExternal,
+    Ambiguous,
+}
+
+impl BrokerExposureOwnership {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RulenixOwned => "rulenix_owned",
+            Self::ManualExternal => "manual_external",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+fn is_rulenix_order_tag(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with("RX")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn broker_order_ownership(
+    item: &Value,
+    known_broker_ids: &HashSet<String>,
+    known_client_ids: &HashSet<String>,
+) -> BrokerExposureOwnership {
+    let broker_id = broker_text(item, &["orderid", "orderId"])
+        .unwrap_or("")
+        .trim();
+    let client_id = broker_text(item, &["ordertag", "orderTag"])
+        .unwrap_or("")
+        .trim();
+    if (!broker_id.is_empty() && known_broker_ids.contains(broker_id))
+        || (!client_id.is_empty() && known_client_ids.contains(client_id))
+    {
+        return BrokerExposureOwnership::RulenixOwned;
+    }
+    if is_rulenix_order_tag(&client_id.to_uppercase()) {
+        return BrokerExposureOwnership::Ambiguous;
+    }
+    let exchange = broker_text(item, &["exchange"]).unwrap_or("").trim();
+    let token = broker_text(item, &["symboltoken", "symbolToken"])
+        .unwrap_or("")
+        .trim();
+    let side = broker_text(item, &["transactiontype", "transactionType", "side"])
+        .unwrap_or("")
+        .trim()
+        .to_uppercase();
+    let quantity = broker_i32(
+        item,
+        &[
+            "quantity",
+            "fillsize",
+            "fillSize",
+            "filledshares",
+            "filledShares",
+        ],
+    );
+    if !broker_id.is_empty()
+        && !exchange.is_empty()
+        && !token.is_empty()
+        && matches!(side.as_str(), "BUY" | "SELL")
+        && quantity.is_some_and(|value| value > 0)
+    {
+        BrokerExposureOwnership::ManualExternal
+    } else {
+        BrokerExposureOwnership::Ambiguous
+    }
+}
+
+fn position_fill_ownership(
+    position: &BrokerNetPosition,
+    fills: &[BrokerTradeFill],
+    order_book: &[Value],
+    known_broker_ids: &HashSet<String>,
+    known_client_ids: &HashSet<String>,
+) -> BrokerExposureOwnership {
+    let broker_orders: HashMap<&str, &Value> = order_book
+        .iter()
+        .filter_map(|item| {
+            broker_text(item, &["orderid", "orderId"])
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value.trim(), item))
+        })
+        .collect();
+    let mut totals = [0_i64; 3];
+    let mut matched = 0_i64;
+    for fill in fills
+        .iter()
+        .filter(|fill| fill.exchange == position.exchange && fill.token == position.token)
+    {
+        let ownership = broker_orders.get(fill.order_id.as_str()).map_or_else(
+            || {
+                if known_broker_ids.contains(&fill.order_id)
+                    || (!fill.order_tag.is_empty() && known_client_ids.contains(&fill.order_tag))
+                {
+                    BrokerExposureOwnership::RulenixOwned
+                } else if is_rulenix_order_tag(&fill.order_tag.to_uppercase()) {
+                    BrokerExposureOwnership::Ambiguous
+                } else if !fill.order_id.is_empty() {
+                    BrokerExposureOwnership::ManualExternal
+                } else {
+                    BrokerExposureOwnership::Ambiguous
+                }
+            },
+            |item| broker_order_ownership(item, known_broker_ids, known_client_ids),
+        );
+        let signed = if fill.side == "BUY" {
+            i64::from(fill.quantity)
+        } else {
+            -i64::from(fill.quantity)
+        };
+        let index = match ownership {
+            BrokerExposureOwnership::RulenixOwned => 0,
+            BrokerExposureOwnership::ManualExternal => 1,
+            BrokerExposureOwnership::Ambiguous => 2,
+        };
+        totals[index] += signed;
+        matched += 1;
+    }
+    let broker_net = i64::from(position.net_quantity);
+    if matched > 0 && totals[0] == broker_net && totals[1] == 0 && totals[2] == 0 {
+        BrokerExposureOwnership::RulenixOwned
+    } else if matched > 0 && totals[1] == broker_net && totals[0] == 0 && totals[2] == 0 {
+        BrokerExposureOwnership::ManualExternal
+    } else {
+        BrokerExposureOwnership::Ambiguous
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6863,6 +6996,10 @@ fn parse_broker_trade_fills(value: &Value) -> AppResult<Vec<BrokerTradeFill>> {
                             "Angel One returned a trade-book fill without an order ID.".into(),
                         )
                     })?
+                    .trim()
+                    .to_owned(),
+                order_tag: broker_text(item, &["ordertag", "orderTag"])
+                    .unwrap_or("")
                     .trim()
                     .to_owned(),
                 exchange: broker_text(item, &["exchange"])
@@ -7072,7 +7209,7 @@ async fn record_position_incident(
         incident_type,
         "ORPHAN_POSITION" | "UNMAPPED_BROKER_POSITION"
     ) {
-        "detected_unattributed"
+        "ambiguous"
     } else {
         "strategy_related"
     };
@@ -7309,9 +7446,31 @@ async fn reconcile_broker_positions(
     broker_credential_revision: i64,
     value: &Value,
     trade_book: Option<&Value>,
+    order_book: &Value,
 ) -> AppResult<()> {
     let broker_positions = parse_authoritative_broker_positions(value)?;
     let broker_trade_fills = trade_book.map(parse_broker_trade_fills).transpose()?;
+    let broker_orders = broker_book_items(order_book, "order-book")?;
+    let known_orders: Vec<(String, String)> = sqlx::query_as(
+        "SELECT broker_order_id,client_order_id FROM strategy_orders
+         WHERE user_id=$1 AND execution_mode='live'
+           AND (broker_order_id<>'' OR client_order_id<>'')",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let known_broker_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(broker_id, _)| broker_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let known_client_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(_, client_id)| client_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
     let broker_by_key: HashMap<(String, String), BrokerNetPosition> = broker_positions
         .into_iter()
         .map(|position| {
@@ -7614,6 +7773,18 @@ async fn reconcile_broker_positions(
         if broker.net_quantity == 0 || local_keys.contains(&(exchange.clone(), token.clone())) {
             continue;
         }
+        let exposure_ownership = position_fill_ownership(
+            &broker,
+            broker_trade_fills.as_deref().unwrap_or_default(),
+            broker_orders,
+            &known_broker_ids,
+            &known_client_ids,
+        );
+        if exposure_ownership == BrokerExposureOwnership::ManualExternal {
+            sqlx::query("UPDATE broker_position_incidents SET status='resolved',ownership_status='manual_external',resolved_at=NOW(),last_detected_at=NOW() WHERE user_id=$1 AND exchange_segment=$2 AND contract_token=$3 AND incident_type IN ('ORPHAN_POSITION','UNMAPPED_BROKER_POSITION') AND status IN ('open','operator_required')")
+                .bind(user_id).bind(&exchange).bind(&token).execute(&state.db).await?;
+            continue;
+        }
         let broker_exposure_lock = format!("broker-exposure:{user_id}:{exchange}:{token}");
         let mut broker_exposure_guard = state.db.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
@@ -7642,7 +7813,10 @@ async fn reconcile_broker_positions(
             continue;
         }
         type OverCloseSourceRow = (Uuid, String, String, Uuid, i32, String, Option<i32>);
-        let over_close_source: Option<OverCloseSourceRow> = sqlx::query_as(
+        let over_close_source: Option<OverCloseSourceRow> = if exposure_ownership
+            == BrokerExposureOwnership::RulenixOwned
+        {
+            sqlx::query_as(
             "SELECT t.id,t.strategy_key,t.instrument_label,t.strategy_snapshot_id,t.quantity,COALESCE(t.contract_symbol,''),s.lot_size
              FROM trades t
              JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
@@ -7656,7 +7830,10 @@ async fn reconcile_broker_positions(
         .bind(&exchange)
         .bind(&token)
         .fetch_optional(&state.db)
-        .await?;
+        .await?
+        } else {
+            None
+        };
         if let Some((
             source_trade_id,
             strategy_key,
@@ -7951,6 +8128,234 @@ fn conditional_rule_is_active(rule: &Value) -> bool {
         status.as_str(),
         "CANCELLED" | "CANCELED" | "REJECTED" | "EXPIRED" | "COMPLETED" | "COMPLETE"
     )
+}
+
+type ExposureObservation = (
+    String,
+    String,
+    BrokerExposureOwnership,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    String,
+);
+
+async fn replace_broker_exposure_observations(
+    state: &AppState,
+    user_id: Uuid,
+    broker_credential_revision: i64,
+    positions: &[BrokerNetPosition],
+    order_book: &Value,
+    trade_book: &Value,
+    conditional_rules: &[Value],
+) -> AppResult<(i64, i64, i64)> {
+    let orders = broker_book_items(order_book, "order-book")?;
+    let fills = parse_broker_trade_fills(trade_book)?;
+    let known_orders: Vec<(String, String)> = sqlx::query_as(
+        "SELECT broker_order_id,client_order_id FROM strategy_orders
+         WHERE user_id=$1 AND execution_mode='live'
+           AND (broker_order_id<>'' OR client_order_id<>'')",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let known_broker_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(broker_id, _)| broker_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let known_client_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(_, client_id)| client_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let local_contracts: HashSet<(String, String)> = sqlx::query_as(
+        "SELECT UPPER(s.exchange_segment),s.contract_token
+         FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
+           AND s.contract_token IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let mut observations: Vec<ExposureObservation> = Vec::new();
+    for position in positions
+        .iter()
+        .filter(|position| position.net_quantity != 0)
+    {
+        let ownership =
+            if local_contracts.contains(&(position.exchange.clone(), position.token.clone())) {
+                BrokerExposureOwnership::RulenixOwned
+            } else {
+                position_fill_ownership(
+                    position,
+                    &fills,
+                    orders,
+                    &known_broker_ids,
+                    &known_client_ids,
+                )
+            };
+        observations.push((
+            "position".into(),
+            format!("{}:{}", position.exchange, position.token),
+            ownership,
+            position.exchange.clone(),
+            position.token.clone(),
+            position.symbol.clone(),
+            if position.net_quantity > 0 {
+                "BUY"
+            } else {
+                "SELL"
+            }
+            .into(),
+            position.net_quantity,
+            match ownership {
+                BrokerExposureOwnership::RulenixOwned => {
+                    "open local trade or exclusively Rulenix-attributable fills"
+                }
+                BrokerExposureOwnership::ManualExternal => {
+                    "net position exclusively matches complete external broker fills"
+                }
+                BrokerExposureOwnership::Ambiguous => {
+                    "position fill ownership is incomplete or mixed"
+                }
+            }
+            .into(),
+        ));
+    }
+    for (index, item) in orders.iter().enumerate() {
+        let status = broker_text(item, &["status", "orderstatus", "orderStatus"])
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if broker_order_is_terminal(&status) {
+            continue;
+        }
+        let mut ownership = broker_order_ownership(item, &known_broker_ids, &known_client_ids);
+        if status.is_empty() {
+            ownership = BrokerExposureOwnership::Ambiguous;
+        }
+        let broker_id = broker_text(item, &["orderid", "orderId"])
+            .unwrap_or("")
+            .trim();
+        let client_id = broker_text(item, &["ordertag", "orderTag"])
+            .unwrap_or("")
+            .trim();
+        observations.push((
+            "order".into(),
+            if !broker_id.is_empty() {
+                broker_id.into()
+            } else if !client_id.is_empty() {
+                client_id.into()
+            } else {
+                format!("unknown:{index}")
+            },
+            ownership,
+            broker_text(item, &["exchange"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            broker_text(item, &["symboltoken", "symbolToken"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(item, &["tradingsymbol", "tradingSymbol"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(item, &["transactiontype", "transactionType", "side"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            broker_i32(item, &["quantity"]).unwrap_or(0),
+            match ownership {
+                BrokerExposureOwnership::RulenixOwned => {
+                    "durable local broker order ID or client tag"
+                }
+                BrokerExposureOwnership::ManualExternal => {
+                    "complete unmatched broker order without a Rulenix tag"
+                }
+                BrokerExposureOwnership::Ambiguous => {
+                    "unmatched Rulenix tag or incomplete broker order"
+                }
+            }
+            .into(),
+        ));
+    }
+    for (index, rule) in conditional_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| conditional_rule_is_active(rule))
+    {
+        let reference = broker_text(rule, &["id", "ruleid", "ruleId", "uniqueid", "uniqueId"])
+            .unwrap_or("")
+            .trim();
+        let exchange = broker_text(rule, &["exchange"])
+            .unwrap_or("")
+            .trim()
+            .to_uppercase();
+        let token = broker_text(rule, &["symboltoken", "symbolToken"])
+            .unwrap_or("")
+            .trim();
+        let quantity = broker_i32(rule, &["qty", "quantity"]).unwrap_or(0);
+        let ownership =
+            if !reference.is_empty() && !exchange.is_empty() && !token.is_empty() && quantity > 0 {
+                BrokerExposureOwnership::ManualExternal
+            } else {
+                BrokerExposureOwnership::Ambiguous
+            };
+        observations.push((
+            "conditional".into(),
+            if reference.is_empty() {
+                format!("unknown:{index}")
+            } else {
+                reference.into()
+            },
+            ownership,
+            exchange,
+            token.into(),
+            broker_text(rule, &["tradingsymbol", "tradingSymbol"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(rule, &["transactiontype", "transactionType", "side"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            quantity,
+            if ownership == BrokerExposureOwnership::ManualExternal {
+                "complete external conditional rule"
+            } else {
+                "incomplete conditional rule"
+            }
+            .into(),
+        ));
+    }
+    let counts = observations
+        .iter()
+        .fold((0_i64, 0_i64, 0_i64), |mut counts, row| {
+            match row.2 {
+                BrokerExposureOwnership::RulenixOwned => counts.0 += 1,
+                BrokerExposureOwnership::ManualExternal => counts.1 += 1,
+                BrokerExposureOwnership::Ambiguous => counts.2 += 1,
+            }
+            counts
+        });
+    let mut transaction = state.db.begin().await?;
+    sqlx::query("DELETE FROM broker_exposure_observations WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
+    for row in observations {
+        sqlx::query("INSERT INTO broker_exposure_observations(user_id,exposure_kind,broker_reference,ownership_status,exchange_segment,contract_token,contract_symbol,side,quantity,evidence,broker_credential_revision,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())")
+            .bind(user_id).bind(row.0).bind(row.1).bind(row.2.as_str()).bind(row.3).bind(row.4).bind(row.5).bind(row.6).bind(row.7).bind(row.8).bind(broker_credential_revision).execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
+    Ok(counts)
 }
 
 async fn live_clear_rejection(state: &AppState, user_id: Uuid, detail: String) -> AppError {
@@ -8478,6 +8883,7 @@ async fn reconcile_live_user_with_scope(
         broker_credential_revision,
         &positions,
         trade_book.as_ref(),
+        &values,
     )
     .await?;
     let unresolved_incidents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_position_incidents WHERE user_id=$1 AND status IN ('open','operator_required')")
@@ -8497,63 +8903,48 @@ async fn reconcile_live_user_with_scope(
         }
     }
     if full_readiness {
-        let known_orders: Vec<(String, String)> = sqlx::query_as("SELECT broker_order_id,client_order_id FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND (broker_order_id<>'' OR client_order_id<>'')")
-            .bind(user_id).fetch_all(&state.db).await?;
-        let known_ids: HashSet<String> = known_orders
-            .iter()
-            .flat_map(|(broker_id, client_id)| [broker_id, client_id])
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .collect();
-        let mut active_unknown_orders = 0_i64;
-        let mut structurally_unknown_orders = 0_i64;
-        for item in values.as_array().into_iter().flatten() {
-            let status = broker_text(item, &["status", "orderstatus", "orderStatus"])
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            if broker_order_is_terminal(&status) {
-                continue;
-            }
-            let broker_id = broker_text(item, &["orderid", "orderId"]).unwrap_or("");
-            let client_id = broker_text(item, &["ordertag", "orderTag"]).unwrap_or("");
-            if status.is_empty() {
-                structurally_unknown_orders += 1;
-            } else if !known_ids.contains(broker_id) && !known_ids.contains(client_id) {
-                active_unknown_orders += 1;
-            }
-        }
-        let active_conditionals = conditional_rules
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter(|rule| conditional_rule_is_active(rule))
-            .count() as i64;
+        let trade_book = trade_book.as_ref().ok_or_else(|| {
+            AppError::BadRequest(
+                "Full broker readiness requires an authoritative trade book.".into(),
+            )
+        })?;
+        let (rulenix_owned_exposure, manual_external_exposure, ambiguous_exposure) =
+            replace_broker_exposure_observations(
+                state,
+                user_id,
+                broker_credential_revision,
+                &broker_positions,
+                &values,
+                trade_book,
+                conditional_rules.as_deref().unwrap_or_default(),
+            )
+            .await?;
         let ambiguous_local_orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous')")
             .bind(user_id).fetch_one(&state.db).await?;
-        let broker_mutation_blockers =
-            active_unknown_orders + structurally_unknown_orders + active_conditionals;
+        let broker_mutation_blockers = ambiguous_exposure;
         if broker_mutation_blockers > 0 {
             let blocker_detail = format!(
-                "Full broker reconciliation found external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}."
+                "Full broker reconciliation found Rulenix-owned exposure={rulenix_owned_exposure}, manual/external exposure={manual_external_exposure}, ambiguous exposure={ambiguous_exposure}."
             );
-            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'open',$2,$3,$4,$5,NOW(),NOW(),NULL) ON CONFLICT(user_id) DO UPDATE SET status='open',external_active_orders=EXCLUDED.external_active_orders,structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=EXCLUDED.active_conditional_rules,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL")
+            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'open',0,$2,0,$3,$2,$4,$5,NOW(),NOW(),NULL) ON CONFLICT(user_id) DO UPDATE SET status='open',external_active_orders=0,structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=0,rulenix_owned_exposure=EXCLUDED.rulenix_owned_exposure,ambiguous_exposure=EXCLUDED.ambiguous_exposure,manual_external_exposure=EXCLUDED.manual_external_exposure,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL")
                 .bind(user_id)
-                .bind(active_unknown_orders)
-                .bind(structurally_unknown_orders)
-                .bind(active_conditionals)
+                .bind(ambiguous_exposure)
+                .bind(rulenix_owned_exposure)
+                .bind(manual_external_exposure)
                 .bind(&blocker_detail)
                 .execute(&state.db)
                 .await?;
         } else {
-            sqlx::query("UPDATE broker_reconciliation_blockers SET status='resolved',external_active_orders=0,structurally_unknown_orders=0,active_conditional_rules=0,detail='Authoritative full broker reconciliation found no unresolved broker mutations.',last_checked_at=NOW(),resolved_at=NOW() WHERE user_id=$1 AND status='open'")
+            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'resolved',0,0,0,$2,0,$3,'Authoritative full broker reconciliation found no ambiguous broker mutations.',NOW(),NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET status='resolved',external_active_orders=0,structurally_unknown_orders=0,active_conditional_rules=0,rulenix_owned_exposure=EXCLUDED.rulenix_owned_exposure,ambiguous_exposure=0,manual_external_exposure=EXCLUDED.manual_external_exposure,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NOW()")
                 .bind(user_id)
+                .bind(rulenix_owned_exposure)
+                .bind(manual_external_exposure)
                 .execute(&state.db)
                 .await?;
         }
         if unresolved_incidents > 0 || broker_mutation_blockers > 0 || ambiguous_local_orders > 0 {
             let detail = format!(
-                "Full broker reconciliation is unsafe: incidents={unresolved_incidents}, external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}, ambiguous_local_orders={ambiguous_local_orders}."
+                "Full broker reconciliation is unsafe: incidents={unresolved_incidents}, ambiguous_exposure={ambiguous_exposure}, ambiguous_local_orders={ambiguous_local_orders}."
             );
             risk::set_reconciliation_health(state, user_id, false, &detail).await?;
             return Err(AppError::BadRequest(detail));
@@ -8562,7 +8953,7 @@ async fn reconcile_live_user_with_scope(
             state,
             user_id,
             true,
-            "Full Angel positions, orders, trades, and conditional state reconciled.",
+            &format!("Full Angel state reconciled: Rulenix-owned exposure={rulenix_owned_exposure}, manual/external exposure={manual_external_exposure}, ambiguous exposure=0."),
         )
         .await?;
         if !risk::reconciliation_ready(state, user_id).await? {
@@ -14713,9 +15104,16 @@ mod tests {
             "avgnetprice":"4321.25",
             "brokerExtra":"retained"
         });
-        reconcile_broker_positions(&state, user_id, 0, &json!([raw_position.clone()]), None)
-            .await
-            .expect("unknown broker position reconciliation must succeed");
+        reconcile_broker_positions(
+            &state,
+            user_id,
+            0,
+            &json!([raw_position.clone()]),
+            None,
+            &json!([]),
+        )
+        .await
+        .expect("unknown broker position reconciliation must succeed");
         let incident: (String, String, String, String, i32, Option<f64>, Value) = sqlx::query_as(
             "SELECT incident_type,status,ownership_status,product_type,
                         broker_quantity,broker_average_price,raw_broker_position
@@ -14728,7 +15126,7 @@ mod tests {
         .expect("unmapped broker exposure must be persisted");
         assert_eq!(incident.0, "UNMAPPED_BROKER_POSITION");
         assert_eq!(incident.1, "operator_required");
-        assert_eq!(incident.2, "detected_unattributed");
+        assert_eq!(incident.2, "ambiguous");
         assert_eq!(incident.3, "CARRYFORWARD");
         assert_eq!(incident.4, 7);
         assert_eq!(incident.5, Some(4321.25));
@@ -14848,6 +15246,7 @@ mod tests {
             ("partial-sl-full-tp", 50, 50, 25),
         ];
         let mut broker_positions = Vec::new();
+        let mut broker_trade_fills = Vec::new();
         let mut contracts = Vec::new();
         let mut expected = HashMap::new();
         for (case_index, (case_name, entry_quantity, target_fill, stop_fill)) in
@@ -14903,6 +15302,16 @@ mod tests {
                     .bind(format!("source-client-{case_index}-{order_index}"))
                     .bind(processed)
                     .execute(&state.db).await.unwrap();
+                if processed > 0 {
+                    broker_trade_fills.push(json!({
+                        "orderid":format!("SRC-{case_index}-{order_index}"),
+                        "ordertag":format!("source-client-{case_index}-{order_index}"),
+                        "exchange":"MCX", "symboltoken":token,
+                        "tradingsymbol":symbol, "transactiontype":side,
+                        "fillsize":processed.to_string(), "fillprice":"100",
+                        "filltime":Utc::now().to_rfc3339()
+                    }));
+                }
             }
             let residual = target_fill + stop_fill - entry_quantity;
             assert!(residual > 0);
@@ -14932,16 +15341,35 @@ mod tests {
         crate::contract_master::set_isolated_test_cache(contracts).await;
 
         let positions = json!(broker_positions);
+        let trade_book = json!(broker_trade_fills);
         let first_state = state.clone();
         let first_positions = positions.clone();
+        let first_trade_book = trade_book.clone();
         let second_state = state.clone();
         let second_positions = positions.clone();
+        let second_trade_book = trade_book.clone();
         let (first, second) = tokio::join!(
             tokio::spawn(async move {
-                reconcile_broker_positions(&first_state, user_id, 0, &first_positions, None).await
+                reconcile_broker_positions(
+                    &first_state,
+                    user_id,
+                    0,
+                    &first_positions,
+                    Some(&first_trade_book),
+                    &json!([]),
+                )
+                .await
             }),
             tokio::spawn(async move {
-                reconcile_broker_positions(&second_state, user_id, 0, &second_positions, None).await
+                reconcile_broker_positions(
+                    &second_state,
+                    user_id,
+                    0,
+                    &second_positions,
+                    Some(&second_trade_book),
+                    &json!([]),
+                )
+                .await
             })
         );
         first.unwrap().unwrap();
@@ -15004,7 +15432,7 @@ mod tests {
 
         sqlx::query("UPDATE strategy_orders SET status='filled',filled_quantity=quantity,processed_quantity=quantity,average_fill_price=price,last_reconciled_at=NOW() WHERE user_id=$1 AND role='EMERGENCY_CLOSE'")
             .bind(user_id).execute(&state.db).await.unwrap();
-        reconcile_broker_positions(&state, user_id, 0, &json!([]), None)
+        reconcile_broker_positions(&state, user_id, 0, &json!([]), None, &json!([]))
             .await
             .unwrap();
         let still_open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE user_id=$1 AND status='open' AND exposure_origin='broker_over_close'")
@@ -17347,6 +17775,142 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn manual_broker_exposure_is_reported_narrow_and_never_mutated() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let user_id = seed_flat_linked_live_account(&state, "manual-narrow").await;
+        let manual_order = json!({
+            "orderid":"MANUAL-1", "ordertag":"", "status":"open", "exchange":"MCX",
+            "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "transactiontype":"BUY", "quantity":"10", "filledshares":"10"
+        });
+        *fake.order_book.lock().await = vec![manual_order];
+        *fake.positions.lock().await = vec![json!({
+            "exchange":"MCX", "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "producttype":"CARRYFORWARD", "netqty":"10", "avgnetprice":"100"
+        })];
+        *fake.trade_book.lock().await = vec![json!({
+            "orderid":"MANUAL-1", "ordertag":"", "exchange":"MCX",
+            "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "transactiontype":"BUY", "fillsize":"10", "fillprice":"100",
+            "filltime":Utc::now().to_rfc3339()
+        })];
+        reconcile_live_user_readiness(&state, user_id)
+            .await
+            .unwrap();
+        assert!(risk::reconciliation_ready(&state, user_id).await.unwrap());
+        let ownership: Vec<(String, String)> = sqlx::query_as(
+            "SELECT exposure_kind,ownership_status FROM broker_exposure_observations
+             WHERE user_id=$1 ORDER BY exposure_kind",
+        )
+        .bind(user_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            ownership,
+            vec![
+                ("order".into(), "manual_external".into()),
+                ("position".into(), "manual_external".into()),
+            ]
+        );
+        reconcile_live_user_readiness(&state, user_id)
+            .await
+            .unwrap();
+        let observation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM broker_exposure_observations WHERE user_id=$1",
+        )
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            observation_count, 2,
+            "restart/reconciliation must only refresh manual evidence"
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+
+        let mut snapshots = HashMap::new();
+        for (token, key) in [
+            ("unrelated-token", "manual-narrow-unrelated"),
+            ("manual-token", "manual-narrow-exact"),
+        ] {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,lot_size,exchange_segment,product_type,execution_key) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready',$3,$3,10,'MCX','CARRYFORWARD',$4)")
+                .bind(id).bind(STRATEGY_KEY).bind(token).bind(key).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,100,NOW())")
+                .bind(token).execute(&state.db).await.unwrap();
+            snapshots.insert(token, id);
+        }
+        let unrelated_snapshot = snapshots["unrelated-token"];
+        let manual_snapshot = snapshots["manual-token"];
+        let risk_order =
+            |snapshot_id, token: &'static str, mode: &'static str, key: &'static str| {
+                risk::OrderRisk {
+                    user_id,
+                    snapshot_id,
+                    trade_id: None,
+                    session: key,
+                    role: "BUY_ENTRY",
+                    side: "BUY",
+                    mode,
+                    lots: 1,
+                    quantity: 10,
+                    price: 100.0,
+                    trigger_price: None,
+                    idempotency_key: key,
+                    snapshot_ready: true,
+                    snapshot_current: true,
+                    exchange_segment: "MCX",
+                    contract_token: token,
+                    live_reconciled: true,
+                    originated_at: None,
+                }
+            };
+        assert!(
+            risk::assess_and_reserve(
+                &state,
+                &risk_order(
+                    unrelated_snapshot,
+                    "unrelated-token",
+                    "live",
+                    "manual-unrelated-live"
+                ),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        let collision = risk::assess_and_reserve(
+            &state,
+            &risk_order(manual_snapshot, "manual-token", "live", "manual-exact-live"),
+        )
+        .await
+        .expect_err("exact manual contract must block only this LIVE mutation");
+        assert!(collision.to_string().contains("exact LIVE contract"));
+
+        sqlx::query("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            risk::assess_and_reserve(
+                &state,
+                &risk_order(manual_snapshot, "manual-token", "demo", "manual-exact-demo"),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn disconnected_flat_account_is_live_blocked_without_platform_exposure() {
         let state = isolated_test_state().await;
         let user_id = seed_flat_linked_live_account(&state, "offline-flat").await;
@@ -17376,6 +17940,7 @@ mod tests {
         let known = HashSet::from(["RULENIX-SL".to_string()]);
         let fill = |order_id: &str, side: &str, quantity: i32, seconds: i64| BrokerTradeFill {
             order_id: order_id.into(),
+            order_tag: String::new(),
             exchange: "MCX".into(),
             token: "123".into(),
             symbol: "GOLDTEN30SEP26FUT".into(),
@@ -17494,6 +18059,30 @@ mod tests {
             attributable_manual_flat_fill(&[fill("MANUAL-SHORT", "BUY", 20, 1)], &short_expected,)
                 .map(|evidence| evidence.weighted_price),
             Some(101.5)
+        );
+    }
+
+    #[test]
+    fn broker_exposure_ownership_requires_durable_or_complete_evidence() {
+        let manual = json!({
+            "orderid":"MANUAL", "exchange":"MCX", "symboltoken":"123",
+            "transactiontype":"BUY", "quantity":"10", "ordertag":""
+        });
+        assert_eq!(
+            broker_order_ownership(&manual, &HashSet::new(), &HashSet::new()),
+            BrokerExposureOwnership::ManualExternal
+        );
+        assert_eq!(
+            broker_order_ownership(
+                &json!({"orderid":"ORPHAN", "exchange":"MCX", "symboltoken":"123", "transactiontype":"BUY", "quantity":"10", "ordertag":"RX0123456789ABCDEF01"}),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
+            BrokerExposureOwnership::Ambiguous
+        );
+        assert_eq!(
+            broker_order_ownership(&manual, &HashSet::from(["MANUAL".into()]), &HashSet::new(),),
+            BrokerExposureOwnership::RulenixOwned
         );
     }
 

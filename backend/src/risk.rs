@@ -270,6 +270,31 @@ pub async fn assess_and_reserve(
             );
         }
         if code == "allowed" && order.mode == "live" {
+            let broker_collision: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM broker_exposure_observations e
+                    JOIN user_profiles p ON p.user_id=e.user_id
+                    WHERE e.user_id=$1
+                      AND UPPER(e.exchange_segment)=UPPER($2)
+                      AND e.contract_token=$3
+                      AND e.ownership_status IN ('manual_external','ambiguous')
+                      AND e.broker_credential_revision=p.broker_credential_revision
+                      AND e.observed_at>NOW()-INTERVAL '5 minutes'
+                )",
+            )
+            .bind(order.user_id)
+            .bind(order.exchange_segment)
+            .bind(order.contract_token)
+            .fetch_one(&mut *tx)
+            .await?;
+            if broker_collision {
+                (code, message) = reject(
+                    "broker_instrument_collision",
+                    "Order rejected: manual or ambiguous broker exposure exists for this exact LIVE contract.",
+                );
+            }
+        }
+        if code == "allowed" && order.mode == "live" {
             let unresolved_position: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM broker_position_incidents i JOIN strategy_market_snapshots s ON s.id=$4 WHERE i.user_id=$1 AND i.status IN ('open','operator_required') AND (i.incident_type='UNMAPPED_BROKER_POSITION' OR (i.exchange_segment=$2 AND i.contract_token=$3) OR (i.strategy_key=s.strategy_key AND split_part(i.instrument,'_',1)=split_part(s.instrument,'_',1))))",
             )
