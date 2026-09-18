@@ -13,6 +13,7 @@ Never log credentials, cookies, authorization headers, MPINs, TOTPs, or broker t
 - Active sessions
 - Market feed age
 - Scheduler run counts
+- Scheduler leadership, last advancement, last successful dispatch, and dispatch/error counters
 - Order counts by status
 - Durable execution-intent counts and incomplete confirmed signals
 - Broker errors in the last 24 hours
@@ -20,6 +21,13 @@ Never log credentials, cookies, authorization headers, MPINs, TOTPs, or broker t
 - Unhealthy reconciliation records
 
 Connect this endpoint to your scraper or a lightweight synthetic monitor.
+
+`GET /api/health/live` reports only that the service process is alive. `GET
+/api/health/ready` also checks PostgreSQL and the process-local strategy scheduler.
+A standby replica remains ready, while the elected leader returns `503 unready` if
+its five-second dispatch loop has not advanced for more than 60 seconds. Readiness
+does not restart the process or change trading state; use the scheduler fields in the
+response to distinguish a healthy standby from a stale leader.
 
 ## Alerts
 

@@ -76,7 +76,7 @@ export const closeTrade = createAsyncThunk(
         tradeId,
         message:
           error.response?.data?.detail ||
-          "Unable to request an authoritative broker close",
+          "Unable to close the trade from authoritative server state",
       });
     }
   }
@@ -174,7 +174,7 @@ const pnlSlice = createSlice({
       .addCase(closeTrade.rejected, (state, action) => {
         state.closingTradeId = null;
         state.closeError =
-          action.payload?.message || "Unable to request broker close";
+          action.payload?.message || "Unable to close the trade";
       });
   },
 });

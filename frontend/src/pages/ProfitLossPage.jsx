@@ -104,9 +104,13 @@ export default function ProfitLossPage() {
     const symbol = trade.contract_symbol || trade.instrument_label || "trade";
     const direction = String(trade.direction || "").toUpperCase();
     const quantity = Number(trade.quantity || 0).toLocaleString("en-IN");
+    const tradeMode = trade.execution_mode === "live" ? "LIVE" : "DEMO";
+    const explanation = tradeMode === "LIVE"
+      ? "Rulenix will reconcile Angel One, safely retire protective orders, and submit a broker close only if exposure still requires it."
+      : "Rulenix will close this simulated trade locally at the latest fresh market price. No Angel One order will be sent.";
     if (
       !window.confirm(
-        `Close this running LIVE trade?\n\n${symbol} · ${direction} · remaining quantity ${quantity}\n\nRulenix will attempt to close the remaining live broker position and reconcile the trade with Angel One.`
+        `Close this running ${tradeMode} trade?\n\n${symbol} · ${direction} · remaining quantity ${quantity}\n\n${explanation}`
       )
     ) {
       return;
@@ -257,6 +261,7 @@ export default function ProfitLossPage() {
               <th className="whitespace-nowrap px-4 py-3">Strategy</th>
               <th className="whitespace-nowrap px-4 py-3">Instrument</th>
               <th className="whitespace-nowrap px-4 py-3">Symbol</th>
+              <th className="whitespace-nowrap px-4 py-3">Mode</th>
               <th className="whitespace-nowrap px-4 py-3">Side</th>
               <th className="whitespace-nowrap px-4 py-3">Qty</th>
               <th className="whitespace-nowrap px-4 py-3">Entry @</th>
@@ -272,7 +277,7 @@ export default function ProfitLossPage() {
             {status === "loading" && entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={15}
+                  colSpan={16}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   Loading trades...
@@ -281,7 +286,7 @@ export default function ProfitLossPage() {
             ) : entries.length === 0 ? (
               <tr>
                 <td
-                  colSpan={15}
+                  colSpan={16}
                   className="px-4 py-8 text-center text-sm text-slate-400"
                 >
                   No trade history available.
@@ -348,7 +353,8 @@ export default function ProfitLossPage() {
                   ? "—"
                   : `${tp1Price} · Qty ${Number(trade.tp1_exit_quantity || 0).toLocaleString("en-IN")} · ${formatDateTime(trade.tp1_exit_datetime)}`;
                 const canClose =
-                  trade.status === "open" && trade.execution_mode === "live";
+                  trade.status === "open" &&
+                  ["demo", "live"].includes(trade.execution_mode);
                 const closePending = closingTradeId === trade.id;
                 const closeAlreadyPending = [
                   "requested",
@@ -376,6 +382,15 @@ export default function ProfitLossPage() {
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">
                       {tradingSymbol}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3">
+                      <span className={`rounded-full border px-2 py-1 text-[10px] font-bold tracking-wide ${
+                        trade.execution_mode === "live"
+                          ? "border-rose-400/50 bg-rose-500/10 text-rose-200"
+                          : "border-cyan-400/50 bg-cyan-500/10 text-cyan-200"
+                      }`}>
+                        {String(trade.execution_mode || "unknown").toUpperCase()}
+                      </span>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 uppercase text-slate-300">
                       {sideDisplay}
@@ -412,7 +427,7 @@ export default function ProfitLossPage() {
                           className="rounded-lg border border-rose-400/60 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {closePending
-                            ? "Reconciling..."
+                            ? trade.execution_mode === "live" ? "Reconciling..." : "Closing..."
                             : trade.manual_close_status
                             ? "Close pending"
                             : "Close Trade"}

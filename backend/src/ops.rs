@@ -1,6 +1,6 @@
 use crate::{
     auth::{AuthUser, require_admin_permission},
-    error::{AppError, AppResult},
+    error::AppResult,
     state::AppState,
 };
 use axum::{
@@ -8,6 +8,7 @@ use axum::{
     extract::{Extension, State},
     http::StatusCode,
 };
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 pub async fn liveness() -> (StatusCode, Json<Value>) {
@@ -17,15 +18,39 @@ pub async fn liveness() -> (StatusCode, Json<Value>) {
     )
 }
 
-pub async fn readiness(State(state): State<AppState>) -> AppResult<Json<Value>> {
-    sqlx::query_scalar::<_, i32>("SELECT 1")
+fn scheduler_check(state: &AppState) -> Value {
+    let snapshot = state.scheduler_health.snapshot_at(Utc::now().timestamp());
+    json!({
+        "status": if snapshot.stale { "stale" } else if snapshot.leader { "advancing" } else { "standby" },
+        "leader": snapshot.leader,
+        "last_advance_at": snapshot.last_advance_epoch.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+        "last_successful_dispatch_at": snapshot.last_successful_dispatch_epoch.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+        "dispatch_count": snapshot.dispatch_count,
+        "error_count": snapshot.error_count,
+    })
+}
+
+pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let database_ready = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db)
         .await
-        .map_err(AppError::Sqlx)?;
-    Ok(Json(json!({
-        "status":"ready",
-        "checks":{"database":"ok"},
-    })))
+        .is_ok();
+    let scheduler = state.scheduler_health.snapshot_at(Utc::now().timestamp());
+    let ready = database_ready && !scheduler.stale;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "status": if ready { "ready" } else { "unready" },
+            "checks": {
+                "database": if database_ready { "ok" } else { "unavailable" },
+                "strategy_scheduler": scheduler_check(&state),
+            },
+        })),
+    )
 }
 
 pub async fn metrics(
@@ -85,6 +110,7 @@ pub async fn metrics(
     .fetch_one(&state.db)
     .await
     .unwrap_or(0);
+    let scheduler = scheduler_check(&state);
     Ok(Json(json!({
         "active_sessions":active_sessions,
         "market_feed_age_seconds":market_feed_age_seconds,
@@ -95,6 +121,7 @@ pub async fn metrics(
         "risk_rejections_24h":risk_rejections,
         "broker_errors_24h":broker_errors_24h,
         "reconciliation_unhealthy":reconciliation_unhealthy,
+        "strategy_scheduler":scheduler,
     })))
 }
 

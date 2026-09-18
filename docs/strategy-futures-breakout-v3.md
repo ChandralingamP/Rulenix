@@ -185,6 +185,14 @@ Live:
 
 Both modes persist into `strategy_orders` and `trades`.
 
+## Manual close and broker reconciliation
+
+- An operator can close an open DEMO trade from Profit/Loss. The backend locks the trade, requires a fresh positive database market tick, terminalizes active demo protection locally, and calculates the final P&L without calling Angel One. Repeated close requests are idempotent and ownership is enforced from the authenticated session.
+- Closing a LIVE trade from Profit/Loss keeps the existing broker-close workflow: it submits or reconciles the tagged broker exit and closes the local trade only after authoritative broker evidence proves the contract flat.
+- If a LIVE position is closed directly at Angel One, reconciliation accepts only an exact, opposite-side set of external fills for the same exchange, token, and symbol after the last exact broker/local exposure match. Partial, excess, stale, conflicting, malformed, or ambiguous evidence fails closed.
+- Exact external-close evidence is stored before protective-order cleanup. This lets a later reconciliation pass finish the local close after protection becomes terminal even if Angel's intraday trade book has expired or is temporarily unavailable. The stored evidence is scoped to the user, account, trade, contract, side, and exact quantity and is consumed once.
+- A broker-flat state without attributable fill evidence remains `RECONCILIATION_REQUIRED`; it is never converted into a guessed local close.
+
 ## Backtesting behavior
 
 Backtesting supports lookbacks of 1, 3, or 6 months and intervals:
