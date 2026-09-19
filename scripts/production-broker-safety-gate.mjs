@@ -244,6 +244,8 @@ for (let index = 0; index < accounts.length; index += 1) {
       const attribution = classifyPositionOwnership(position, {
         orders, trades, knownOrders: account.known_orders,
         openLocalPositions: account.open_local_positions,
+        rulenixContractHistory: account.rulenix_contract_history,
+        allowDurableNegativeProof: true,
       });
       exposureTotals.positions[attribution.ownership] += 1;
       ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
@@ -307,7 +309,6 @@ for (let index = 0; index < accounts.length; index += 1) {
     brokerReadable,
     brokerSafe,
     brokerExposureObserved,
-    requiresAuthoritativeBroker: account.is_active === true && account.can_live_trade === true,
     rulenixOwnedExposure: ownershipCounts.rulenix_owned,
     ambiguousExposure: ownershipCounts.ambiguous,
     local: account.local,

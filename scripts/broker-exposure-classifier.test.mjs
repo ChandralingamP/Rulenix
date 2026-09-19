@@ -79,3 +79,23 @@ test("position requires exclusive fill attribution", () => {
   }).ownership, ownership.rulenix);
   assert.equal(classifyPositionOwnership(position, { orders: [], trades: [] }).ownership, ownership.ambiguous);
 });
+
+test("deployment may prove a position manual from complete negative Rulenix history", () => {
+  const position = { exchange: "MCX", symboltoken: "571307", netqty: "20" };
+  const manual = classifyPositionOwnership(position, {
+    orders: [], trades: [], openLocalPositions: [], rulenixContractHistory: [],
+    allowDurableNegativeProof: true,
+  });
+  assert.equal(manual.ownership, ownership.manual);
+  assert.equal(manual.evidence, "no_rulenix_durable_contract_history");
+});
+
+test("any exact-contract Rulenix history keeps an unexplained position ambiguous", () => {
+  const position = { exchange: "MCX", symboltoken: "571307", netqty: "20" };
+  const ambiguous = classifyPositionOwnership(position, {
+    orders: [], trades: [], openLocalPositions: [],
+    rulenixContractHistory: [{ exchange_segment: "MCX", contract_token: "571307", evidence_rows: 1 }],
+    allowDurableNegativeProof: true,
+  });
+  assert.equal(ambiguous.ownership, ownership.ambiguous);
+});

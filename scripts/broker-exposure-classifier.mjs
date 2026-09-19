@@ -113,6 +113,17 @@ export function classifyPositionOwnership(position, context = {}) {
       && totals[ownership.rulenix] === 0 && totals[ownership.ambiguous] === 0) {
     return { ownership: ownership.manual, evidence: "net_position_matches_manual_fills", details: { matchingFills, ...totals } };
   }
+  const durableContractHistory = (context.rulenixContractHistory ?? []).some((item) =>
+    String(item.exchange_segment ?? "").toUpperCase() === id.exchange
+      && String(item.contract_token ?? "") === id.symbolToken
+      && Number(item.evidence_rows ?? 0) > 0);
+  if (context.allowDurableNegativeProof === true && !durableContractHistory) {
+    return {
+      ownership: ownership.manual,
+      evidence: "no_rulenix_durable_contract_history",
+      details: { matchingFills, ...totals },
+    };
+  }
   return {
     ownership: ownership.ambiguous,
     evidence: "position_fill_ownership_not_exclusive",

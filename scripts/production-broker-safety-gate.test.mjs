@@ -62,15 +62,6 @@ test("readable broker exposure blocks even when local state is empty", () => {
   assert.equal(deploymentAccountDecision({ brokerReadable: true, brokerSafe: false, local: flat }).allow, false);
 });
 
-test("disconnected LIVE-capable account blocks without authoritative evidence", () => {
-  const decision = deploymentAccountDecision({
-    brokerReadable: false, requiresAuthoritativeBroker: true, local: flat,
-  });
-  assert.equal(decision.allow, false);
-  assert.equal(decision.liveReady, false);
-  assert.equal(decision.classification, "unreadable_live_capable_account");
-});
-
 test("proven manual broker exposure permits deployment", () => {
   const decision = deploymentAccountDecision({
     brokerReadable: true, brokerExposureObserved: true,

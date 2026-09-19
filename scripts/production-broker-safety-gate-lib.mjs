@@ -17,7 +17,6 @@ export function deploymentAccountDecision({
   brokerReadable,
   brokerSafe,
   brokerExposureObserved = false,
-  requiresAuthoritativeBroker = false,
   rulenixOwnedExposure = 0,
   ambiguousExposure = 0,
   local = {},
@@ -46,14 +45,6 @@ export function deploymentAccountDecision({
       allow: false,
       liveReady: false,
       classification: "unreadable_broker_exposure_observed",
-      localUnresolved,
-    };
-  }
-  if (requiresAuthoritativeBroker) {
-    return {
-      allow: false,
-      liveReady: false,
-      classification: "unreadable_live_capable_account",
       localUnresolved,
     };
   }

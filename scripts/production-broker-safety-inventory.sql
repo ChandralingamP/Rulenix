@@ -82,6 +82,7 @@ SELECT COALESCE(json_agg(json_build_object(
     ),
     'known_orders', COALESCE(orders.values, '[]'::JSON),
     'open_local_positions', COALESCE(positions.values, '[]'::JSON),
+    'rulenix_contract_history', COALESCE(contract_history.values, '[]'::JSON),
     'secrets', COALESCE(secrets.values, '{}'::JSON),
     'egress_ip', egress.ip_address,
     'egress_configuration_status', egress.configuration_status,
@@ -123,6 +124,53 @@ LEFT JOIN LATERAL (
     WHERE t.user_id=account.user_id AND t.execution_mode='live'
       AND t.status='open' AND s.contract_token IS NOT NULL
 ) positions ON TRUE
+LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object(
+        'exchange_segment', evidence.exchange_segment,
+        'contract_token', evidence.contract_token,
+        'evidence_rows', evidence.evidence_rows
+    )) AS values
+    FROM (
+        SELECT exchange_segment, contract_token, COUNT(*)::BIGINT AS evidence_rows
+        FROM (
+            SELECT UPPER(s.exchange_segment) AS exchange_segment, s.contract_token
+            FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+            WHERE t.user_id=account.user_id AND t.execution_mode='live' AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+            WHERE o.user_id=account.user_id AND o.execution_mode='live' AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM strategy_execution_intents i JOIN strategy_market_snapshots s ON s.id=i.snapshot_id
+            WHERE i.user_id=account.user_id AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM strategy_execution_intents i JOIN strategy_orders o ON o.id=i.strategy_order_id
+            JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+            WHERE i.user_id=account.user_id AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM strategy_execution_intents i JOIN trades t ON t.id=i.trade_id
+            JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+            WHERE i.user_id=account.user_id AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM strategy_reversal_intents r JOIN strategy_market_snapshots s ON s.id=r.snapshot_id
+            WHERE r.user_id=account.user_id AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(s.exchange_segment), s.contract_token
+            FROM manual_trade_close_intents m JOIN trades t ON t.id=m.trade_id
+            JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+            WHERE m.user_id=account.user_id AND s.contract_token IS NOT NULL
+            UNION ALL
+            SELECT UPPER(i.exchange_segment), i.contract_token
+            FROM broker_position_incidents i
+            WHERE i.user_id=account.user_id AND i.contract_token<>''
+        ) durable
+        GROUP BY exchange_segment, contract_token
+    ) evidence
+) contract_history ON TRUE
 LEFT JOIN LATERAL (
     SELECT host(e.ip_address) AS ip_address,
            e.configuration_status,
