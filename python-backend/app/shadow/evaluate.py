@@ -29,8 +29,26 @@ def _render(value: Any) -> Any:
     return value
 
 
+def _equivalent(rust: Any, python: Any) -> bool:
+    if isinstance(rust, dict) and isinstance(python, dict):
+        return rust.keys() == python.keys() and all(
+            _equivalent(value, python[key]) for key, value in rust.items()
+        )
+    if isinstance(rust, list) and isinstance(python, list):
+        return len(rust) == len(python) and all(
+            _equivalent(actual, expected)
+            for actual, expected in zip(rust, python, strict=True)
+        )
+    numeric = (Decimal, int, float)
+    if not isinstance(rust, bool) and not isinstance(python, bool) and isinstance(rust, numeric) and isinstance(python, numeric):
+        actual, expected = Decimal(str(rust)), Decimal(str(python))
+        tolerance = max(Decimal("1e-9"), max(abs(actual), abs(expected)) * Decimal("1e-12"))
+        return abs(actual - expected) <= tolerance
+    return _render(rust) == _render(python)
+
+
 def _compare(rust: dict[str, Any], python: dict[str, Any]) -> tuple[str, str, str]:
-    mismatches = [key for key in sorted(rust) if _render(rust[key]) != _render(python.get(key))]
+    mismatches = [key for key in sorted(rust) if not _equivalent(rust[key], python.get(key))]
     if not mismatches:
         return "MATCH", "", "NONE"
     critical = any(key in {"side", "quantity", "instrument"} for key in mismatches)
@@ -95,7 +113,11 @@ def evaluate_futures_signal(row: dict[str, Any]) -> tuple[dict[str, Any], dict[s
                 "account_ref": intent.get("account_ref"),
                 "role": role,
                 "side": intent["side"],
-                "quantity": intent["quantity"],
+                # Rust accepts a nullable intent quantity and derives the effective
+                # entry quantity from current lot size × requested lots at dispatch.
+                "quantity": intent["quantity"]
+                if intent["quantity"] is not None
+                else int(intent["lots"]) * int(row["lot_size"]),
                 "price": _decimal(intent["price"]),
             }
         )

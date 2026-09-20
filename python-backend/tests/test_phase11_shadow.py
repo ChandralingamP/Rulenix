@@ -9,6 +9,7 @@ import pytest
 from app.shadow.config import ShadowSettings
 from app.shadow.database import ShadowWriter
 from app.shadow.evaluate import (
+    _compare,
     evaluate_futures_signal,
     evaluate_readiness,
     evaluate_supertrend_signal,
@@ -121,6 +122,41 @@ def test_futures_shadow_matches_authoritative_snapshot_and_intent() -> None:
                 "price": levels.buy_entry,
             }
         ],
+    }
+    _, _, classification, reason, severity = evaluate_futures_signal(row)
+    assert (classification, reason, severity) == ("MATCH", "", "NONE")
+
+
+def test_shadow_comparison_accepts_only_float_precision_noise() -> None:
+    assert _compare(
+        {"supertrend": Decimal("74557.8508409299")},
+        {"supertrend": Decimal("74557.85084092691481115624878")},
+    ) == ("MATCH", "", "NONE")
+    assert _compare(
+        {"supertrend": Decimal("74557.85")},
+        {"supertrend": Decimal("74557.86")},
+    ) == ("MISMATCH", "fields: supertrend", "HIGH")
+
+
+def test_futures_shadow_uses_rust_effective_quantity_for_nullable_intent() -> None:
+    levels = calculate_levels([100, 110, 105, 108], [90, 92, 94, 93])
+    row = {
+        "instrument": "GOLDTEN",
+        "contract_symbol": "GOLDTEN30SEP26FUT",
+        "entry_direction": "BOTH",
+        "planned_entry": None,
+        "lot_size": 10,
+        "highs": [100, 110, 105, 108],
+        "lows": [90, 92, 94, 93],
+        **{name: float(getattr(levels, name)) for name in levels.__dataclass_fields__},
+        "intents": [{
+            "account_ref": "a" * 64,
+            "role": "BUY_ENTRY",
+            "side": "BUY",
+            "lots": 2,
+            "quantity": None,
+            "price": float(levels.buy_entry),
+        }],
     }
     _, _, classification, reason, severity = evaluate_futures_signal(row)
     assert (classification, reason, severity) == ("MATCH", "", "NONE")
