@@ -1,0 +1,69 @@
+services:
+  demo-trial-db-proxy:
+    image: haproxy:3.0-alpine
+    restart: on-failure:5
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    volumes:
+      - ./infra/phase12/haproxy-demo-trial-db.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - production_db_path
+      - demo_trial_internal
+    mem_limit: 32m
+    cpus: 0.10
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  python-demo-trial:
+    build:
+      context: ./python-backend
+      dockerfile: Dockerfile.demo-trial
+    restart: on-failure:5
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      RULENIX_DEMO_TRIAL_ONLY: required
+      DEMO_TRIAL_SOURCE_DATABASE_URL_FILE: /run/secrets/demo_trial_source_database_url
+      DEMO_TRIAL_SINK_DATABASE_URL_FILE: /run/secrets/demo_trial_sink_database_url
+      DEMO_TRIAL_RELEASE: ${DEMO_TRIAL_RELEASE:?DEMO_TRIAL_RELEASE is required}
+      DEMO_TRIAL_POLL_SECONDS: "15"
+      DEMO_TRIAL_HEALTH_PORT: "8091"
+    secrets:
+      - demo_trial_source_database_url
+      - demo_trial_sink_database_url
+    networks:
+      - demo_trial_internal
+    depends_on:
+      demo-trial-db-proxy:
+        condition: service_started
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+networks:
+  production_db_path:
+    external: true
+    name: rulenix_default
+  demo_trial_internal:
+    internal: true
+
+secrets:
+  demo_trial_source_database_url:
+    file: ./secrets/demo_trial_source_database_url.txt
+  demo_trial_sink_database_url:
+    file: ./secrets/demo_trial_sink_database_url.txt

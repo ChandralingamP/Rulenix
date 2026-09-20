@@ -1,0 +1,21 @@
+FROM python:3.14-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+RUN groupadd --system --gid 10003 rulenix-demo-trial \
+    && useradd --system --uid 10003 --gid 10003 --home /nonexistent --shell /usr/sbin/nologin rulenix-demo-trial
+
+WORKDIR /app
+COPY requirements-shadow.txt /app/requirements-shadow.txt
+RUN pip install --no-cache-dir --requirement /app/requirements-shadow.txt
+
+# Intentionally exclude API, broker, credentials, egress, reconciliation and
+# every Angel transport.  This image can only run the isolated DEMO trial.
+COPY app/__init__.py /app/app/__init__.py
+COPY app/demo_trial /app/app/demo_trial
+
+USER 10003:10003
+EXPOSE 8091
+ENTRYPOINT ["python", "-m", "app.demo_trial"]

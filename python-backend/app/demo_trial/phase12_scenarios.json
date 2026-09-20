@@ -1,0 +1,92 @@
+[
+  {
+    "scenario_id": "futures-buy-target",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "GOLDTEN30SEP26FUT",
+    "side": "BUY", "quantity": 20,
+    "entry": "100", "target": "101.5", "sl1": "98.5", "sl2": "97",
+    "exit_kind": "TARGET",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 4, "trade_count": 1, "side": "BUY", "quantity": 20, "entry": "100", "target": "101.5", "sl1": "98.5", "sl2": "97", "exit_reason": "TARGET", "exit_price": "101.5", "pnl": "30.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "futures-sell-sl1",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "SILVERM30NOV26FUT",
+    "side": "SELL", "quantity": 5,
+    "entry": "200", "target": "197", "sl1": "203", "sl2": "204",
+    "exit_kind": "SL1",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 4, "trade_count": 1, "side": "SELL", "quantity": 5, "entry": "200", "target": "197", "sl1": "203", "sl2": "204", "exit_reason": "SL1", "exit_price": "203", "pnl": "-15.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "futures-buy-sl2-reversal",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "SILVERMIC30NOV26FUT",
+    "side": "BUY", "quantity": 10,
+    "entry": "100", "target": "101.5", "sl1": "98.5", "sl2": "97",
+    "exit_kind": "SL2", "reversal": true, "reversal_exit_price": "95.545",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 4, "order_count": 8, "trade_count": 2, "side": "BUY", "quantity": 10, "entry": "100", "target": "101.5", "sl1": "98.5", "sl2": "97", "exit_reason": "SL2", "exit_price": "97", "pnl": "-30.00", "reversal_side": "SELL", "reversal_entry": "97", "reversal_exit": "95.545", "reversal_pnl": "14.55"}
+  },
+  {
+    "scenario_id": "supertrend-target",
+    "strategy_key": "supertrend_index_options_v1",
+    "instrument": "NIFTY23350CE",
+    "side": "BUY", "quantity": 50,
+    "entry": "100", "target": "125", "sl1": "85", "sl2": "85",
+    "exit_kind": "TARGET",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 50, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "TARGET", "exit_price": "125", "pnl": "1250.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "supertrend-stop",
+    "strategy_key": "supertrend_index_options_v1",
+    "instrument": "SENSEX74600PE",
+    "side": "BUY", "quantity": 20,
+    "entry": "100", "target": "140", "sl1": "75", "sl2": "75",
+    "exit_kind": "SL1",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 20, "entry": "100", "target": "140", "sl1": "75", "sl2": "75", "exit_reason": "SL1", "exit_price": "75", "pnl": "-500.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "supertrend-1510-eod",
+    "strategy_key": "supertrend_index_options_v1",
+    "instrument": "NIFTY23350PE",
+    "side": "BUY", "quantity": 50,
+    "entry": "100", "target": "125", "sl1": "85", "sl2": "85",
+    "exit_kind": "EOD", "exit_price": "102",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 50, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "EOD", "exit_price": "102", "pnl": "100.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "futures-manual-demo-close",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "GOLDTEN30SEP26FUT",
+    "side": "SELL", "quantity": 20,
+    "entry": "100", "target": "98.5", "sl1": "101.5", "sl2": "103",
+    "exit_kind": "MANUAL_CLOSE", "exit_price": "98",
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 4, "trade_count": 1, "side": "SELL", "quantity": 20, "entry": "100", "target": "98.5", "sl1": "101.5", "sl2": "103", "exit_reason": "MANUAL_CLOSE", "exit_price": "98", "pnl": "40.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "global-kill-blocks-entry",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "GOLDTEN30SEP26FUT",
+    "side": "BUY", "quantity": 20,
+    "entry": "100", "target": "101.5", "sl1": "98.5", "sl2": "97",
+    "exit_kind": "KILL_SWITCH", "global_kill": true,
+    "oracle": {"allowed": false, "reason": "global_kill_switch", "signal_count": 0, "intent_count": 0, "order_count": 0, "trade_count": 0, "side": null, "quantity": 0, "entry": null, "target": null, "sl1": null, "sl2": null, "exit_reason": null, "exit_price": null, "pnl": "0.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "futures-no-signal",
+    "strategy_key": "futures_breakout_v3",
+    "instrument": "GOLDTEN",
+    "side": "BUY", "quantity": 1,
+    "entry": "1", "target": "1", "sl1": "1", "sl2": "1",
+    "exit_kind": "NO_SIGNAL",
+    "oracle": {"allowed": true, "reason": "no_signal", "signal_count": 0, "intent_count": 0, "order_count": 0, "trade_count": 0, "side": null, "quantity": 0, "entry": null, "target": null, "sl1": null, "sl2": null, "exit_reason": null, "exit_price": null, "pnl": "0.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  },
+  {
+    "scenario_id": "supertrend-no-signal",
+    "strategy_key": "supertrend_index_options_v1",
+    "instrument": "NIFTY",
+    "side": "BUY", "quantity": 1,
+    "entry": "1", "target": "1", "sl1": "1", "sl2": "1",
+    "exit_kind": "NO_SIGNAL",
+    "oracle": {"allowed": true, "reason": "no_signal", "signal_count": 0, "intent_count": 0, "order_count": 0, "trade_count": 0, "side": null, "quantity": 0, "entry": null, "target": null, "sl1": null, "sl2": null, "exit_reason": null, "exit_price": null, "pnl": "0.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+  }
+]
