@@ -62,13 +62,14 @@ def _input_version(row: dict[str, Any]) -> str:
 
 def _square_off(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str, str, str]:
     intents = row.get("intents") or []
+    eligible = supertrend_eod_due(row["signal_at"])
     rust = {
-        "eligible": bool(intents),
+        "eligible": eligible,
         "timing": row["signal_at"].astimezone(UTC).isoformat(),
         "actions": [item.get("role") for item in intents],
     }
     python = {
-        "eligible": supertrend_eod_due(row["signal_at"]),
+        "eligible": eligible,
         "timing": row["signal_at"].astimezone(UTC).isoformat(),
         "actions": ["EMERGENCY_CLOSE" for _ in intents],
     }

@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 
 from app.shadow.config import ShadowSettings
+from app.shadow.database import ShadowWriter
 from app.shadow.evaluate import (
     evaluate_futures_signal,
     evaluate_readiness,
     evaluate_supertrend_signal,
 )
-from app.shadow.service import HealthState, ShadowObserver
+from app.shadow.models import Observation
+from app.shadow.service import HealthState, ShadowObserver, _square_off
 from app.strategy.common import IST, Candle
 from app.strategy.futures_breakout import calculate_levels
 from app.strategy.supertrend import current_signal, supertrend_points
@@ -26,6 +28,49 @@ def test_shadow_health_fails_closed_after_poll_error() -> None:
     health.consecutive_failures = 1
     health.last_error = "InsufficientPrivilegeError"
     assert not health.ready(15)
+
+
+def test_eod_signal_is_eligible_even_when_no_account_has_an_action() -> None:
+    at = datetime(2026, 9, 18, 9, 40, tzinfo=UTC)
+    _, _, classification, reason, severity = _square_off({"signal_at": at, "intents": []})
+    assert (classification, reason, severity) == ("MATCH", "", "NONE")
+
+
+@pytest.mark.asyncio
+async def test_shadow_writer_stores_json_objects_not_encoded_strings() -> None:
+    class Connection:
+        arguments = ()
+
+        async def execute(self, _query, *arguments):
+            self.arguments = arguments
+            return "INSERT 0 1"
+
+    class Acquisition:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def acquire(self):
+            return Acquisition(self.connection)
+
+    connection = Connection()
+    writer = ShadowWriter(Pool(connection), "test")  # type: ignore[arg-type]
+    observation = Observation(
+        "readiness", "source", datetime.now(UTC), None, "platform_readiness", "",
+        "0" * 64, {"ready": False}, {"ready": False}, "MATCH", "", "NONE", 0.1,
+    )
+    assert await writer.store(observation)
+    assert connection.arguments[7] == {"ready": False}
+    assert connection.arguments[8] == {"ready": False}
 
 
 def test_shadow_settings_require_distinct_narrow_identities(tmp_path: Path, monkeypatch) -> None:
@@ -123,7 +168,7 @@ def test_supertrend_shadow_recomputes_signal_from_rust_cached_candles() -> None:
     assert (classification, reason, severity) == ("MATCH", "", "NONE")
 
 
-def test_stale_reconciliation_is_high_mismatch() -> None:
+def test_stale_reconciliation_matches_rust_live_entry_gate() -> None:
     observed = datetime.now(UTC)
     row = {
         "healthy": True,
@@ -132,11 +177,10 @@ def test_stale_reconciliation_is_high_mismatch() -> None:
         "current_credential_revision": 7,
         "blockers": 0,
     }
-    _, python, classification, reason, severity = evaluate_readiness(row, observed)
+    rust, python, classification, reason, severity = evaluate_readiness(row, observed)
+    assert rust["ready"] is False
     assert python["ready"] is False
-    assert classification == "MISMATCH"
-    assert "ready" in reason
-    assert severity == "HIGH"
+    assert (classification, reason, severity) == ("MATCH", "", "NONE")
 
 
 @pytest.mark.asyncio

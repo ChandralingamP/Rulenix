@@ -172,31 +172,33 @@ def evaluate_readiness(row: dict[str, Any], observed_at: datetime) -> tuple[dict
         else "unreadable_broker_exposure_observed" if broker_exposure_observed
         else "offline_with_unresolved_live_state"
     )
-    rust = {
-        "ready": bool(row["healthy"]),
-        "deployment_safe": deployment_safe,
-        "deployment_classification": deployment_classification,
-        "credential_revision": row.get("broker_credential_revision"),
-        "checked_at": row["checked_at"],
-        "blockers": blockers,
-        "rulenix_owned_exposure": owned,
-        "ambiguous_exposure": ambiguous,
-        "manual_external_exposure": manual,
-    }
     checked_at: datetime = row["checked_at"]
-    python_ready = (
-        bool(row["healthy"])
+    live_ready = (
+        broker_readable
         and blockers == 0
         and owned == 0
         and ambiguous == 0
         and row.get("broker_credential_revision") == row.get("current_credential_revision")
         and checked_at >= observed_at - timedelta(minutes=5)
     )
-    python = {
-        "ready": python_ready,
+    rust = {
+        "ready": live_ready,
         "deployment_safe": deployment_safe,
         "deployment_classification": deployment_classification,
         "credential_revision": row.get("current_credential_revision"),
+        "reconciliation_revision": row.get("broker_credential_revision"),
+        "checked_at": row["checked_at"],
+        "blockers": blockers,
+        "rulenix_owned_exposure": owned,
+        "ambiguous_exposure": ambiguous,
+        "manual_external_exposure": manual,
+    }
+    python = {
+        "ready": live_ready,
+        "deployment_safe": deployment_safe,
+        "deployment_classification": deployment_classification,
+        "credential_revision": row.get("current_credential_revision"),
+        "reconciliation_revision": row.get("broker_credential_revision"),
         "checked_at": checked_at,
         "blockers": blockers,
         "rulenix_owned_exposure": owned,

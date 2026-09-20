@@ -214,8 +214,8 @@ class ShadowWriter:
             observation.strategy,
             observation.instrument,
             observation.input_version,
-            json.dumps(observation.rust_decision, default=_json_default, separators=(",", ":")),
-            json.dumps(observation.python_decision, default=_json_default, separators=(",", ":")),
+            observation.rust_decision,
+            observation.python_decision,
             observation.classification,
             observation.mismatch_reason,
             observation.severity,
@@ -251,7 +251,7 @@ class ShadowWriter:
                 self.release,
                 healthy,
                 detail[:512],
-                json.dumps(counts, separators=(",", ":")),
+                counts,
             )
 
 
