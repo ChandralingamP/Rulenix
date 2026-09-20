@@ -82,3 +82,9 @@ def test_demo_trial_image_excludes_all_broker_and_api_packages() -> None:
     assert "COPY app/demo_trial" in dockerfile
     for forbidden in ("app/broker", "app/api", "app/reconciliation", "app/trading", "app/main.py"):
         assert forbidden not in dockerfile
+
+
+def test_cycle_keys_are_release_scoped_for_fresh_code_evidence() -> None:
+    source = (ROOT / "python-backend" / "app" / "demo_trial" / "service.py").read_text()
+    assert 'f"replay:{self.settings.release}:' in source
+    assert 'f"real:{self.settings.release}:' in source

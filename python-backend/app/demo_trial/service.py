@@ -99,7 +99,9 @@ class DemoTrialService:
                     oracle=oracle,
                     account_ref=account_ref,
                     source_kind="DETERMINISTIC_PRODUCTION_DERIVED_REPLAY",
-                    cycle_key=f"replay:{scenario.scenario_id}:{account_ref}",
+                    cycle_key=(
+                        f"replay:{self.settings.release}:{scenario.scenario_id}:{account_ref}"
+                    ),
                     scheduled_for=self.started_at,
                 )
         closed = int(market["iso_day"]) >= 6 or (
@@ -129,7 +131,10 @@ class DemoTrialService:
                     oracle=oracle,
                     account_ref="phase12-production-session",
                     source_kind="REAL_PRODUCTION_DEMO_OBSERVATION",
-                    cycle_key=f"real:{market['trade_date']}:{strategy}:{observation_kind}",
+                    cycle_key=(
+                        f"real:{self.settings.release}:{market['trade_date']}:"
+                        f"{strategy}:{observation_kind}"
+                    ),
                     scheduled_for=datetime.now(UTC),
                 )
         self.counts.update(await repository.summary())
