@@ -106,13 +106,21 @@ class DemoTrialService:
             not bool(market["morning_open"]) and not bool(market["evening_open"])
         )
         if closed:
-            for strategy, instrument in (
-                ("futures_breakout_v3", "PRODUCTION_SESSION"),
-                ("supertrend_index_options_v1", "PRODUCTION_SESSION"),
+            actual = [("futures_breakout_v3", ExitKind.NO_SIGNAL, "no-signal")]
+            if int(market["supertrend_eod_signals"]) > 0 and int(market["supertrend_eod_users"]) == 0:
+                actual.append(
+                    ("supertrend_index_options_v1", ExitKind.EOD_NO_POSITION, "eod-no-position")
+                )
+            elif (
+                int(market["supertrend_eod_signals"]) == 0
+                and int(market["supertrend_entry_signals"]) == 0
             ):
+                actual.append(("supertrend_index_options_v1", ExitKind.NO_SIGNAL, "no-signal"))
+            for strategy, exit_kind, observation_kind in actual:
+                instrument = "PRODUCTION_SESSION"
                 scenario = DemoScenario(
                     f"real-{market['trade_date']}-{strategy}", strategy, instrument, "BUY", 1,
-                    Decimal(1), Decimal(1), Decimal(1), Decimal(1), ExitKind.NO_SIGNAL,
+                    Decimal(1), Decimal(1), Decimal(1), Decimal(1), exit_kind,
                 )
                 oracle = evaluate_scenario(scenario).json()
                 await self._execute(
@@ -121,7 +129,7 @@ class DemoTrialService:
                     oracle=oracle,
                     account_ref="phase12-production-session",
                     source_kind="REAL_PRODUCTION_DEMO_OBSERVATION",
-                    cycle_key=f"real:{market['trade_date']}:{strategy}:closed",
+                    cycle_key=f"real:{market['trade_date']}:{strategy}:{observation_kind}",
                     scheduled_for=datetime.now(UTC),
                 )
         self.counts.update(await repository.summary())
@@ -131,7 +139,11 @@ class DemoTrialService:
             healthy=True,
             detail=(
                 f"DEMO trial poll complete; production_session_closed={closed}; "
-                f"weekend_skips={market['weekend_skips']}; production_signals={market['signals']}"
+                f"weekend_skips={market['weekend_skips']}; "
+                f"futures_signals={market['futures_signals']}; "
+                f"supertrend_entry_signals={market['supertrend_entry_signals']}; "
+                f"supertrend_eod_signals={market['supertrend_eod_signals']}; "
+                f"supertrend_eod_users={market['supertrend_eod_users']}"
             ),
             counts=self.counts,
         )

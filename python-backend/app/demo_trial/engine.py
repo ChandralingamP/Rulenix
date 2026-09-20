@@ -63,6 +63,24 @@ def evaluate_scenario(scenario: DemoScenario) -> DemoDecision:
             None,
             Decimal("0.00"),
         )
+    if scenario.exit_kind is ExitKind.EOD_NO_POSITION:
+        return DemoDecision(
+            True,
+            "eod_no_open_demo_position",
+            1,
+            0,
+            0,
+            0,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            "EOD",
+            None,
+            Decimal("0.00"),
+        )
     if min(scenario.entry, scenario.target, scenario.sl1, scenario.sl2) <= 0:
         raise ValueError("price levels must be positive")
     expected_exit = {

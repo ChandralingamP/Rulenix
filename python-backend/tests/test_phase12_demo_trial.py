@@ -65,6 +65,18 @@ def test_kill_switch_and_no_signal_create_no_state() -> None:
         assert decision.trade_count == 0
 
 
+def test_eod_without_open_demo_position_records_signal_but_creates_no_execution_state() -> None:
+    scenario, _ = load_scenarios()[0]
+    decision = evaluate_scenario(replace(scenario, exit_kind=ExitKind.EOD_NO_POSITION))
+    assert decision.reason == "eod_no_open_demo_position"
+    assert decision.signal_count == 1
+    assert decision.intent_count == decision.order_count == decision.trade_count == 0
+    assert decision.side is None and decision.quantity == 0
+    assert decision.entry is decision.target is decision.sl1 is decision.sl2 is None
+    assert decision.exit_reason == "EOD" and decision.exit_price is None
+    assert decision.pnl == Decimal("0.00")
+
+
 def test_demo_trial_image_excludes_all_broker_and_api_packages() -> None:
     dockerfile = (ROOT / "python-backend" / "Dockerfile.demo-trial").read_text()
     assert "COPY app/demo_trial" in dockerfile

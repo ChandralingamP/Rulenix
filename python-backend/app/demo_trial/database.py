@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -68,7 +69,19 @@ class ProductionReader:
                            AND r.last_error='Weekend') AS weekend_skips,
                        (SELECT COUNT(*) FROM public.strategy_signals s
                          WHERE (s.signal_at AT TIME ZONE 'Asia/Kolkata')::date=clock.trade_date
-                           AND s.strategy_key IN ('futures_breakout_v3','supertrend_index_options_v1')) AS signals,
+                           AND s.strategy_key='futures_breakout_v3') AS futures_signals,
+                       (SELECT COUNT(*) FROM public.strategy_signals s
+                         WHERE (s.signal_at AT TIME ZONE 'Asia/Kolkata')::date=clock.trade_date
+                           AND s.strategy_key='supertrend_index_options_v1'
+                           AND s.signal_type<>'SQUARE_OFF') AS supertrend_entry_signals,
+                       (SELECT COUNT(*) FROM public.strategy_signals s
+                         WHERE (s.signal_at AT TIME ZONE 'Asia/Kolkata')::date=clock.trade_date
+                           AND s.strategy_key='supertrend_index_options_v1'
+                           AND s.signal_type='SQUARE_OFF') AS supertrend_eod_signals,
+                       COALESCE((SELECT SUM(s.expected_users) FROM public.strategy_signals s
+                         WHERE (s.signal_at AT TIME ZONE 'Asia/Kolkata')::date=clock.trade_date
+                           AND s.strategy_key='supertrend_index_options_v1'
+                           AND s.signal_type='SQUARE_OFF'),0) AS supertrend_eod_users,
                        COALESCE((SELECT enabled FROM public.risk_kill_switches WHERE user_id IS NULL),FALSE) AS global_kill
                   FROM clock LEFT JOIN public.market_calendar calendar USING(trade_date)
             """)
@@ -161,12 +174,14 @@ class TrialRepository:
         actual = decision.json()
         base = str(cycle_id)
         async with self.pool.acquire() as connection, connection.transaction():
-                if decision.signal_count:
+                if decision.signal_count and decision.side is not None and decision.entry is not None:
                     await connection.execute("""
                         INSERT INTO rulenix_demo_trial.signals(id,cycle_id,signal_type,side,price)
                         VALUES($1,$2,'ENTRY',$3,$4) ON CONFLICT(cycle_id) DO NOTHING
                     """, uuid5(NAMESPACE_URL, base + ":signal"), cycle_id, decision.side, decision.entry)
-                    roles = [("ENTRY", decision.side, decision.entry)]
+                    roles: list[tuple[str, str, Decimal | None]] = [
+                        ("ENTRY", decision.side, decision.entry)
+                    ]
                     exit_side = "SELL" if decision.side == "BUY" else "BUY"
                     roles.append((decision.exit_reason or "EXIT", exit_side, decision.exit_price))
                     if decision.reversal_side:

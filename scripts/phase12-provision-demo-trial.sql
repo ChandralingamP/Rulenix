@@ -147,7 +147,7 @@ GRANT SELECT(trade_date,morning_open,evening_open,reason)
   ON public.market_calendar TO rulenix_demo_trial_reader;
 GRANT SELECT(strategy_key,trade_date,status,last_error)
   ON public.strategy_scheduler_runs TO rulenix_demo_trial_reader;
-GRANT SELECT(strategy_key,signal_at)
+GRANT SELECT(strategy_key,signal_at,signal_type,expected_users)
   ON public.strategy_signals TO rulenix_demo_trial_reader;
 GRANT SELECT(user_id,enabled)
   ON public.risk_kill_switches TO rulenix_demo_trial_reader;

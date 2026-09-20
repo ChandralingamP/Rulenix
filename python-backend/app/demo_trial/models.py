@@ -14,6 +14,7 @@ class ExitKind(StrEnum):
     SL1 = "SL1"
     SL2 = "SL2"
     EOD = "EOD"
+    EOD_NO_POSITION = "EOD_NO_POSITION"
     MANUAL_CLOSE = "MANUAL_CLOSE"
     KILL_SWITCH = "KILL_SWITCH"
 
