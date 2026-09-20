@@ -95,8 +95,8 @@ class SafetyRepository:
                 (
                     await self.session.execute(
                         text("""
-                SELECT COUNT(*) FILTER (WHERE status IN ('open','operator_required')) AS incidents,
-                       COUNT(*) FILTER (WHERE status='open' AND (ownership_status='detected_unattributed' OR incident_type='UNMAPPED_BROKER_POSITION')) AS protection_incidents
+                SELECT COUNT(*) FILTER (WHERE status IN ('open','operator_required') AND ownership_status<>'manual_external') AS incidents,
+                       COUNT(*) FILTER (WHERE status='open' AND ownership_status='ambiguous') AS protection_incidents
                   FROM broker_position_incidents WHERE user_id=:user
             """),
                         {"user": request.user_id},
@@ -194,6 +194,30 @@ class SafetyRepository:
                 )
             )
 
+        broker_contract_collision = False
+        if (
+            request.execution_mode == "live"
+            and request.action in {ActionKind.ENTRY, ActionKind.SL2_REVERSAL}
+            and request.exchange_segment
+            and request.contract_token
+            and user["broker_credential_revision"] is not None
+        ):
+            broker_contract_collision = bool(await self.session.scalar(text("""
+                SELECT EXISTS(
+                    SELECT 1 FROM broker_exposure_observations
+                     WHERE user_id=:user
+                       AND UPPER(exchange_segment)=UPPER(:exchange)
+                       AND contract_token=:token
+                       AND ownership_status IN ('manual_external','ambiguous')
+                       AND broker_credential_revision=:revision
+                       AND observed_at>=NOW()-INTERVAL '5 minutes'
+                )
+            """), {
+                "user": request.user_id, "exchange": request.exchange_segment,
+                "token": request.contract_token,
+                "revision": user["broker_credential_revision"],
+            }))
+
         limits_row = (
             (
                 await self.session.execute(
@@ -278,6 +302,7 @@ class SafetyRepository:
             pending_intent=pending,
             ambiguous_mutation=ambiguous,
             duplicate_exposure=duplicate,
+            broker_contract_collision=broker_contract_collision,
             existing_quantity=existing_quantity,
             limits=limits,
             projected=projected,

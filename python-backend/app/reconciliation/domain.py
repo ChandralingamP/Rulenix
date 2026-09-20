@@ -29,6 +29,12 @@ class EvidenceStatus(StrEnum):
         return self is EvidenceStatus.SUCCESS
 
 
+class ExposureOwnership(StrEnum):
+    RULENIX_OWNED = "rulenix_owned"
+    MANUAL_EXTERNAL = "manual_external"
+    AMBIGUOUS = "ambiguous"
+
+
 T = TypeVar("T")
 
 
@@ -83,6 +89,8 @@ class BrokerOrder:
     android_synthetic: bool = False
     order_shape: str = ""
     updated_at: datetime | None = None
+    client_order_id: str = ""
+    ownership: ExposureOwnership | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,7 @@ class BrokerFill:
     price: Decimal
     filled_at: datetime
     owned_by_rulenix: bool = False
+    order_tag: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,37 @@ class ConditionalRule:
     rule_id: str
     active: bool = True
     order_id: str | None = None
+    exchange: str = ""
+    token: str = ""
+    symbol: str = ""
+    side: str = ""
+    quantity: int = 0
+
+
+@dataclass(frozen=True)
+class DeploymentDecision:
+    deployment_safe: bool
+    live_ready: bool
+    classification: str
+    local_unresolved: int
+
+
+@dataclass(frozen=True)
+class ManualCloseEvidence:
+    trade_id: UUID
+    user_id: UUID
+    broker_credential_revision: int
+    exchange: str
+    token: str
+    symbol: str
+    close_side: str
+    filled_quantity: int
+    weighted_fill_price: Decimal
+    broker_order_ids: tuple[str, ...]
+    first_fill_at: datetime
+    last_fill_at: datetime
+    observed_at: datetime
+    consumed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +278,8 @@ def classify_manual_broker_close(
     conflicting_executable_sibling: bool = False,
     local_trade_count: int = 1,
     local_direction: str | None = None,
+    evidence_since: datetime | None = None,
+    known_order_ids: frozenset[str] = frozenset(),
 ) -> ManualCloseClassification:
     if not (local_open and local_trade_count == 1 and positions_succeeded and order_book_succeeded and fills_succeeded):
         return ManualCloseClassification.RECONCILIATION_REQUIRED
@@ -246,15 +288,173 @@ def classify_manual_broker_close(
     attributable = [
         fill for fill in fills
         if fill.symbol == local_symbol and fill.token == local_token and fill.exchange == local_exchange
-        and fill.filled_at > entry_at and fill.quantity > 0
+        and fill.filled_at >= entry_at and fill.quantity > 0
+        and (evidence_since is None or fill.filled_at >= evidence_since)
         and not fill.owned_by_rulenix
+        and fill.order_id not in known_order_ids
         and (local_direction is None or fill.side.upper() == ("SELL" if local_direction.upper() == "BUY" else "BUY"))
     ]
     if conflicting_executable_sibling or sum(fill.quantity for fill in attributable) != remaining_quantity:
         return ManualCloseClassification.RECONCILIATION_REQUIRED
-    if not attributable or len({fill.order_id for fill in attributable}) != len({fill.order_id for fill in fills if fill in attributable}):
+    if not attributable:
         return ManualCloseClassification.RECONCILIATION_REQUIRED
     return ManualCloseClassification.MANUAL_BROKER_CLOSE
+
+
+def _rulenix_order_tag(value: str) -> bool:
+    normalized = value.strip().upper()
+    return (
+        len(normalized) == 20
+        and normalized.startswith("RX")
+        and all(character in "0123456789ABCDEF" for character in normalized[2:])
+    )
+
+
+def classify_order_ownership(
+    order: BrokerOrder,
+    *,
+    known_broker_ids: frozenset[str] = frozenset(),
+    known_client_ids: frozenset[str] = frozenset(),
+) -> ExposureOwnership:
+    if order.ownership is not None:
+        return order.ownership
+    if order.order_id in known_broker_ids or (
+        order.client_order_id and order.client_order_id in known_client_ids
+    ):
+        return ExposureOwnership.RULENIX_OWNED
+    if order.owned_by_rulenix:
+        return ExposureOwnership.RULENIX_OWNED
+    if _rulenix_order_tag(order.client_order_id):
+        return ExposureOwnership.AMBIGUOUS
+    if (
+        order.order_id
+        and order.exchange
+        and order.token
+        and order.side.upper() in {"BUY", "SELL"}
+        and order.quantity > 0
+    ):
+        return ExposureOwnership.MANUAL_EXTERNAL
+    return ExposureOwnership.AMBIGUOUS
+
+
+def classify_position_ownership(
+    position: BrokerPosition,
+    *,
+    fills: Sequence[BrokerFill],
+    orders: Sequence[BrokerOrder],
+    local_contracts: frozenset[tuple[str, str]] = frozenset(),
+    known_broker_ids: frozenset[str] = frozenset(),
+    known_client_ids: frozenset[str] = frozenset(),
+) -> ExposureOwnership:
+    contract = (position.exchange.upper(), position.token)
+    if contract in local_contracts:
+        return ExposureOwnership.RULENIX_OWNED
+    order_by_id = {order.order_id: order for order in orders if order.order_id}
+    totals = {ownership: 0 for ownership in ExposureOwnership}
+    matched = 0
+    for fill in fills:
+        if (fill.exchange.upper(), fill.token) != contract:
+            continue
+        matched += 1
+        source = order_by_id.get(fill.order_id)
+        if source is not None:
+            ownership = classify_order_ownership(
+                source,
+                known_broker_ids=known_broker_ids,
+                known_client_ids=known_client_ids,
+            )
+        elif (
+            fill.owned_by_rulenix
+            or fill.order_id in known_broker_ids
+            or (fill.order_tag and fill.order_tag in known_client_ids)
+        ):
+            ownership = ExposureOwnership.RULENIX_OWNED
+        elif _rulenix_order_tag(fill.order_tag):
+            ownership = ExposureOwnership.AMBIGUOUS
+        elif fill.order_id:
+            ownership = ExposureOwnership.MANUAL_EXTERNAL
+        else:
+            ownership = ExposureOwnership.AMBIGUOUS
+        if fill.side.upper() not in {"BUY", "SELL"}:
+            return ExposureOwnership.AMBIGUOUS
+        signed = fill.quantity if fill.side.upper() == "BUY" else -fill.quantity
+        totals[ownership] += signed
+    if (
+        matched
+        and totals[ExposureOwnership.RULENIX_OWNED] == position.quantity
+        and totals[ExposureOwnership.MANUAL_EXTERNAL] == 0
+        and totals[ExposureOwnership.AMBIGUOUS] == 0
+    ):
+        return ExposureOwnership.RULENIX_OWNED
+    if (
+        matched
+        and totals[ExposureOwnership.MANUAL_EXTERNAL] == position.quantity
+        and totals[ExposureOwnership.RULENIX_OWNED] == 0
+        and totals[ExposureOwnership.AMBIGUOUS] == 0
+    ):
+        return ExposureOwnership.MANUAL_EXTERNAL
+    return ExposureOwnership.AMBIGUOUS
+
+
+def classify_conditional_ownership(rule: ConditionalRule) -> ExposureOwnership:
+    if rule.rule_id and rule.exchange and rule.token and rule.quantity > 0:
+        return ExposureOwnership.MANUAL_EXTERNAL
+    return ExposureOwnership.AMBIGUOUS
+
+
+def deployment_account_decision(
+    *,
+    broker_readable: bool,
+    broker_exposure_observed: bool,
+    rulenix_owned_exposure: int,
+    ambiguous_exposure: int,
+    local_unresolved: int,
+) -> DeploymentDecision:
+    local_unresolved = max(local_unresolved, 0)
+    if broker_readable:
+        safe = (
+            rulenix_owned_exposure <= 0
+            and ambiguous_exposure <= 0
+            and local_unresolved == 0
+        )
+        classification = (
+            "readable_rulenix_owned_exposure"
+            if rulenix_owned_exposure > 0
+            else "readable_ambiguous_exposure"
+            if ambiguous_exposure > 0
+            else "readable_local_unresolved_live_state"
+            if local_unresolved
+            else "readable_safe"
+        )
+        return DeploymentDecision(safe, safe, classification, local_unresolved)
+    if broker_exposure_observed:
+        return DeploymentDecision(
+            False, False, "unreadable_broker_exposure_observed", local_unresolved
+        )
+    safe = local_unresolved == 0
+    return DeploymentDecision(
+        safe,
+        False,
+        "offline_locally_flat" if safe else "offline_with_unresolved_live_state",
+        local_unresolved,
+    )
+
+
+def exact_contract_collision(
+    *,
+    execution_mode: str,
+    exchange: str,
+    token: str,
+    observations: Sequence[tuple[str, str, ExposureOwnership]],
+) -> bool:
+    if execution_mode != "live":
+        return False
+    contract = (exchange.upper(), token)
+    return any(
+        (observed_exchange.upper(), observed_token) == contract
+        and ownership in {ExposureOwnership.MANUAL_EXTERNAL, ExposureOwnership.AMBIGUOUS}
+        for observed_exchange, observed_token, ownership in observations
+    )
 
 
 def is_synthetic_android_oco(*, order: BrokerOrder, position: ReadEvidence[Sequence[BrokerPosition]], individual: ReadEvidence[BrokerOrder | None], conditional_rules: ReadEvidence[Sequence[ConditionalRule]], fills: ReadEvidence[Sequence[BrokerFill]], executable_sibling: bool) -> bool:

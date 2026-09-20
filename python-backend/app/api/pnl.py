@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..dependencies import Principal, current_user, get_db
 from ..errors import DomainError
+from ..trading.domain import futures_pnl_units, trade_pnl
 from ..trading.repository import TradingRepository
 
 router = APIRouter(tags=["pnl"])
@@ -68,15 +70,89 @@ async def export_pnl(page: int = Query(1), page_size: int = Query(20), mode: str
 
 @router.post("/pnl/trades/{trade_id}/close")
 async def close_trade(trade_id: UUID, user: Principal = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    row = (await db.execute(text("SELECT status,execution_mode,quantity FROM trades WHERE id=:id AND user_id=:user FOR UPDATE"), {"id": trade_id, "user": user.id})).mappings().first()
+    await db.execute(text("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))"))
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:user,0))"),
+        {"user": str(user.id)},
+    )
+    row = (await db.execute(text("""
+        SELECT t.status,t.execution_mode,t.direction,t.quantity,t.total_lots,t.entry_price,t.pnl,
+               t.strategy_key,t.instrument_label,UPPER(s.exchange_segment) AS exchange_segment,
+               s.contract_token,s.lot_size
+          FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.id=:id AND t.user_id=:user FOR UPDATE OF t
+    """), {"id": trade_id, "user": user.id})).mappings().first()
     if row is None:
         raise DomainError(404, "Trade was not found.")
     if row["status"] == "closed":
         return {"trade_id": str(trade_id), "status": "completed", "message": "Trade is already closed."}
+    if row["execution_mode"] == "demo":
+        if row["status"] != "open" or int(row["quantity"] or 0) <= 0:
+            raise DomainError(400, "Only an eligible running DEMO trade can be closed locally.")
+        orders = (await db.execute(text("""
+            SELECT status FROM strategy_orders
+             WHERE trade_id=:trade AND execution_mode='demo'
+               AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+             FOR UPDATE
+        """), {"trade": trade_id})).scalars().all()
+        if "processing" in orders:
+            raise DomainError(400, "A DEMO exit fill is already being processed; refresh the trade before closing it.")
+        max_age = await db.scalar(text("""
+            SELECT COALESCE(u.max_price_age_seconds,g.max_price_age_seconds)::int
+              FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=:user
+             WHERE g.user_id IS NULL
+        """), {"user": user.id})
+        exit_price = await db.scalar(text("""
+            SELECT price FROM market_price_ticks
+             WHERE exchange_segment=:exchange AND contract_token=:token
+               AND received_at>NOW()-(:age * INTERVAL '1 second') AND price>0
+             ORDER BY received_at DESC LIMIT 1
+        """), {
+            "exchange": row["exchange_segment"], "token": row["contract_token"],
+            "age": max(int(max_age or 1), 1),
+        })
+        if exit_price is None or Decimal(str(exit_price)) <= 0:
+            raise DomainError(400, "DEMO close stopped because no fresh valid market price is available.")
+        quantity = int(row["quantity"])
+        realized = Decimal(str(row["pnl"] or 0)) + trade_pnl(
+            row["direction"], row["entry_price"], exit_price,
+            futures_pnl_units(row["instrument_label"], quantity, row["lot_size"]),
+        )
+        reporting_quantity = (
+            int(row["total_lots"] or 0) * max(int(row["lot_size"] or 1), 1)
+            if row["strategy_key"] == "futures_breakout_v3" else quantity
+        )
+        await db.execute(text("""
+            UPDATE strategy_orders
+               SET status='cancelled',broker_status='DEMO order terminalized by user close',
+                   state_version=state_version+1,updated_at=NOW()
+             WHERE trade_id=:trade AND execution_mode='demo'
+               AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','cancelling')
+        """), {"trade": trade_id})
+        changed = await db.execute(text("""
+            UPDATE trades SET status='closed',safety_status='CLOSED',quantity=:quantity,
+                   remaining_lots=0,exit_price=:price,last_price=:price,pnl=:pnl,
+                   exit_datetime=NOW(),exit_reason='MANUAL_RULENIX_CLOSE',
+                   notes=CONCAT(notes,'; running DEMO trade closed locally by user'),updated_at=NOW()
+             WHERE id=:trade AND user_id=:user AND execution_mode='demo' AND status='open'
+        """), {"trade": trade_id, "user": user.id, "quantity": reporting_quantity,
+                 "price": exit_price, "pnl": realized})
+        if int(getattr(changed, "rowcount", 0) or 0) != 1:
+            raise DomainError(400, "DEMO trade state changed while the close was being processed; refresh and try again.")
+        await db.commit()
+        return {
+            "trade_id": str(trade_id), "status": "completed", "execution_mode": "demo",
+            "exit_price": exit_price, "pnl": realized,
+            "message": "DEMO trade closed locally at the latest authoritative simulated price.",
+        }
     if row["execution_mode"] != "live":
-        raise DomainError(400, "Close Trade is currently available only for running LIVE trades.")
+        raise DomainError(400, "Close Trade is available only for running DEMO or LIVE trades.")
     # Preserve the durable intent, but stop before any Angel mutation.  The
     # frontend receives an explicit migration-safe error, never fake success.
-    await TradingRepository(db).request_manual_close(trade_id=trade_id, user_id=UUID(user.id), requested_quantity=int(row["quantity"]))
+    await TradingRepository(db).request_manual_close(
+        trade_id=trade_id,
+        user_id=UUID(str(user.id)),
+        requested_quantity=int(row["quantity"]),
+    )
     await db.commit()
     raise DomainError(503, "LIVE manual close is queued for broker reconciliation; Python Angel mutation transport is disabled.", code="python_live_mutation_disabled")

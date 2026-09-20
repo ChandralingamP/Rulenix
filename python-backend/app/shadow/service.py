@@ -28,8 +28,10 @@ class HealthState:
     last_success_at: datetime | None = None
     last_error: str = ""
     consecutive_failures: int = 0
+    last_advance_at: datetime | None = None
+    last_successful_dispatch_at: datetime | None = None
     counts: dict[str, int] = field(
-        default_factory=lambda: {"decisions": 0, "matches": 0, "mismatches": 0, "errors": 0}
+        default_factory=lambda: {"decisions": 0, "matches": 0, "mismatches": 0, "errors": 0, "advances": 0, "dispatches": 0}
     )
 
     def ready(self, poll_seconds: int) -> bool:
@@ -38,6 +40,14 @@ class HealthState:
             and self.last_success_at >= datetime.now(UTC).replace(microsecond=0)
             - timedelta(seconds=poll_seconds * 3)
         )
+
+    def advance(self) -> None:
+        self.last_advance_at = datetime.now(UTC)
+        self.counts["advances"] += 1
+
+    def dispatched(self) -> None:
+        self.last_successful_dispatch_at = datetime.now(UTC)
+        self.counts["dispatches"] += 1
 
 
 def _input_version(row: dict[str, Any]) -> str:
@@ -124,6 +134,7 @@ class ShadowObserver:
         inserted = await sink.store(observation)
         self._remember("strategy_signal", source_id)
         if inserted:
+            self.health.dispatched()
             self.health.counts["decisions"] += 1
             key = {
                 "MATCH": "matches",
@@ -159,12 +170,14 @@ class ShadowObserver:
         inserted = await sink.store(observation)
         self._remember("readiness", source_id)
         if inserted:
+            self.health.dispatched()
             self.health.counts["decisions"] += 1
             self.health.counts[
                 "matches" if classification == "MATCH" else "mismatches"
             ] += 1
 
     async def poll(self, source: SourceReader, sink: ShadowWriter) -> None:
+        self.health.advance()
         for row in await source.signals(self.settings.lookback_hours, self.settings.batch_size):
             await self._observe_signal(source, sink, row)
         for row in await source.readiness():
@@ -225,6 +238,12 @@ async def _health_handler(
                 if observer.health.last_success_at
                 else None,
                 "last_error": observer.health.last_error,
+                "scheduler_leader": False,
+                "last_advance_at": observer.health.last_advance_at.isoformat()
+                if observer.health.last_advance_at else None,
+                "last_successful_dispatch_at": observer.health.last_successful_dispatch_at.isoformat()
+                if observer.health.last_successful_dispatch_at else None,
+                "stale": not ready,
                 "counts": observer.health.counts,
                 "mode": "shadow_observer_only",
             },

@@ -50,6 +50,7 @@ class ReasonCode(str, Enum):
     AMBIGUOUS_MUTATION = "ambiguous_mutation"
     PROTECTION_INCIDENT = "protection_incident"
     DUPLICATE_EXPOSURE = "duplicate_exposure"
+    BROKER_INSTRUMENT_COLLISION = "broker_instrument_collision"
     OVER_CLOSE = "over_close"
     OWNERSHIP_MISMATCH = "ownership_mismatch"
     ACCOUNT_UNSAFE = "unsafe_account"
@@ -148,6 +149,8 @@ class SafetyRequest:
     intent_id: UUID | None = None
     strategy_key: str | None = None
     instrument: str | None = None
+    exchange_segment: str | None = None
+    contract_token: str | None = None
     side: str | None = None
     quantity: int = 0
     attributable_quantity: int = 0
@@ -180,6 +183,7 @@ class SafetyState:
     pending_intent: bool = False
     ambiguous_mutation: bool = False
     duplicate_exposure: bool = False
+    broker_contract_collision: bool = False
     existing_quantity: int = 0
     limits: Mapping[str, Decimal | int | float | None] = field(default_factory=dict)
     projected: Mapping[str, Decimal | int | float] = field(default_factory=dict)
@@ -408,6 +412,13 @@ def evaluate(request: SafetyRequest, state: SafetyState) -> SafetyDecision:
             action_class,
             ReasonCode.DUPLICATE_EXPOSURE,
             "Equivalent exposure already exists or is pending.",
+            **common,
+        )
+    if request.execution_mode == "live" and state.broker_contract_collision:
+        return SafetyDecision.block(
+            action_class,
+            ReasonCode.BROKER_INSTRUMENT_COLLISION,
+            "Manual or ambiguous broker exposure already exists for this exact contract.",
             **common,
         )
     if state.blockers:

@@ -156,10 +156,14 @@ class SourceReader:
                        safety.open_live_trades+safety.unresolved_closed_live_trades+
                        safety.unresolved_live_orders+safety.unresolved_live_execution_intents+
                        safety.unresolved_live_reversals+safety.unresolved_live_manual_closes+
-                       safety.unresolved_broker_incidents+safety.unresolved_broker_mutations AS blockers
+                       safety.unresolved_broker_incidents+safety.unresolved_broker_mutations AS blockers,
+                       COALESCE(blocker.rulenix_owned_exposure,0) AS rulenix_owned_exposure,
+                       COALESCE(blocker.ambiguous_exposure,0) AS ambiguous_exposure,
+                       COALESCE(blocker.manual_external_exposure,0) AS manual_external_exposure
                   FROM public.broker_reconciliation_health h
                   JOIN public.broker_deployment_account_safety safety ON safety.user_id=h.user_id
                   JOIN public.user_profiles profile ON profile.user_id=h.user_id
+                  LEFT JOIN public.broker_reconciliation_blockers blocker ON blocker.user_id=h.user_id
                 """
             )
         result = []

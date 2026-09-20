@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .domain import ReconciliationSnapshot
+from .domain import ManualCloseEvidence, ReconciliationSnapshot
 
 
 class ReconciliationRepository:
@@ -36,7 +38,7 @@ class ReconciliationRepository:
         """), {"user": snapshot.user_id, "healthy": healthy, "detail": detail[:4000], "revision": snapshot.credential_revision if healthy else None})
         return healthy
 
-    async def record_blockers(self, snapshot: ReconciliationSnapshot, *, external_active_orders: int = 0, structurally_unknown_orders: int = 0, active_conditional_rules: int = 0) -> None:
+    async def record_blockers(self, snapshot: ReconciliationSnapshot, *, rulenix_owned_exposure: int = 0, ambiguous_exposure: int = 0, manual_external_exposure: int = 0) -> None:
         if not snapshot.authoritative:
             await self.session.execute(text("""
                 INSERT INTO broker_reconciliation_blockers(user_id,status,detail,first_detected_at,last_checked_at)
@@ -44,15 +46,33 @@ class ReconciliationRepository:
                 ON CONFLICT(user_id) DO UPDATE SET status='open',detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL
             """), {"user": snapshot.user_id, "detail": f"Incomplete broker evidence: {snapshot.failure_detail}"[:4000]})
             return
-        detail = "Authoritative reconciliation found no unresolved broker mutations." if not any((external_active_orders, structurally_unknown_orders, active_conditional_rules)) else "Broker evidence contains unresolved external state."
-        status = "open" if any((external_active_orders, structurally_unknown_orders, active_conditional_rules)) else "resolved"
+        detail = "Authoritative reconciliation found no unresolved Rulenix-owned or ambiguous broker mutations." if not any((rulenix_owned_exposure, ambiguous_exposure)) else "Broker evidence contains unresolved Rulenix-owned or ambiguous state."
+        status = "open" if any((rulenix_owned_exposure, ambiguous_exposure)) else "resolved"
         await self.session.execute(text("""
-            INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,detail,first_detected_at,last_checked_at,resolved_at)
-            VALUES(:user,CAST(:status AS varchar(16)),:external,:unknown,:conditional,:detail,NOW(),NOW(),CASE WHEN CAST(:status AS varchar(16))='resolved' THEN NOW() ELSE NULL END)
+            INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure,detail,first_detected_at,last_checked_at,resolved_at)
+            VALUES(:user,CAST(:status AS varchar(16)),0,:ambiguous,0,:owned,:ambiguous,:manual,:detail,NOW(),NOW(),CASE WHEN CAST(:status AS varchar(16))='resolved' THEN NOW() ELSE NULL END)
             ON CONFLICT(user_id) DO UPDATE SET status=EXCLUDED.status,external_active_orders=EXCLUDED.external_active_orders,
               structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=EXCLUDED.active_conditional_rules,
+              rulenix_owned_exposure=EXCLUDED.rulenix_owned_exposure,ambiguous_exposure=EXCLUDED.ambiguous_exposure,
+              manual_external_exposure=EXCLUDED.manual_external_exposure,
               detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=EXCLUDED.resolved_at
-        """), {"user": snapshot.user_id, "status": status, "external": external_active_orders, "unknown": structurally_unknown_orders, "conditional": active_conditional_rules, "detail": detail})
+        """), {"user": snapshot.user_id, "status": status, "owned": rulenix_owned_exposure, "ambiguous": ambiguous_exposure, "manual": manual_external_exposure, "detail": detail})
+
+    async def replace_exposure_observations(
+        self, *, user_id: UUID, credential_revision: int,
+        observations: list[dict[str, object]],
+    ) -> None:
+        await self.session.execute(
+            text("DELETE FROM broker_exposure_observations WHERE user_id=:user"), {"user": user_id}
+        )
+        for observation in observations:
+            await self.session.execute(text("""
+                INSERT INTO broker_exposure_observations(
+                  user_id,exposure_kind,broker_reference,ownership_status,exchange_segment,
+                  contract_token,contract_symbol,side,quantity,evidence,broker_credential_revision)
+                VALUES(:user,:kind,:reference,:ownership,:exchange,:token,:symbol,:side,
+                  :quantity,:evidence,:revision)
+            """), {"user": user_id, "revision": credential_revision, **observation})
 
     async def record_position_incident(self, *, user_id: UUID, strategy_key: str, instrument: str, exchange_segment: str, contract_token: str, contract_symbol: str, incident_type: str, broker_quantity: int, local_quantity: int, detail: str, trade_id: UUID | None = None, broker_average_price: float | None = None) -> None:
         await self.session.execute(text("""
@@ -79,6 +99,67 @@ class ReconciliationRepository:
     async def deployment_safe(self, user_id: UUID) -> bool:
         row = (await self.session.execute(text("SELECT open_live_trades,unresolved_closed_live_trades,unresolved_live_orders,unresolved_live_execution_intents,unresolved_live_reversals,unresolved_live_manual_closes,unresolved_broker_incidents,unresolved_broker_mutations FROM broker_deployment_account_safety WHERE user_id=:user"), {"user": user_id})).mappings().first()
         return row is not None and all(int(value or 0) == 0 for value in row.values())
+
+    async def store_manual_close_evidence(self, evidence: ManualCloseEvidence) -> None:
+        await self.session.execute(text("""
+            INSERT INTO manual_broker_close_evidence(
+              trade_id,user_id,broker_credential_revision,exchange_segment,contract_token,
+              contract_symbol,close_side,filled_quantity,weighted_fill_price,broker_order_ids,
+              first_fill_at,last_fill_at,observed_at,consumed_at)
+            VALUES(:trade,:user,:revision,:exchange,:token,:symbol,:side,:quantity,:price,
+              :orders,:first_fill,:last_fill,:observed,:consumed)
+            ON CONFLICT(trade_id) DO UPDATE SET
+              broker_credential_revision=EXCLUDED.broker_credential_revision,
+              exchange_segment=EXCLUDED.exchange_segment,contract_token=EXCLUDED.contract_token,
+              contract_symbol=EXCLUDED.contract_symbol,close_side=EXCLUDED.close_side,
+              filled_quantity=EXCLUDED.filled_quantity,weighted_fill_price=EXCLUDED.weighted_fill_price,
+              broker_order_ids=EXCLUDED.broker_order_ids,first_fill_at=EXCLUDED.first_fill_at,
+              last_fill_at=EXCLUDED.last_fill_at,observed_at=EXCLUDED.observed_at,
+              consumed_at=EXCLUDED.consumed_at
+        """), {
+            "trade": evidence.trade_id, "user": evidence.user_id,
+            "revision": evidence.broker_credential_revision, "exchange": evidence.exchange,
+            "token": evidence.token, "symbol": evidence.symbol, "side": evidence.close_side,
+            "quantity": evidence.filled_quantity, "price": evidence.weighted_fill_price,
+            "orders": list(evidence.broker_order_ids), "first_fill": evidence.first_fill_at,
+            "last_fill": evidence.last_fill_at, "observed": evidence.observed_at,
+            "consumed": evidence.consumed_at,
+        })
+
+    async def load_manual_close_evidence(
+        self, *, trade_id: UUID, user_id: UUID, credential_revision: int
+    ) -> ManualCloseEvidence | None:
+        row = (await self.session.execute(text("""
+            SELECT trade_id,user_id,broker_credential_revision,exchange_segment,contract_token,
+                   contract_symbol,close_side,filled_quantity,weighted_fill_price,broker_order_ids,
+                   first_fill_at,last_fill_at,observed_at,consumed_at
+              FROM manual_broker_close_evidence
+             WHERE trade_id=:trade AND user_id=:user
+               AND broker_credential_revision=:revision AND consumed_at IS NULL
+        """), {"trade": trade_id, "user": user_id, "revision": credential_revision})).mappings().first()
+        if row is None:
+            return None
+        return ManualCloseEvidence(
+            trade_id=row["trade_id"], user_id=row["user_id"],
+            broker_credential_revision=int(row["broker_credential_revision"]),
+            exchange=str(row["exchange_segment"]), token=str(row["contract_token"]),
+            symbol=str(row["contract_symbol"]), close_side=str(row["close_side"]),
+            filled_quantity=int(row["filled_quantity"]),
+            weighted_fill_price=Decimal(row["weighted_fill_price"]),
+            broker_order_ids=tuple(row["broker_order_ids"]), first_fill_at=row["first_fill_at"],
+            last_fill_at=row["last_fill_at"], observed_at=row["observed_at"],
+            consumed_at=row["consumed_at"],
+        )
+
+    async def consume_manual_close_evidence(
+        self, *, trade_id: UUID, user_id: UUID, credential_revision: int, consumed_at: datetime
+    ) -> bool:
+        result = await self.session.execute(text("""
+            UPDATE manual_broker_close_evidence SET consumed_at=:consumed
+             WHERE trade_id=:trade AND user_id=:user
+               AND broker_credential_revision=:revision AND consumed_at IS NULL
+        """), {"trade": trade_id, "user": user_id, "revision": credential_revision, "consumed": consumed_at})
+        return bool(getattr(result, "rowcount", 0))
 
 
 __all__ = ["ReconciliationRepository"]

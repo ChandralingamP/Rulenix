@@ -104,6 +104,8 @@ GRANT SELECT(user_id,healthy,checked_at,broker_credential_revision)
 GRANT SELECT(user_id,broker_credential_revision)
   ON public.user_profiles TO rulenix_shadow_reader;
 GRANT SELECT ON public.broker_deployment_account_safety TO rulenix_shadow_reader;
+GRANT SELECT(user_id,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure)
+  ON public.broker_reconciliation_blockers TO rulenix_shadow_reader;
 
 GRANT INSERT,SELECT(source_kind,source_id,observer_release)
   ON rulenix_shadow.observations TO rulenix_shadow_writer;

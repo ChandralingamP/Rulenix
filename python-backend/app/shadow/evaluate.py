@@ -152,24 +152,56 @@ def evaluate_supertrend_signal(row: dict[str, Any]) -> tuple[dict[str, Any], dic
 
 
 def evaluate_readiness(row: dict[str, Any], observed_at: datetime) -> tuple[dict[str, Any], dict[str, Any], str, str, str]:
+    blockers = int(row.get("blockers", 0))
+    owned = int(row.get("rulenix_owned_exposure", 0))
+    ambiguous = int(row.get("ambiguous_exposure", 0))
+    manual = int(row.get("manual_external_exposure", 0))
+    broker_readable = bool(row["healthy"])
+    broker_exposure_observed = owned + ambiguous + manual > 0
+    deployment_safe = (
+        blockers == 0 and owned == 0 and ambiguous == 0
+        if broker_readable
+        else blockers == 0 and not broker_exposure_observed
+    )
+    deployment_classification = (
+        "readable_safe" if broker_readable and deployment_safe
+        else "readable_rulenix_owned_exposure" if broker_readable and owned
+        else "readable_ambiguous_exposure" if broker_readable and ambiguous
+        else "readable_local_unresolved_live_state" if broker_readable
+        else "offline_locally_flat" if deployment_safe
+        else "unreadable_broker_exposure_observed" if broker_exposure_observed
+        else "offline_with_unresolved_live_state"
+    )
     rust = {
         "ready": bool(row["healthy"]),
+        "deployment_safe": deployment_safe,
+        "deployment_classification": deployment_classification,
         "credential_revision": row.get("broker_credential_revision"),
         "checked_at": row["checked_at"],
-        "blockers": int(row["blockers"]),
+        "blockers": blockers,
+        "rulenix_owned_exposure": owned,
+        "ambiguous_exposure": ambiguous,
+        "manual_external_exposure": manual,
     }
     checked_at: datetime = row["checked_at"]
     python_ready = (
         bool(row["healthy"])
-        and int(row["blockers"]) == 0
+        and blockers == 0
+        and owned == 0
+        and ambiguous == 0
         and row.get("broker_credential_revision") == row.get("current_credential_revision")
         and checked_at >= observed_at - timedelta(minutes=5)
     )
     python = {
         "ready": python_ready,
+        "deployment_safe": deployment_safe,
+        "deployment_classification": deployment_classification,
         "credential_revision": row.get("current_credential_revision"),
         "checked_at": checked_at,
-        "blockers": int(row["blockers"]),
+        "blockers": blockers,
+        "rulenix_owned_exposure": owned,
+        "ambiguous_exposure": ambiguous,
+        "manual_external_exposure": manual,
     }
     classification, reason, severity = _compare(rust, python)
     return _render(rust), _render(python), classification, reason, severity
