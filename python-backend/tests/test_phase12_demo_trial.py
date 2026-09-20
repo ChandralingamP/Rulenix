@@ -6,9 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from app.demo_trial.config import DemoTrialSettings
 from app.demo_trial.engine import compare_decisions, evaluate_scenario
 from app.demo_trial.models import ExitKind
-from app.demo_trial.service import load_scenarios
+from app.demo_trial.service import DemoTrialService, load_scenarios
 
 ROOT = Path(__file__).parents[2]
 
@@ -88,3 +89,10 @@ def test_cycle_keys_are_release_scoped_for_fresh_code_evidence() -> None:
     source = (ROOT / "python-backend" / "app" / "demo_trial" / "service.py").read_text()
     assert 'f"replay:{self.settings.release}:' in source
     assert 'f"real:{self.settings.release}:' in source
+
+
+def test_poll_errors_are_distinct_from_parity_errors() -> None:
+    settings = DemoTrialSettings("postgresql://reader@db/r", "postgresql://writer@db/r", "release")
+    service = DemoTrialService(settings)
+    assert service.counts["errors"] == 0
+    assert service.counts["poll_errors"] == 0

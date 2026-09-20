@@ -46,7 +46,7 @@ class DemoTrialService:
         self.last_advance_at: datetime | None = None
         self.counts = {
             "cycles": 0, "matches": 0, "mismatches": 0, "errors": 0,
-            "real_observations": 0, "replay_observations": 0,
+            "poll_errors": 0, "real_observations": 0, "replay_observations": 0,
         }
 
     def ready(self) -> bool:
@@ -169,7 +169,7 @@ class DemoTrialService:
                     await self.poll(reader, repository)
                 except Exception as error:
                     self.last_error = type(error).__name__
-                    self.counts["errors"] += 1
+                    self.counts["poll_errors"] += 1
                     logger.exception("DEMO trial poll failed")
                     await repository.heartbeat(
                         healthy=False,
