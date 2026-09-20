@@ -281,3 +281,104 @@ FRONTEND STILL ROUTED TO RUST: YES
 ```
 
 PHASE 11: BLOCKED
+
+## Final completion — 2026-09-20
+
+Phase 11 completed against authoritative Rust production
+`ab14c3ca05ce91ad959b29ace66f623936cd4f76`. The deployed Python shadow code release is
+`743a99887b9f147241fcd1430306954d935865c2`. Rust remains the public backend, frontend target,
+scheduler leader, trading authority, and sole Angel mutation authority.
+
+| Rust change after the old baseline | Python catch-up | Evidence |
+|---|---|---|
+| Scheduler/feed liveness | Isolated single-flight progress, recovery, stale detection, telemetry | Scheduler matrix and 66-entry replay pass |
+| Durable external-close evidence | Exact attributable evidence survives later passes/restart; ambiguous/partial remains fail-closed | Focused reconciliation/PostgreSQL tests pass |
+| DEMO Close | Owner-scoped simulated close, quote/P&L and local cleanup; no broker path | API/domain tests pass |
+| Ownership-aware exposure | `RULENIX_OWNED`, `MANUAL_EXTERNAL`, `AMBIGUOUS` | Ownership/readiness tests pass |
+| Deployment versus LIVE readiness | Offline local-flat can deploy but cannot enter LIVE | Three production readiness comparisons match |
+| Exact-contract collision | Account/exchange/contract-scoped LIVE block; DEMO independent | Focused collision matrix passes |
+
+The extended production replay exposed two comparison defects and preserved their original rows.
+Rust persists strategy arithmetic through `f64`, while Python calculates with `Decimal`; observed
+differences were below `0.000001` and never changed side, contract, quantity, or a tradable tick.
+Rust also permits a nullable intent quantity and derives the effective entry quantity as current
+lot size multiplied by requested lots. The final comparator models those exact execution semantics
+with a tolerance far below one tick, while tests prove that one-cent, side, quantity, contract,
+and fan-out differences still fail.
+
+```text
+66-ENTRY REPLAY: PASS
+EXPECTED/DISPATCHED/EVALUATED/DEMO PATH: 66/66/66/66
+DUPLICATES/SCHEDULER MISSES: 0/0
+
+PHASE 10 AUDIT: PASS
+PYTHON TESTS: 190 passed, 2 skipped, 2 dependency-deprecation warnings
+HTTP: 39 executable differentials, 0 mismatches; 50/50 classified
+WEBSOCKETS: 2/2
+FUTURES BREAKOUT: 22/22
+SUPERTREND: 6/6
+DATABASE STATE: 8/8
+OCO: 12/12
+EOD: 4/4
+CRASH/RESTART: 5/5
+CONCURRENCY/STATE MACHINE/RISK-SAFETY: PASS
+RUFF: PASS
+MYPY: PASS - 79 source files
+```
+
+Implementation scope before report-only edits: 18 files, 1,368 additions, 53 deletions. There
+was no repository-wide formatting, dependency change, Rust runtime change, frontend change, or
+unrelated semantic change. The three pre-existing dirty production-gate files remain preserved
+and were excluded from all migration commits.
+
+The fresh deployment gate checked all four relevant accounts and every durable LIVE blocker
+category: local unresolved, Rulenix-owned, and ambiguous exposure were all zero. Unreadable
+accounts were classified `offline_locally_flat`, never broker-flat, and remain LIVE-unready.
+Manual broker activity was not changed.
+
+The fresh encrypted backup
+`/var/backups/rulenix/rulenix-phase11-7a4ac52-20260920T020046Z.dump.enc` is 12,173,408 bytes,
+SHA-256 `b20d28ea9c3aab1e098b8f6d1fca3cc06736c831fbae0f92bb0db7f247777053`; its disposable
+restore passed with four users and 51 migrations. Production has 51 successful, zero failed
+migrations, latest `20260918000000`. The Global Kill Switch remained disabled.
+
+The final image permission proof denied reader/writer authoritative INSERT, UPDATE, and DELETE,
+while isolated shadow writes worked. The container has no external gateway or published port,
+receives no Angel configuration or credentials, and packages only the observer and pure strategy
+modules—no API, Angel, credential, egress, trading, or mutation transport.
+
+```text
+RUST RELEASE: ab14c3ca05ce91ad959b29ace66f623936cd4f76
+PYTHON SHADOW RELEASE: 743a99887b9f147241fcd1430306954d935865c2
+RUST/PYTHON/POSTGRESQL/FRONTEND/PUBLIC HEALTH: PASS
+RESTART COUNTS: 0
+FRONTEND /api ROUTE: proxy_pass http://backend:8080/api/
+RUST SCHEDULER LEADER/ADVANCING/NOT STALE: YES/YES/YES
+DISPATCH SAMPLE: 118420 -> 118436 in five seconds
+LAST ADVANCEMENT/DISPATCH: 2026-09-20T02:31:21Z
+RUST SCHEDULER/WORKER ERRORS: 0
+PYTHON SHADOW ADVANCES/ERRORS: 9/0
+```
+
+Final observation has 15 decision matches and zero mismatches: three Futures Breakout entries,
+four SuperTrend entries, one SuperTrend square-off/EOD decision, three historical readiness
+decisions, and four current observer decisions. Two accounts were `readable_safe`, one was
+`offline_locally_flat`; all were deployment-safe and LIVE-ready false. There are zero unresolved
+final-release observations, plus a successful permission-boundary observation. Earlier immutable
+release rows retain the seven comparison defects that prompted the final correction.
+
+```text
+PYTHON AUTHORITATIVE TRADING WRITES: 0
+PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
+PYTHON ANGEL MUTATION HTTP REQUESTS: 0
+PYTHON LIVE ORDERS PLACED: 0
+PYTHON LIVE ORDERS MODIFIED: 0
+PYTHON LIVE ORDERS CANCELLED: 0
+PYTHON LIVE POSITIONS CLOSED: 0
+MANUAL BROKER ACTIVITY MODIFIED: NO
+RUST REMAINS AUTHORITATIVE: YES
+FRONTEND STILL ROUTED TO RUST: YES
+PHASE 12: NOT STARTED
+```
+
+PHASE 11: PASS — READY FOR PHASE 12 REVIEW
