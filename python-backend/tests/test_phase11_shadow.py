@@ -12,12 +12,20 @@ from app.shadow.evaluate import (
     evaluate_readiness,
     evaluate_supertrend_signal,
 )
-from app.shadow.service import ShadowObserver
+from app.shadow.service import HealthState, ShadowObserver
 from app.strategy.common import IST, Candle
 from app.strategy.futures_breakout import calculate_levels
 from app.strategy.supertrend import current_signal, supertrend_points
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_shadow_health_fails_closed_after_poll_error() -> None:
+    health = HealthState(last_success_at=datetime.now(UTC))
+    assert health.ready(15)
+    health.consecutive_failures = 1
+    health.last_error = "InsufficientPrivilegeError"
+    assert not health.ready(15)
 
 
 def test_shadow_settings_require_distinct_narrow_identities(tmp_path: Path, monkeypatch) -> None:

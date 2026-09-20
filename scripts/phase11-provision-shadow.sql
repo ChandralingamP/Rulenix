@@ -109,7 +109,7 @@ GRANT SELECT(user_id,rulenix_owned_exposure,ambiguous_exposure,manual_external_e
 
 GRANT INSERT,SELECT(source_kind,source_id,observer_release)
   ON rulenix_shadow.observations TO rulenix_shadow_writer;
-GRANT INSERT,UPDATE,SELECT(observer_release)
+GRANT INSERT,UPDATE,SELECT
   ON rulenix_shadow.observer_health TO rulenix_shadow_writer;
 
 ALTER DEFAULT PRIVILEGES FOR ROLE rulenix_shadow_owner IN SCHEMA rulenix_shadow

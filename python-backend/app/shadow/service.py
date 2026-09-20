@@ -36,7 +36,9 @@ class HealthState:
 
     def ready(self, poll_seconds: int) -> bool:
         return bool(
-            self.last_success_at
+            self.consecutive_failures == 0
+            and not self.last_error
+            and self.last_success_at
             and self.last_success_at >= datetime.now(UTC).replace(microsecond=0)
             - timedelta(seconds=poll_seconds * 3)
         )
