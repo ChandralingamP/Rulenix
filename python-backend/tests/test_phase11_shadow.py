@@ -88,6 +88,13 @@ def test_shadow_settings_require_distinct_narrow_identities(tmp_path: Path, monk
     settings = ShadowSettings.from_environment()
     assert settings.poll_seconds == 15
 
+    monkeypatch.setenv("SHADOW_LOOKBACK_HOURS", "336")
+    assert ShadowSettings.from_environment().lookback_hours == 336
+    monkeypatch.setenv("SHADOW_LOOKBACK_HOURS", "337")
+    with pytest.raises(ValueError, match="SHADOW_LOOKBACK_HOURS"):
+        ShadowSettings.from_environment()
+    monkeypatch.delenv("SHADOW_LOOKBACK_HOURS")
+
     source.write_text("postgresql://rulenix:x@shadow-db-proxy/rulenix")
     with pytest.raises(ValueError, match="rulenix_shadow_reader"):
         ShadowSettings.from_environment()

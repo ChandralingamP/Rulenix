@@ -67,7 +67,7 @@ class ShadowSettings:
             release,
             _bounded_int("SHADOW_POLL_SECONDS", 15, 5, 300),
             _bounded_int("SHADOW_BATCH_SIZE", 100, 1, 500),
-            _bounded_int("SHADOW_LOOKBACK_HOURS", 24, 1, 168),
+            _bounded_int("SHADOW_LOOKBACK_HOURS", 24, 1, 336),
             _bounded_int("SHADOW_HEALTH_PORT", 8090, 1024, 65535),
         )
 
