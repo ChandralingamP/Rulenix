@@ -12,6 +12,7 @@ mod error;
 mod home;
 mod instruments;
 mod jobs;
+mod live_authority;
 mod logs;
 mod market_ws;
 mod models;

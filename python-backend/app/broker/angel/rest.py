@@ -6,9 +6,14 @@ import httpx
 from .auth import _authenticated_headers, _decode_envelope
 from .errors import BrokerError, BrokerErrorCategory
 from .models import (
+    BrokerMutationResponse,
     BrokerReadFailure,
     BrokerReadSuccess,
+    CancelOrderRequest,
+    ConditionalMutationRequest,
     ConditionalRule,
+    ModifyOrderRequest,
+    OrderMutationRequest,
     OrderRecord,
     PositionRecord,
     TradeRecord,
@@ -54,6 +59,163 @@ class AngelRestClient:
                     continue
                 raise BrokerError(BrokerErrorCategory.TRANSPORT_FAILURE, f"Angel One {operation} transport failed.", operation, retryable=retry_candles, diagnostic=type(exc).__name__) from exc
         raise RuntimeError("unreachable")
+
+    async def _mutation_request(
+        self, operation: str, path: str, body: dict[str, Any]
+    ) -> Any:
+        """Execute exactly one broker write; unknown outcomes are never retried."""
+        cooldown_key = f"{self.account.api_key.get_secret_value()}:{path}"
+        remaining = await self.cooldowns.remaining(cooldown_key)
+        if remaining:
+            raise BrokerError(
+                BrokerErrorCategory.RATE_LIMITED,
+                "Angel One rate limit is active.",
+                operation,
+                retry_after_seconds=remaining,
+                retryable=False,
+            )
+        await self.pacer.acquire(
+            self.account.api_key.get_secret_value(), operation, ((1, 1.05),)
+        )
+        try:
+            response = await self.transport.request(
+                "POST",
+                f"{self.base_url}{path}",
+                headers=_authenticated_headers(self.account),
+                json=body,
+                timeout=15.0,
+            )
+            try:
+                return _decode_envelope(response, operation)
+            except BrokerError as error:
+                if error.category == BrokerErrorCategory.RATE_LIMITED:
+                    await self.cooldowns.activate(cooldown_key, error.retry_after_seconds or 90)
+                if error.category in {
+                    BrokerErrorCategory.TIMEOUT,
+                    BrokerErrorCategory.TRANSPORT_FAILURE,
+                }:
+                    raise BrokerError(
+                        BrokerErrorCategory.AMBIGUOUS,
+                        f"Angel One {operation} outcome is unknown; reconciliation is required.",
+                        operation,
+                        status_code=error.status_code,
+                        code=error.code,
+                        retryable=False,
+                        diagnostic=error.diagnostic or error.category.value,
+                    ) from error
+                raise
+        except httpx.ConnectError as exc:
+            # A connect failure is known to occur before an HTTP submission,
+            # but remains durable and operator/reconciliation driven.  The
+            # coordinator does not automatically replay it.
+            raise BrokerError(
+                BrokerErrorCategory.TRANSPORT_FAILURE,
+                f"Angel One {operation} could not connect before submission.",
+                operation,
+                retryable=True,
+                diagnostic=type(exc).__name__,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise BrokerError(
+                BrokerErrorCategory.AMBIGUOUS,
+                f"Angel One {operation} outcome is unknown; reconciliation is required.",
+                operation,
+                retryable=False,
+                diagnostic=type(exc).__name__,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise BrokerError(
+                BrokerErrorCategory.AMBIGUOUS,
+                f"Angel One {operation} outcome is unknown; reconciliation is required.",
+                operation,
+                retryable=False,
+                diagnostic=type(exc).__name__,
+            ) from exc
+
+    @staticmethod
+    def _mutation_response(operation: str, data: Any, fallback_id: str = "") -> BrokerMutationResponse:
+        if isinstance(data, str):
+            order_id = data.strip()
+            unique_id = ""
+        elif isinstance(data, dict):
+            order_id = str(data.get("orderid") or data.get("orderId") or fallback_id).strip()
+            unique_id = str(data.get("uniqueorderid") or data.get("uniqueOrderId") or "").strip()
+        elif data is None and fallback_id:
+            order_id = fallback_id
+            unique_id = ""
+        else:
+            order_id = ""
+            unique_id = ""
+        if not order_id:
+            raise BrokerError(
+                BrokerErrorCategory.AMBIGUOUS,
+                f"Angel One accepted {operation} without an order identifier; reconciliation is required.",
+                operation,
+                retryable=False,
+                diagnostic="missing_order_id",
+            )
+        return BrokerMutationResponse(
+            operation=operation,
+            broker_order_id=order_id,
+            unique_order_id=unique_id,
+            raw=data,
+        )
+
+    async def place_order(self, request: OrderMutationRequest) -> BrokerMutationResponse:
+        data = await self._mutation_request(
+            "place-order",
+            "/rest/secure/angelbroking/order/v1/placeOrder",
+            request.angel_payload(),
+        )
+        return self._mutation_response("place-order", data)
+
+    async def cancel_order(self, request: CancelOrderRequest) -> BrokerMutationResponse:
+        data = await self._mutation_request(
+            "cancel-order",
+            "/rest/secure/angelbroking/order/v1/cancelOrder",
+            request.angel_payload(),
+        )
+        return self._mutation_response("cancel-order", data, request.order_id)
+
+    async def modify_order(self, request: ModifyOrderRequest) -> BrokerMutationResponse:
+        data = await self._mutation_request(
+            "modify-order",
+            "/rest/secure/angelbroking/order/v1/modifyOrder",
+            request.angel_payload(),
+        )
+        return self._mutation_response("modify-order", data, request.order_id)
+
+    async def create_conditional(
+        self, request: ConditionalMutationRequest
+    ) -> BrokerMutationResponse:
+        data = await self._mutation_request(
+            "gtt-create",
+            "/rest/secure/angelbroking/gtt/v1/createRule",
+            request.angel_payload(),
+        )
+        return self._mutation_response("gtt-create", data)
+
+    async def modify_conditional(
+        self, request: ConditionalMutationRequest
+    ) -> BrokerMutationResponse:
+        if not request.rule_id:
+            raise ValueError("Conditional modification requires a rule_id.")
+        data = await self._mutation_request(
+            "gtt-modify",
+            "/rest/secure/angelbroking/gtt/v1/modifyRule",
+            request.angel_payload(),
+        )
+        return self._mutation_response("gtt-modify", data, request.rule_id)
+
+    async def cancel_conditional(self, rule_id: str) -> BrokerMutationResponse:
+        if not rule_id.strip():
+            raise ValueError("Conditional cancellation requires a rule_id.")
+        data = await self._mutation_request(
+            "gtt-cancel",
+            "/rest/secure/angelbroking/gtt/v1/cancelRule",
+            {"id": rule_id},
+        )
+        return self._mutation_response("gtt-cancel", data, rule_id)
 
     async def order_book(self) -> list[OrderRecord]:
         return [OrderRecord.from_payload(item) for item in _list_data(await self._request("order-book", "GET", "/rest/secure/angelbroking/order/v1/getOrderBook"))]

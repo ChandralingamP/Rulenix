@@ -54,10 +54,10 @@ async def test_network_trap_observes_zero_trading_mutation_requests():
         MutationGuard(),
     )
     with pytest.raises(MutationBlockedError):
-        client.place_order({"symbol": "GOLDTEN"})
+        await client.place_order({"symbol": "GOLDTEN"})
     with pytest.raises(MutationBlockedError):
-        client.cancel_order("broker-order")
+        await client.cancel_order("broker-order")
     with pytest.raises(MutationBlockedError):
-        client.manual_close("trade")
+        await client.manual_close("trade")
     assert trap.requests == []
     await transport.aclose()

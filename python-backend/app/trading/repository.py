@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -129,6 +129,54 @@ class TradingRepository:
              WHERE id=:id AND user_id=:user AND status='claimed'
         """), {"id": intent_id, "user": user_id, "status": final.value, "error": error[:2000], "order_id": strategy_order_id})
         return bool(getattr(result, "rowcount", 0))
+
+    async def reserve_order_for_intent(self, *, intent_id: UUID, user_id: UUID) -> UUID:
+        row = (await self.session.execute(text("""
+            SELECT i.id,i.user_id,i.snapshot_id,i.trade_id,i.session_key,i.role,i.side,i.status,
+                   i.order_type,i.lots,i.quantity,i.price,i.trigger_price,i.strategy_order_id,
+                   COALESCE(p.trading_mode,'demo') AS execution_mode,
+                   s.exchange_segment,s.product_type
+              FROM strategy_execution_intents i
+              JOIN strategy_market_snapshots s ON s.id=i.snapshot_id
+              LEFT JOIN user_profiles p ON p.user_id=i.user_id
+             WHERE i.id=:intent FOR UPDATE
+        """), {"intent": intent_id})).mappings().first()
+        if row is None or row["user_id"] != user_id:
+            raise OwnershipError("Execution intent is not owned by this user.")
+        if row["strategy_order_id"]:
+            return UUID(str(row["strategy_order_id"]))
+        if row["status"] != "claimed":
+            raise ConcurrentStateError("Execution intent is not claimed.")
+        quantity = int(row["quantity"] or 0)
+        if quantity <= 0:
+            raise ValueError("Execution intent quantity must be positive before order reservation.")
+        order_id = uuid5(NAMESPACE_URL, f"rulenix:execution-intent:{intent_id}")
+        client_order_id = f"RX{order_id.hex[:18].upper()}"
+        await self.session.execute(text("""
+            INSERT INTO strategy_orders(
+                id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,
+                lots,quantity,price,trigger_price,status,idempotency_key,client_order_id,
+                order_type,exchange_segment,product_type)
+            VALUES(:id,:user,:snapshot,:trade,:session,:role,:side,:mode,:lots,:quantity,
+                   :price,:trigger,'pending',:key,:client,:order_type,:exchange,:product)
+            ON CONFLICT(idempotency_key) DO NOTHING
+        """), {
+            "id": order_id, "user": user_id, "snapshot": row["snapshot_id"],
+            "trade": row["trade_id"], "session": str(row["session_key"])[:32],
+            "role": row["role"], "side": row["side"], "mode": row["execution_mode"],
+            "lots": row["lots"], "quantity": quantity, "price": row["price"],
+            "trigger": row["trigger_price"], "key": f"python:intent:{intent_id}",
+            "client": client_order_id, "order_type": row["order_type"],
+            "exchange": row["exchange_segment"], "product": row["product_type"],
+        })
+        result = await self.session.execute(text("""
+            UPDATE strategy_execution_intents SET strategy_order_id=:order,updated_at=NOW()
+             WHERE id=:intent AND user_id=:user AND status='claimed'
+               AND strategy_order_id IS NULL
+        """), {"order": order_id, "intent": intent_id, "user": user_id})
+        if getattr(result, "rowcount", 0) != 1:
+            raise ConcurrentStateError("Execution intent order was reserved concurrently.")
+        return order_id
 
     async def create_sl2_reversal_intent(self, *, source_trade_id: UUID, user_id: UUID, snapshot_id: UUID, instrument: str, source_direction: str | Side, lots: int, entry_price: Decimal | str) -> bool:
         source = (await self.session.execute(text("SELECT user_id,status,direction,exit_reason FROM trades WHERE id=:trade FOR UPDATE"), {"trade": source_trade_id})).mappings().first()

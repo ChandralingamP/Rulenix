@@ -24,7 +24,7 @@ async def test_every_defined_mutation_is_blocked_before_http():
         client = AngelClient("http://angel.test", "ws://angel.test", context, transport, DefaultEgressBinding(), MutationGuard(events.append))
         for operation in ("place_order", "cancel_order", "manual_close"):
             with pytest.raises(MutationBlockedError) as caught:
-                getattr(client, operation)({"example": "payload"})
+                await getattr(client, operation)({"example": "payload"})
             assert caught.value.operation == operation
     assert calls == 0
     assert [event["operation"] for event in events] == ["place_order", "cancel_order", "manual_close"]

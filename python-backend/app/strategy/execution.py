@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.broker.mutations import LiveMutationCoordinator, MutationState
 from app.risk import ActionKind, RiskSafetyService, SafetyDecision, SafetyRequest
 from app.trading.domain import IntentStatus
 from app.trading.repository import ClaimedIntent, TradingRepository
@@ -22,6 +23,9 @@ class ExecutionOutcome(StrEnum):
     DEMO_SIMULATED = "DEMO_SIMULATED"
     LIVE_MUTATION_DISABLED_DURING_MIGRATION = "LIVE_MUTATION_DISABLED_DURING_MIGRATION"
     BLOCKED = "BLOCKED"
+    LIVE_SUBMITTED = "LIVE_SUBMITTED"
+    LIVE_AMBIGUOUS = "LIVE_AMBIGUOUS"
+    LIVE_FAILED = "LIVE_FAILED"
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,7 @@ class ExecutionResult:
     decision: SafetyDecision
     request: BrokerActionRequest | None
     intent_id: UUID | None
-    broker_order_id: None = None
+    broker_order_id: str | None = None
 
 
 def _action_kind(action: str, role: str) -> ActionKind:
@@ -69,10 +73,11 @@ def _action_kind(action: str, role: str) -> ActionKind:
 
 
 class ExecutionOrchestrator:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, live: LiveMutationCoordinator | None = None):
         self.session = session
         self.trading = TradingRepository(session)
         self.safety = RiskSafetyService(session)
+        self.live = live
 
     @staticmethod
     def build_request(
@@ -153,6 +158,36 @@ class ExecutionOrchestrator:
             await self.session.commit()
             return ExecutionResult(
                 ExecutionOutcome.DEMO_SIMULATED, decision, action_request, UUID(str(intent.id))
+            )
+        if self.live is not None:
+            order_id = await self.trading.reserve_order_for_intent(
+                intent_id=UUID(str(intent.id)), user_id=UUID(str(intent.user_id))
+            )
+            await self.session.commit()
+            outcome = await self.live.place_order(order_id)
+            if outcome.state is MutationState.ACKNOWLEDGED:
+                intent_status = IntentStatus.SUBMITTED
+                execution_outcome = ExecutionOutcome.LIVE_SUBMITTED
+            elif outcome.state is MutationState.AMBIGUOUS:
+                intent_status = IntentStatus.SUBMITTED
+                execution_outcome = ExecutionOutcome.LIVE_AMBIGUOUS
+            else:
+                intent_status = IntentStatus.FAILED
+                execution_outcome = ExecutionOutcome.LIVE_FAILED
+            await self.trading.complete_intent(
+                UUID(str(intent.id)),
+                UUID(str(intent.user_id)),
+                intent_status,
+                error="" if outcome.error_category is None else outcome.error_category.value,
+                strategy_order_id=order_id,
+            )
+            await self.session.commit()
+            return ExecutionResult(
+                execution_outcome,
+                decision,
+                action_request,
+                UUID(str(intent.id)),
+                outcome.broker_order_id or None,
             )
         await self.trading.complete_intent(
             UUID(str(intent.id)),

@@ -147,6 +147,7 @@ class SafetyRequest:
     account_id: UUID | None = None
     trade_id: UUID | None = None
     intent_id: UUID | None = None
+    order_id: UUID | None = None
     strategy_key: str | None = None
     instrument: str | None = None
     exchange_segment: str | None = None

@@ -1,8 +1,9 @@
 import httpx
 
+from ..authority import AuthorityProof, AuthorityRuntime
 from .auth import AngelAuthenticator
 from .egress import EgressBinding
-from .models import AccountContext
+from .models import AccountContext, CancelOrderRequest, OrderMutationRequest
 from .mutation_guard import MutationGuard
 from .rest import AngelRestClient
 from .retry import CooldownRegistry, RequestPacer
@@ -17,14 +18,34 @@ class AngelClient:
         self.websocket = AngelWebSocketClient(ws_url, account, egress)
         self._mutation_guard = mutation_guard
 
-    def place_order(self, *_args, **_kwargs) -> None:
-        self._mutation_guard.block("place_order", self.account.user_id)
+    @staticmethod
+    def _valid_proof(proof: AuthorityProof | None, user_id: str) -> bool:
+        return bool(
+            proof
+            and proof.runtime is AuthorityRuntime.PYTHON
+            and str(proof.user_id) == user_id
+        )
 
-    def cancel_order(self, *_args, **_kwargs) -> None:
-        self._mutation_guard.block("cancel_order", self.account.user_id)
+    async def place_order(
+        self, request: OrderMutationRequest, *, proof: AuthorityProof | None = None
+    ):
+        if not self._valid_proof(proof, self.account.user_id):
+            self._mutation_guard.block("place_order", self.account.user_id)
+        return await self.rest.place_order(request)
 
-    def manual_close(self, *_args, **_kwargs) -> None:
-        self._mutation_guard.block("manual_close", self.account.user_id)
+    async def cancel_order(
+        self, request: CancelOrderRequest, *, proof: AuthorityProof | None = None
+    ):
+        if not self._valid_proof(proof, self.account.user_id):
+            self._mutation_guard.block("cancel_order", self.account.user_id)
+        return await self.rest.cancel_order(request)
+
+    async def manual_close(
+        self, request: OrderMutationRequest, *, proof: AuthorityProof | None = None
+    ):
+        if not self._valid_proof(proof, self.account.user_id):
+            self._mutation_guard.block("manual_close", self.account.user_id)
+        return await self.rest.place_order(request)
 
     async def close(self) -> None:
         await self.websocket.close()

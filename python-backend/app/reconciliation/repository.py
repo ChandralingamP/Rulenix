@@ -90,11 +90,41 @@ class ReconciliationRepository:
         execution = await self.session.execute(text("UPDATE strategy_execution_intents SET status='retry_wait',next_attempt_at=NOW(),last_error='Backend restarted while this execution intent was claimed.',updated_at=NOW() WHERE status='claimed' AND claimed_at<NOW()-(:age * INTERVAL '1 second')"), values)
         reversals = await self.session.execute(text("UPDATE strategy_reversal_intents SET status='pending',next_attempt_at=NOW(),last_error='Backend restarted while the reversal was being processed.',updated_at=NOW() WHERE status='processing' AND updated_at<NOW()-(:age * INTERVAL '1 second')"), values)
         manual = await self.session.execute(text("UPDATE manual_trade_close_intents SET status='reconciliation_required',last_error='Recovered uncertain manual-close worker claim.' WHERE status='cancelling_protection' AND updated_at<NOW()-(:age * INTERVAL '1 second')"), values)
-        uncertain = await self.session.execute(text("UPDATE strategy_orders SET status='ambiguous',broker_error_class='ambiguous',uncertain_since_at=COALESCE(uncertain_since_at,NOW()),updated_at=NOW() WHERE status='submitting' AND updated_at<NOW()-(:age * INTERVAL '1 second')"), values)
+        uncertain = await self.session.execute(text("UPDATE strategy_orders o SET status='ambiguous',broker_error_class='ambiguous',uncertain_since_at=COALESCE(uncertain_since_at,NOW()),updated_at=NOW() WHERE o.status='submitting' AND o.updated_at<NOW()-(:age * INTERVAL '1 second') AND NOT EXISTS (SELECT 1 FROM broker_mutation_attempts a WHERE a.strategy_order_id=o.id AND a.state IN ('prepared','submitting'))"), values)
         processing = await self.session.execute(text("UPDATE strategy_orders SET status=CASE WHEN processed_quantity>0 AND processed_quantity<filled_quantity THEN 'partially_filled' ELSE 'submitted' END,broker_status='Fill processing was interrupted; queued for reconciliation.',updated_at=NOW() WHERE status='processing' AND updated_at<NOW()-(:age * INTERVAL '1 second')"), values)
-        cancelling = await self.session.execute(text("UPDATE strategy_orders SET status='submitted',broker_status='Cancellation was interrupted; queued for reconciliation.',updated_at=NOW() WHERE status='cancelling' AND updated_at<NOW()-(:age * INTERVAL '1 second')"), values)
+        cancelling = await self.session.execute(text("UPDATE strategy_orders o SET status='submitted',broker_status='Cancellation was interrupted; queued for reconciliation.',updated_at=NOW() WHERE o.status='cancelling' AND o.updated_at<NOW()-(:age * INTERVAL '1 second') AND NOT EXISTS (SELECT 1 FROM broker_mutation_attempts a WHERE a.strategy_order_id=o.id AND a.state IN ('prepared','submitting'))"), values)
+        prepared_attempts = await self.session.execute(text("""
+            UPDATE broker_mutation_attempts
+               SET state='failed',broker_error_class='pre_submission_crash',
+                   diagnostic='Process stopped before broker transport began; safe explicit retry is permitted.',
+                   completed_at=NOW(),updated_at=NOW()
+             WHERE state='prepared' AND network_started_at IS NULL
+               AND updated_at<NOW()-(:age * INTERVAL '1 second')
+        """), values)
+        await self.session.execute(text("""
+            UPDATE strategy_orders o SET status='failed',broker_error_class='pre_submission_crash',
+                   broker_status='Process stopped before broker transport began.',updated_at=NOW()
+              FROM broker_mutation_attempts a
+             WHERE a.strategy_order_id=o.id AND a.state='failed'
+               AND a.broker_error_class='pre_submission_crash' AND o.status='submitting'
+        """))
+        ambiguous_attempts = await self.session.execute(text("""
+            UPDATE broker_mutation_attempts
+               SET state='ambiguous',broker_error_class='ambiguous',
+                   diagnostic='Process stopped after broker transport began; reconciliation is required.',
+                   updated_at=NOW()
+             WHERE state='submitting' AND network_started_at IS NOT NULL
+               AND updated_at<NOW()-(:age * INTERVAL '1 second')
+        """), values)
+        await self.session.execute(text("""
+            UPDATE strategy_orders o SET status='ambiguous',broker_error_class='ambiguous',
+                   uncertain_since_at=COALESCE(uncertain_since_at,NOW()),updated_at=NOW()
+              FROM broker_mutation_attempts a
+             WHERE a.strategy_order_id=o.id AND a.state='ambiguous'
+               AND o.status IN ('submitting','cancelling')
+        """))
         order_count = sum(int(getattr(result, "rowcount", 0) or 0) for result in (uncertain, processing, cancelling))
-        return {"execution_intents": int(getattr(execution, "rowcount", 0) or 0), "reversal_intents": int(getattr(reversals, "rowcount", 0) or 0), "manual_close_intents": int(getattr(manual, "rowcount", 0) or 0), "orders": order_count}
+        return {"execution_intents": int(getattr(execution, "rowcount", 0) or 0), "reversal_intents": int(getattr(reversals, "rowcount", 0) or 0), "manual_close_intents": int(getattr(manual, "rowcount", 0) or 0), "orders": order_count, "prepared_mutations": int(getattr(prepared_attempts, "rowcount", 0) or 0), "ambiguous_mutations": int(getattr(ambiguous_attempts, "rowcount", 0) or 0)}
 
     async def deployment_safe(self, user_id: UUID) -> bool:
         row = (await self.session.execute(text("SELECT open_live_trades,unresolved_closed_live_trades,unresolved_live_orders,unresolved_live_execution_intents,unresolved_live_reversals,unresolved_live_manual_closes,unresolved_broker_incidents,unresolved_broker_mutations FROM broker_deployment_account_safety WHERE user_id=:user"), {"user": user_id})).mappings().first()

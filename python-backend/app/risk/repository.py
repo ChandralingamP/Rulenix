@@ -159,9 +159,9 @@ class SafetyRepository:
             await self.session.scalar(
                 text("""
             SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=:user AND status='ambiguous'
-                          AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid)))
+                          AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid)))
         """),
-                {"user": request.user_id, "intent": request.intent_id},
+                {"user": request.user_id, "order": request.order_id},
             )
         )
 
@@ -181,6 +181,7 @@ class SafetyRepository:
                 ) OR EXISTS(
                     SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
                      WHERE o.user_id=:user AND o.execution_mode=:mode AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                       AND (CAST(:order AS uuid) IS NULL OR o.id<>CAST(:order AS uuid))
                        AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
                        AND s.strategy_key=:strategy AND s.instrument=:instrument
                 )
@@ -190,6 +191,7 @@ class SafetyRepository:
                         "mode": request.execution_mode,
                         "strategy": request.strategy_key,
                         "instrument": request.instrument,
+                        "order": request.order_id,
                     },
                 )
             )
@@ -239,13 +241,13 @@ class SafetyRepository:
                     await self.session.execute(
                         text("""
                 SELECT COALESCE(SUM(CASE WHEN status='open' THEN total_lots ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(lots) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')),0) lots,
+                       COALESCE((SELECT SUM(lots) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) lots,
                        COALESCE(SUM(CASE WHEN status='open' THEN quantity ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(quantity) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')),0) quantity,
+                       COALESCE((SELECT SUM(quantity) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) quantity,
                        COUNT(*) FILTER (WHERE status='open') positions
                   FROM trades WHERE user_id=:user
             """),
-                        {"user": request.user_id},
+                        {"user": request.user_id, "order": request.order_id},
                     )
                 )
                 .mappings()
@@ -267,6 +269,14 @@ class SafetyRepository:
         existing_quantity = 0
         trade_open = True
         owner_matches = True
+        if request.order_id:
+            order_owner = (
+                await self.session.execute(
+                    text("SELECT user_id FROM strategy_orders WHERE id=:order"),
+                    {"order": request.order_id},
+                )
+            ).scalar()
+            owner_matches = order_owner == request.user_id
         if request.trade_id:
             trade = (
                 (
@@ -280,7 +290,7 @@ class SafetyRepository:
                 .mappings()
                 .first()
             )
-            owner_matches = trade is not None and trade["user_id"] == request.user_id
+            owner_matches = owner_matches and trade is not None and trade["user_id"] == request.user_id
             if trade:
                 trade_open = trade["status"] == "open"
                 existing_quantity = int(trade["quantity"] or 0)
@@ -346,7 +356,7 @@ class SafetyRepository:
             {
                 "id": uuid4(),
                 "user": request.user_id,
-                "order": request.intent_id or request.trade_id,
+                "order": request.order_id or request.intent_id or request.trade_id,
                 "mode": request.execution_mode,
                 "role": ActionKind(request.action).value,
                 "allowed": decision.allowed,

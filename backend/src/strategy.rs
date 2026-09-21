@@ -11566,6 +11566,10 @@ mod tests {
             .execute(&db)
             .await
             .expect("global test kill switch must be restored");
+        sqlx::query("INSERT INTO live_mutation_authority(singleton,holder,epoch,lease_owner,lease_expires_at,updated_by) VALUES(TRUE,'rust',1,'267961f9-6037-580b-906f-152939952a73'::uuid,'infinity'::timestamptz,'isolated Rust test authority')")
+            .execute(&db)
+            .await
+            .expect("isolated Rust test mutation authority must be restored");
         let (strategy_events, _) = tokio::sync::broadcast::channel(64);
         AppState {
             http: reqwest::Client::builder()

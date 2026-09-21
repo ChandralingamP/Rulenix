@@ -646,6 +646,16 @@ pub async fn place_order(
     wait_for_order_capacity(state, api_key).await;
     let body = order_payload(order);
     let http=crate::egress::http_client_for_user(state,user_id).await.map_err(|error|BrokerError{class:BrokerErrorClass::Rejected,status:None,code:"egress_unavailable".into(),message:error.to_string(),diagnostic:"Explicit Angel source binding could not be established; no default-route fallback was attempted.".into()})?;
+    let authority = crate::live_authority::acquire_rust(&state.db)
+        .await
+        .map_err(|error| BrokerError {
+            class: BrokerErrorClass::Rejected,
+            status: None,
+            code: "live_authority_fenced".into(),
+            message: "Rust LIVE mutation authority is fenced.".into(),
+            diagnostic: error.to_string(),
+        })?;
+    let _authority_epoch = authority.epoch;
     let response=http.post(format!("{}{path}",state.config.angel_api_base))
         .headers(authenticated_headers(state,api_key,jwt_token).map_err(|e|BrokerError{class:BrokerErrorClass::Authentication,status:None,code:"invalid_headers".into(),message:e.to_string(),diagnostic:String::new()})?)
         .json(&body).send().await.map_err(|error|BrokerError{class:classify_transport(&error),status:error.status().map(|s|s.as_u16()),code:"transport".into(),message:if error.is_connect(){"Angel One could not be reached before submission.".into()}else{"Angel One submission outcome is unknown and will be reconciled; it will not be retried automatically.".into()},diagnostic:redact_sensitive(&error.to_string(),&[api_key,jwt_token])})?;
@@ -712,6 +722,8 @@ pub async fn cancel_order(
     order_id: &str,
     variety: &str,
 ) -> AppResult<()> {
+    let authority = crate::live_authority::acquire_rust(&state.db).await?;
+    let _authority_epoch = authority.epoch;
     wait_for_order_capacity(state, api_key).await;
     secure_json(
         state,

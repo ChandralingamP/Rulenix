@@ -1,6 +1,7 @@
 from functools import lru_cache
+from uuid import UUID
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,15 +18,11 @@ class Settings(BaseSettings):
     credential_primary_version: int = Field(default=1, validation_alias=AliasChoices("CREDENTIAL_PRIMARY_VERSION", "CREDENTIAL_ENCRYPTION_PRIMARY_VERSION"))
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     live_trading_enabled: bool = Field(default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED")
+    live_authority_lease_owner: str = Field(
+        default="", validation_alias="PYTHON_LIVE_AUTHORITY_LEASE_OWNER"
+    )
     egress_helper_socket: str = Field(default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET")
     log_directory: str = Field(default="./logs", validation_alias="RULENIX_LOG_DIRECTORY")
-
-    @field_validator("live_trading_enabled")
-    @classmethod
-    def reject_live(cls, value: bool) -> bool:
-        if value:
-            raise ValueError("Python foundation cannot enable live trading")
-        return value
 
     @property
     def async_database_url(self) -> str:
@@ -37,6 +34,15 @@ class Settings(BaseSettings):
         return url
 
     def validate_production(self) -> None:
+        if self.live_trading_enabled:
+            if not self.async_database_url:
+                raise ValueError("DATABASE_URL is required for Python LIVE mutation")
+            try:
+                UUID(self.live_authority_lease_owner)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "PYTHON_LIVE_AUTHORITY_LEASE_OWNER must be an explicit UUID"
+                ) from exc
         if self.app_env.lower() in {"production", "staging"}:
             if not self.async_database_url:
                 raise ValueError("DATABASE_URL is required outside development")

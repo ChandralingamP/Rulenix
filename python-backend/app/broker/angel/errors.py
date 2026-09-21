@@ -17,7 +17,7 @@ class BrokerErrorCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True)
+@dataclass
 class BrokerError(Exception):
     category: BrokerErrorCategory
     message: str
