@@ -2,17 +2,20 @@
 
 ## Outcome
 
-Phase 12 implementation and DEMO lifecycle parity passed, but the final production gate is
-blocked. A fresh post-trial authoritative broker read found two broker order records whose states
-remain `AMBIGUOUS`. They are not counted as exposure-capable orders, but `UNKNOWN != SAFE`; no
-further Phase 12 deployment was performed and no broker state was mutated.
+Phase 12 implementation, DEMO lifecycle parity, and the remediated final production gate passed.
+Fresh authoritative reads prove the two previously ambiguous broker rows are non-executable
+synthetic `OCO_LIMIT` records: they have no broker/order ID or state, zero filled and unfilled
+quantity, zero price and trigger, no position/trade/GTT counterpart, and individual-order lookup
+returns broker code `AB1007`. The ownership classifier now recognizes the same strict synthetic
+shape for `CARRYFORWARD` as well as `INTRADAY`; all other products and incomplete evidence remain
+fail-closed.
 
 Rust remains the only LIVE and public authority. Phase 13 was not started.
 
 ## Releases and reproducibility
 
 ```text
-RUST PRODUCTION SHA: ab14c3ca05ce91ad959b29ace66f623936cd4f76
+RUST PRODUCTION SHA: 267961f96037580b106f152939952a73586b6a4e
 PYTHON STARTING SHA: d2066618e7f37fc2fcc20ef176d085ef3a0dd5c2
 PHASE 11 SHADOW SHA: 743a99887b9f147241fcd1430306954d935865c2
 PHASE 12 DEPLOYED DEMO SHA: 0398e66ac9e82b6198661092218691000946065d
@@ -23,9 +26,33 @@ The Phase 11 deployed SHA differs from the starting source SHA only by the two c
 reports `PHASE11_SHADOW_DEPLOYMENT_REPORT.md` and `PYTHON_MIGRATION_MASTER.md`. There is no Python,
 dependency, migration, container, or runtime difference, so that initial difference is expected.
 
-The Phase 12 deployed SHA is reproducible from its Git archive. The final executable source adds
-only a distinct cumulative `poll_errors` telemetry field and its unit test. It was not redeployed
-after the final gate blocked on ambiguous broker evidence.
+The original Phase 12 evidence release is reproducible from its Git archive. The final executable
+source adds only a distinct cumulative `poll_errors` telemetry field and its unit test. That exact
+executable commit is now deployed to the isolated DEMO observer while retaining evidence release
+`0398e66`, so the already-passed 22-cycle trial was not rerun.
+
+## Final-gate remediation
+
+The Rust deadlocks were caused by the general execution-intent status refresh updating signal rows
+that also belonged to the concurrent mandatory square-off refresh. PostgreSQL could acquire the
+same `strategy_signals` tuples in opposite plan order. Rust release `267961f` restricts each refresh
+to its action, locks matching signal IDs in UUID order inside the transaction, and then performs the
+atomic bulk status update. A 16-worker, 20-iteration PostgreSQL regression reproduced SQLSTATE
+`40P01` before the fix and passes after it. No lost signal/intent/trade, idempotency duplicate, or
+inconsistent signal status was found.
+
+The old cumulative PostgreSQL deadlock count was 77 immediately before deployment. The new backend
+is leader/advancing with zero worker errors and no new PostgreSQL or backend deadlock error during
+the post-remediation observation window. The encrypted pre-deployment backup was restore-verified;
+all 51 migration checksums matched; users, profiles, encrypted broker-secret rows, egress rows,
+configuration hashes, and Global Kill Switch state were preserved.
+
+Two accounts remain offline and therefore `LIVE_READY=false`; broker read failure is still not
+treated as flat. They do not block preparation because durable Rulenix inventory is flat and there
+is no unresolved mutation, protection/reconciliation incident, or ambiguous Rulenix exposure. New
+LIVE entry remains fail-closed per account. Fresh pre- and post-deployment gates found zero broker
+positions, exposure-capable orders, active conditional rules, Rulenix-owned exposure, ambiguous
+exposure, and durable blockers. No broker state was mutated.
 
 ## Ownership and duplicate prevention
 
@@ -104,9 +131,9 @@ finding is outside the changed scope; the authoritative `app tests` run passed.
 ```text
 RUST PRODUCTION HEALTH: ready; container healthy; restart count 0
 RUST SCHEDULER LEADER: true
-RUST SCHEDULER ADVANCING: yes; dispatch_count advanced 272557 -> 471114
-RUST LAST ADVANCEMENT / DISPATCH: 2026-09-21T08:19:01Z at final sample
-RUST WORKER ERRORS: 41 cumulative
+RUST SCHEDULER ADVANCING: yes; post-remediation dispatch count continues increasing
+RUST LAST ADVANCEMENT / DISPATCH: current at every post-remediation sample
+RUST WORKER ERRORS: 77 historical before remediation; 0 in the new process
 PYTHON DEMO HEALTH: ready; leader=true; stale=false; 22/22 matches
 POSTGRESQL HEALTH: healthy; restart count 0
 FRONTEND HEALTH: running; restart count 0
@@ -114,9 +141,9 @@ PUBLIC READINESS: HTTPS 200
 GLOBAL KILL SWITCH: disabled
 ```
 
-The 41 Rust errors are recovered PostgreSQL deadlocks in SuperTrend mandatory square-off and
-execution-intent recovery. Rust continues advancing, but a clean observation window after a
-separate remediation is required before Phase 13.
+The 77 historical errors were recovered PostgreSQL deadlocks in SuperTrend mandatory square-off
+and execution-intent recovery. The root transaction overlap was corrected in `267961f`; Rust
+continues advancing and no new deadlock occurred in the post-remediation observation window.
 
 The pre-trial deployment gate passed under the established deployment-vs-LIVE-readiness policy:
 four accounts were locally flat, no durable blockers existed, and no broker failure was treated as
@@ -126,9 +153,11 @@ account remained LIVE-ready false.
 The fresh post-trial gate checked four accounts. It found zero broker positions, zero
 exposure-capable orders, zero active conditional rules, zero Rulenix-owned exposure, and zero
 manual-external exposure. Two accounts were readable; two remained offline and LIVE-ready false.
-One readable account contained two order records classified `AMBIGUOUS` because their broker states
-were unknown. The gate therefore returned `BLOCK`. No attempt was made to cancel, modify, close, or
-otherwise resolve them.
+One readable account contained two order records initially classified `AMBIGUOUS` because their
+broker states were blank. Read-only individual-order, position, trade, conditional, and local
+durable evidence subsequently proved the exact strict non-executable synthetic shape. Fresh pre-
+and post-deployment gates classify both as synthetic and return `PASS`. No attempt was made to
+cancel, modify, close, or otherwise mutate them.
 
 ```text
 PYTHON ANGEL MUTATION TRANSPORT PATHS: 0
@@ -143,8 +172,8 @@ MANUAL BROKER ACTIVITY MODIFIED: NO
 ## Backup and permission boundary
 
 The fresh encrypted backup is
-`/var/backups/rulenix/rulenix-phase12-ade9a2d-20260920T150353Z.dump.enc`, size 12,209,856 bytes,
-SHA-256 `d1cae7d9bf06fedc2f7e71e16b6bd9919677d187388f3d658f8103dd289e3848`.
+`/var/backups/rulenix/rulenix-predeploy-267961f-20260921T115130Z.dump.enc`, size 12,304,064 bytes,
+SHA-256 `63fd766f5d14c96e5c36c70095b11a45ab9c4f77f5032bd4485ddcc8529934e5`.
 Its disposable restore passed with four users and 51 migrations.
 
 The exact deployed image proved that the reader cannot insert into production and that the writer
@@ -162,8 +191,11 @@ Phase 13 must implement and certify typed place/cancel/modify/GTT operations; ri
 close and protection management; cumulative and partial fills; OCO siblings; SL2 reversal; EOD;
 stable tags and idempotency; ambiguous-write reconciliation; restart-safe retries; per-account
 source-IP binding; and a final database/broker risk and collision check immediately before every
-mutation. It also requires a fenced authority lease/epoch, broker sandbox and fault testing, and a
-reviewed mutation allowlist.
+mutation. It also requires a fenced authority lease/epoch, internal Rulenix pre-LIVE validation in
+a broker sandbox or controlled test account, fault testing, and a reviewed mutation allowlist.
+Here, "certification" means that internal release gate. Repository evidence does not establish a
+separate Angel SmartAPI technical certification, regulatory certification, or vendor-onboarding
+requirement.
 
 The future transfer sequence is: resolve blockers, backup/restore proof, freeze control-plane
 changes, stop new entries while preserving exits, drain and fence Rust workers, reconcile fresh
@@ -171,27 +203,26 @@ broker truth, prove schema compatibility, start Python read/reconcile-only, tran
 authority epoch, enable one reviewed canary, verify, then route public traffic. It must never run
 two broker mutators.
 
-Rollback keeps Rust SHA `ab14c3c` and compatible schema available. Python entries and mutation must
+Rollback keeps Rust SHA `267961f` and compatible schema available. Python entries and mutation must
 first be disabled, its workers drained and fenced, all in-flight broker actions reconciled, and its
 authority lease relinquished before Rust resumes. Any parity mismatch, stale scheduler/feed,
 worker error, ambiguous submission, protection failure, reconciliation disagreement, cross-account
 leak, or readiness failure triggers rollback review.
 
-Phase 13 blockers are: two ambiguous broker order states; two offline/not-LIVE-ready accounts; no
-Python LIVE mutation implementation; no fenced authority transfer; no broker sandbox certification;
-41 recovered Rust worker deadlocks without a clean post-remediation window; Rust
+Phase 13 review items are: no Python LIVE mutation implementation; no fenced authority transfer; no
+completed internal Rulenix pre-LIVE broker sandbox/controlled-account mutation validation; Rust
 `RUSTSEC-2026-0285` (`rustls 0.23.43`, fixed in 0.23.45+); unfixed `RUSTSEC-2023-0071` in `rsa`;
 yanked `chacha20 0.10.1`; and seven frontend development-tool advisories (production dependency
 audit remains zero).
 
 ## Scope
 
-Executable Phase 12 scope before this report: 16 new files, 1,596 added lines, zero deleted lines.
+Initial executable Phase 12 scope before remediation: 16 new files, 1,596 added lines, zero deleted lines.
 There was no line-ending normalization, generated-file churn, dependency change, frontend change,
 Rust behavior change, or unrelated semantic change. The user's pre-existing edits to the production
 broker-safety scripts and the untracked diagnostic script were preserved and not committed.
 
 ```text
 PHASE 13: NOT STARTED
-PHASE 12: BLOCKED
+PHASE 12: PASS - READY FOR PHASE 13 REVIEW
 ```

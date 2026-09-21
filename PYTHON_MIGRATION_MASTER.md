@@ -19,25 +19,36 @@ passes 10 tests including the disposable-PostgreSQL permission/idempotency case.
 pass. Rust, PostgreSQL, frontend, public readiness, Phase 11 shadow, and the Phase 12 service are
 healthy. Python still has zero reachable Angel mutation paths and performed no LIVE action.
 
-A fresh post-trial broker gate found zero positions and zero exposure-capable orders, but two
-broker order records remain `AMBIGUOUS` due to unknown broker states. Two accounts also remain
-offline and not LIVE-ready. The gate returned `BLOCK`, so final source telemetry commit
-`4d114907ba9fc81094b5199187262cc2ebe42975` was not redeployed. No broker state was modified.
+The final broker gate passes with zero positions, exposure-capable orders, active conditional rules,
+Rulenix-owned exposure, ambiguous exposure, and durable blockers. The two formerly ambiguous rows
+are authoritatively proven non-executable synthetic broker records. Two offline accounts remain
+not LIVE-ready without blocking preparation; read failure is never treated as broker-flat and new
+LIVE entry remains fail-closed per account.
 
-Rust has 41 cumulative recovered scheduler/worker errors caused by observed PostgreSQL deadlocks.
-The ambiguous broker evidence, offline accounts, deadlock remediation/soak, security advisories,
-missing Python LIVE mutation implementation, fencing protocol, and broker certification all remain
-Phase 13 blockers. Phase 13 and public cutover were not started. Full evidence and the exact future
-cutover/rollback plan are in `PHASE12_DEMO_TRIAL_REPORT.md` and
-`docs/phase12-demo-trial-and-cutover-preflight.md`.
+Rust release `267961f96037580b106f152939952a73586b6a4e` fixes the PostgreSQL deadlock root cause by
+action-scoping and deterministically locking signal rows before the atomic status updates. The old
+cumulative count reached 77 before remediation; the concurrency regression passes and no new
+deadlock occurred during the post-deployment observation window. The isolated DEMO observer now
+runs executable commit `4d114907ba9fc81094b5199187262cc2ebe42975` with distinct cumulative
+`poll_errors`, while retaining the already-passed `0398e66` evidence release so no trial was rerun.
+
+Security advisories, Python LIVE mutation implementation, the fencing protocol, and internal
+Rulenix pre-LIVE broker sandbox/controlled-account validation remain Phase 13 review items. Phase 13
+and public cutover were not started. Full evidence and the exact future cutover/rollback plan are in
+`PHASE12_DEMO_TRIAL_REPORT.md` and `docs/phase12-demo-trial-and-cutover-preflight.md`.
+
+"Broker certification" in the Phase 12 materials means that internal release gate. Repository
+evidence does not establish a separate Angel SmartAPI technical certification, regulatory
+certification, or vendor-onboarding requirement.
 
 ```text
-CURRENT PHASE: 12 BLOCKED AT FINAL PRODUCTION SAFETY GATE
-AUTHORITATIVE RUST RELEASE: ab14c3ca05ce91ad959b29ace66f623936cd4f76
+CURRENT PHASE: 12 PASS - READY FOR PHASE 13 REVIEW
+AUTHORITATIVE RUST RELEASE: 267961f96037580b106f152939952a73586b6a4e
 DEPLOYED PHASE 11 SHADOW: 743a99887b9f147241fcd1430306954d935865c2
-DEPLOYED PHASE 12 DEMO: 0398e66ac9e82b6198661092218691000946065d
+DEPLOYED PHASE 12 DEMO EXECUTABLE: 4d114907ba9fc81094b5199187262cc2ebe42975
+PHASE 12 DEMO EVIDENCE RELEASE: 0398e66ac9e82b6198661092218691000946065d
 PHASE 13: NOT STARTED
-PHASE 12: BLOCKED
+PHASE 12: PASS - READY FOR PHASE 13 REVIEW
 ```
 
 > Phase 1 production audit and behavioral migration contract. This document is specification only: it does not authorize a Python implementation, deployment, database change, broker mutation, network change, or production operation.

@@ -2,7 +2,7 @@
 
 ## Authority boundary
 
-Rust release `ab14c3ca05ce91ad959b29ace66f623936cd4f76` remains the only public API,
+Rust release `267961f96037580b106f152939952a73586b6a4e` remains the only public API,
 scheduler for authoritative application state, LIVE reconciliation process, and Angel mutator.
 Phase 12 neither routes traffic to Python nor grants Python a write on `public`.
 
@@ -83,8 +83,13 @@ Phase 13 therefore requires, at minimum:
    restart-safe retry state machines;
 5. per-account source-IP binding and bounded rate/cooldown policy;
 6. an immediately-before-mutation database risk/readiness/collision recheck;
-7. mutation-trap tests, fault injection, broker sandbox/certification, and a reviewed production
-   mutation allowlist that cannot be enabled by a client request.
+7. mutation-trap tests, fault injection, internal Rulenix pre-LIVE validation in a broker sandbox or
+   controlled test account, and a reviewed production mutation allowlist that cannot be enabled by
+   a client request.
+
+In this plan, "broker certification" refers only to that internal Rulenix release gate. No
+repository evidence establishes a separate Angel SmartAPI technical certification, regulatory
+certification, or vendor-onboarding requirement.
 
 ## Phase 13 authority-transfer sequence (not executed)
 
@@ -108,7 +113,7 @@ Trigger rollback on any material parity mismatch, stale scheduler/feed, repeated
 ambiguous broker submission, protection failure, reconciliation disagreement, cross-account leak,
 or readiness failure. First disable Python entries and mutation, drain/fence Python workers, and
 reconcile every in-flight broker action. Only after Python has relinquished the authority lease may
-Rust `ab14c3ca05ce91ad959b29ace66f623936cd4f76` resume workers and routing. The fencing epoch and
+Rust `267961f96037580b106f152939952a73586b6a4e` resume workers and routing. The fencing epoch and
 stable broker tags prevent duplicate mutation during the transition. If schema compatibility is
 not proven, rollback is blocked and forward recovery is required.
 
@@ -124,6 +129,7 @@ not proven, rollback is blocked and forward recovery is required.
   advisories (two high, four moderate, one low), including Vitest. They do not affect the deployed
   frontend bundle, but the test/build toolchain must be upgraded and revalidated before Phase 13.
 
-The observed recovered PostgreSQL deadlocks in Rust SuperTrend square-off/execution recovery also
-remain a Phase 13 operational blocker. Do not change stable Rust as part of Phase 12; diagnose and
-remediate separately, then require a clean worker-error observation window.
+The observed PostgreSQL deadlocks in Rust SuperTrend square-off/execution recovery were remediated
+in `267961f96037580b106f152939952a73586b6a4e` with action-scoped deterministic signal locking. The
+stateful concurrency regression and post-deployment worker-error observation window pass; retain
+the old cumulative count as historical telemetry.
