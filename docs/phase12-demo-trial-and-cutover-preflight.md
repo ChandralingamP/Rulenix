@@ -24,8 +24,9 @@ Rust cannot execute a Phase 12 cycle because the account assignments, cycle name
 intents, orders, and trades exist only in `rulenix_demo_trial`; Rust has no dependency on that
 schema. Python has a single PostgreSQL advisory-lock leader. Each cycle has a unique stable key;
 signals are unique by cycle, intents/orders have stable idempotency keys, and trades are unique by
-cycle and lineage. A completed cycle cannot be reclaimed. A stale running claim becomes failed and
-is safely reclaimed without duplicating child state.
+cycle and lineage. Cycle keys include the observer release, so every code release produces fresh
+evidence; within one release a completed cycle cannot be reclaimed. A stale running claim becomes
+failed and is safely reclaimed without duplicating child state.
 
 This isolates the trial without disabling or editing any real user's strategy activation. It also
 means trial trades are intentionally not presented as user-facing production trades. Real market
@@ -33,9 +34,11 @@ observation and deterministic execution are reported separately.
 
 ## Trial coverage
 
-The production service records actual closed-session/no-signal decisions for both strategies from
-the live production clock, calendar, and Rust scheduler evidence. Full lifecycle events that do
-not naturally occur during the observation window use immutable deterministic Rust-oracle cases:
+The production service records actual closed-session decisions from the live production clock,
+calendar, and Rust scheduler evidence. The observed Futures session had no signal. The observed
+SuperTrend session had a Rust `SQUARE_OFF` signal with zero expected users, which is explicitly
+classified as EOD with no open DEMO position rather than as no-signal. Full lifecycle events that
+do not naturally occur during the observation window use immutable deterministic Rust-oracle cases:
 
 - Futures BUY target, SELL SL1, BUY SL2 and opposite SELL reversal;
 - SuperTrend target, stop, and 15:10 EOD semantics;
@@ -53,9 +56,10 @@ values are compared exactly in these fixtures.
 ## Failure and rollback behavior
 
 Worker exceptions do not release leadership or bypass the durable claim. PostgreSQL errors fail
-the health check closed. Stale claims are recovered on startup and every poll. Restarting the
-container reuses the same release/cycle keys and cannot create a second signal, intent, order, or
-trade. A second instance cannot acquire the advisory lock.
+the health check closed and increment a cumulative poll-error counter distinct from lifecycle
+parity errors. Stale claims are recovered on startup and every poll. Restarting the container
+reuses the same release/cycle keys and cannot create a second signal, intent, order, or trade. A
+second instance cannot acquire the advisory lock.
 
 Phase 12 rollback stops/removes only `python-demo-trial` and `demo-trial-db-proxy`. The disposable
 trial schema is retained for evidence. Rust, frontend, PostgreSQL, Caddy, egress, user settings,

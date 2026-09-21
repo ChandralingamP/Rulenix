@@ -1,5 +1,45 @@
 # Rulenix Rust to Python Migration Master Specification
 
+## 48. Phase 12 DEMO trial and Phase 13 preflight
+
+Phase 12 added an isolated internal-only Python DEMO trial for two synthetic accounts and both
+production strategies. Rust remains the only public and LIVE authority. The trial role is
+read-only on selected production clock/calendar/scheduler/signal/Kill Switch columns and can write
+only `rulenix_demo_trial`; its image contains no Angel, credentials, egress, API, reconciliation,
+or general trading package.
+
+Deployed release `0398e66ac9e82b6198661092218691000946065d` recorded 22/22 exact matches:
+20 deterministic production-derived lifecycle replays and two real closed-session observations.
+Futures recorded no signal; the observed SuperTrend `SQUARE_OFF` with zero expected users was
+correctly classified as EOD with no open DEMO position. Restart and a controlled trial-only
+database-proxy outage produced no duplicate or lost lifecycle state.
+
+The authoritative Phase 10 audit passes with 199 tests and three skips; focused Phase 12 coverage
+passes 10 tests including the disposable-PostgreSQL permission/idempotency case. Ruff and Mypy
+pass. Rust, PostgreSQL, frontend, public readiness, Phase 11 shadow, and the Phase 12 service are
+healthy. Python still has zero reachable Angel mutation paths and performed no LIVE action.
+
+A fresh post-trial broker gate found zero positions and zero exposure-capable orders, but two
+broker order records remain `AMBIGUOUS` due to unknown broker states. Two accounts also remain
+offline and not LIVE-ready. The gate returned `BLOCK`, so final source telemetry commit
+`4d114907ba9fc81094b5199187262cc2ebe42975` was not redeployed. No broker state was modified.
+
+Rust has 18 cumulative recovered scheduler/worker errors caused by observed PostgreSQL deadlocks.
+The ambiguous broker evidence, offline accounts, deadlock remediation/soak, security advisories,
+missing Python LIVE mutation implementation, fencing protocol, and broker certification all remain
+Phase 13 blockers. Phase 13 and public cutover were not started. Full evidence and the exact future
+cutover/rollback plan are in `PHASE12_DEMO_TRIAL_REPORT.md` and
+`docs/phase12-demo-trial-and-cutover-preflight.md`.
+
+```text
+CURRENT PHASE: 12 BLOCKED AT FINAL PRODUCTION SAFETY GATE
+AUTHORITATIVE RUST RELEASE: ab14c3ca05ce91ad959b29ace66f623936cd4f76
+DEPLOYED PHASE 11 SHADOW: 743a99887b9f147241fcd1430306954d935865c2
+DEPLOYED PHASE 12 DEMO: 0398e66ac9e82b6198661092218691000946065d
+PHASE 13: NOT STARTED
+PHASE 12: BLOCKED
+```
+
 > Phase 1 production audit and behavioral migration contract. This document is specification only: it does not authorize a Python implementation, deployment, database change, broker mutation, network change, or production operation.
 
 ## 0. Authority, scope, and evidence
