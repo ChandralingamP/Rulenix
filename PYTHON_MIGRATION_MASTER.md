@@ -24,7 +24,7 @@ broker order records remain `AMBIGUOUS` due to unknown broker states. Two accoun
 offline and not LIVE-ready. The gate returned `BLOCK`, so final source telemetry commit
 `4d114907ba9fc81094b5199187262cc2ebe42975` was not redeployed. No broker state was modified.
 
-Rust has 18 cumulative recovered scheduler/worker errors caused by observed PostgreSQL deadlocks.
+Rust has 41 cumulative recovered scheduler/worker errors caused by observed PostgreSQL deadlocks.
 The ambiguous broker evidence, offline accounts, deadlock remediation/soak, security advisories,
 missing Python LIVE mutation implementation, fencing protocol, and broker certification all remain
 Phase 13 blockers. Phase 13 and public cutover were not started. Full evidence and the exact future

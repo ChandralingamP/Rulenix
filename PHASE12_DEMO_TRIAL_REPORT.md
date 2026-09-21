@@ -104,9 +104,9 @@ finding is outside the changed scope; the authoritative `app tests` run passed.
 ```text
 RUST PRODUCTION HEALTH: ready; container healthy; restart count 0
 RUST SCHEDULER LEADER: true
-RUST SCHEDULER ADVANCING: yes; dispatch_count advanced 272557 -> 274023
-RUST LAST ADVANCEMENT / DISPATCH: 2026-09-20T15:34:01Z at final sample
-RUST WORKER ERRORS: 18 cumulative
+RUST SCHEDULER ADVANCING: yes; dispatch_count advanced 272557 -> 471114
+RUST LAST ADVANCEMENT / DISPATCH: 2026-09-21T08:19:01Z at final sample
+RUST WORKER ERRORS: 41 cumulative
 PYTHON DEMO HEALTH: ready; leader=true; stale=false; 22/22 matches
 POSTGRESQL HEALTH: healthy; restart count 0
 FRONTEND HEALTH: running; restart count 0
@@ -114,7 +114,7 @@ PUBLIC READINESS: HTTPS 200
 GLOBAL KILL SWITCH: disabled
 ```
 
-The 18 Rust errors are recovered PostgreSQL deadlocks in SuperTrend mandatory square-off and
+The 41 Rust errors are recovered PostgreSQL deadlocks in SuperTrend mandatory square-off and
 execution-intent recovery. Rust continues advancing, but a clean observation window after a
 separate remediation is required before Phase 13.
 
@@ -179,7 +179,7 @@ leak, or readiness failure triggers rollback review.
 
 Phase 13 blockers are: two ambiguous broker order states; two offline/not-LIVE-ready accounts; no
 Python LIVE mutation implementation; no fenced authority transfer; no broker sandbox certification;
-18 recovered Rust worker deadlocks without a clean post-remediation window; Rust
+41 recovered Rust worker deadlocks without a clean post-remediation window; Rust
 `RUSTSEC-2026-0285` (`rustls 0.23.43`, fixed in 0.23.45+); unfixed `RUSTSEC-2023-0071` in `rsa`;
 yanked `chacha20 0.10.1`; and seven frontend development-tool advisories (production dependency
 audit remains zero).
