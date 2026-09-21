@@ -157,7 +157,9 @@ function strictSyntheticShape(order) {
     && id.uniqueOrderId.startsWith("SE-")
     && text(order, "ordertype", "orderType").toUpperCase() === "OCO_LIMIT"
     && text(order, "variety").toUpperCase() === "NORMAL"
-    && text(order, "producttype", "productType").toUpperCase() === "INTRADAY"
+    && ["INTRADAY", "CARRYFORWARD"].includes(
+      text(order, "producttype", "productType").toUpperCase(),
+    )
     && /^N_Spark_(Android|IOS)_/.test(text(order, "strategycode", "strategyCode"))
     && (number(order, "quantity") ?? 0) > 0
     && number(order, "filledshares", "filledShares") === 0

@@ -3140,6 +3140,23 @@ async fn process_execution_intents(state: &AppState, signal_id: Option<Uuid>) ->
             tracing::warn!(%error,"strategy execution intent task failed");
         }
     }
+    // ENTRY and SQUARE_OFF refreshes run concurrently. Lock each scope in the
+    // same stable order before updating so PostgreSQL cannot invert row locks.
+    let mut status_transaction = state.db.begin().await?;
+    let _status_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT s.id
+         FROM strategy_signals s
+         WHERE ($1::uuid IS NULL OR s.id=$1)
+           AND EXISTS(
+             SELECT 1 FROM strategy_execution_intents i
+             WHERE i.signal_id=s.id AND i.action='ENTRY'
+           )
+         ORDER BY s.id
+         FOR UPDATE OF s",
+    )
+    .bind(signal_id)
+    .fetch_all(&mut *status_transaction)
+    .await?;
     sqlx::query(
         "UPDATE strategy_signals s SET status=summary.status,updated_at=NOW()
          FROM (
@@ -3151,13 +3168,14 @@ async fn process_execution_intents(state: &AppState, signal_id: Option<Uuid>) ->
                ELSE 'completed'
              END AS status
            FROM strategy_execution_intents
-           WHERE ($1::uuid IS NULL OR signal_id=$1)
+           WHERE action='ENTRY' AND ($1::uuid IS NULL OR signal_id=$1)
            GROUP BY signal_id
          ) summary WHERE s.id=summary.signal_id",
     )
     .bind(signal_id)
-    .execute(&state.db)
+    .execute(&mut *status_transaction)
     .await?;
+    status_transaction.commit().await?;
     Ok(count)
 }
 
@@ -4781,14 +4799,29 @@ async fn reconcile_square_off_intents(state: &AppState) -> AppResult<()> {
     )
     .execute(&state.db)
     .await?;
+    // Match the ENTRY refresh lock order while keeping the action scopes disjoint.
+    let mut status_transaction = state.db.begin().await?;
+    let _status_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT s.id
+         FROM strategy_signals s
+         WHERE EXISTS(
+           SELECT 1 FROM strategy_execution_intents i
+           WHERE i.signal_id=s.id AND i.action='SQUARE_OFF'
+         )
+         ORDER BY s.id
+         FOR UPDATE OF s",
+    )
+    .fetch_all(&mut *status_transaction)
+    .await?;
     sqlx::query(
         "UPDATE strategy_signals s SET status=summary.status,updated_at=NOW()
          FROM (SELECT signal_id,CASE WHEN BOOL_OR(status IN ('pending','claimed','retry_wait','submitted')) THEN 'dispatching' WHEN BOOL_OR(status='failed') THEN 'partial' ELSE 'completed' END status
                FROM strategy_execution_intents WHERE action='SQUARE_OFF' GROUP BY signal_id) summary
          WHERE s.id=summary.signal_id",
     )
-    .execute(&state.db)
+    .execute(&mut *status_transaction)
     .await?;
+    status_transaction.commit().await?;
     Ok(())
 }
 
@@ -14449,6 +14482,98 @@ mod tests {
                 residual_incoming: 0,
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn concurrent_signal_status_refreshes_do_not_deadlock() {
+        let state = isolated_test_state().await;
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users(id,username,email,password_hash) VALUES($1,'signal-lock-test','signal-lock-test@example.test','test-only')",
+        )
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for index in 0..64 {
+            let signal_id = Uuid::new_v4();
+            let action = if index % 2 == 0 {
+                "ENTRY"
+            } else {
+                "SQUARE_OFF"
+            };
+            let signal_type = if action == "ENTRY" {
+                "ENTRY"
+            } else {
+                "SQUARE_OFF"
+            };
+            sqlx::query(
+                "INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,signal_type,status,expected_users)
+                 VALUES($1,$2,'LOCK_TEST',$3,NOW(),$4,'dispatching',1)",
+            )
+            .bind(signal_id)
+            .bind(if action == "ENTRY" {
+                STRATEGY_KEY
+            } else {
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+            })
+            .bind(format!("signal-lock-{index}"))
+            .bind(signal_type)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO strategy_execution_intents(
+                   id,signal_id,user_id,strategy_key,instrument,session_key,action,role,side,
+                   order_type,lots,quantity,price,status,completed_at)
+                 VALUES(gen_random_uuid(),$1,$2,$3,'LOCK_TEST',$4,$5,'EMERGENCY_CLOSE','SELL',
+                        'MARKET',1,1,1,'completed',NOW())",
+            )
+            .bind(signal_id)
+            .bind(user_id)
+            .bind(if action == "ENTRY" {
+                STRATEGY_KEY
+            } else {
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+            })
+            .bind(format!("signal-lock-{index}"))
+            .bind(action)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for worker in 0..16 {
+            let task_state = state.clone();
+            tasks.spawn(async move {
+                for _ in 0..20 {
+                    if worker % 2 == 0 {
+                        process_execution_intents(&task_state, None).await?;
+                    } else {
+                        reconcile_square_off_intents(&task_state).await?;
+                    }
+                }
+                AppResult::Ok(())
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(result) = tasks.join_next().await {
+                result.expect("status refresh task must not panic").unwrap();
+            }
+        })
+        .await
+        .expect("deterministically ordered status refreshes must not stall");
+
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM strategy_signals
+             WHERE instrument='LOCK_TEST' AND status='completed'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(completed, 64);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

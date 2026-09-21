@@ -42,6 +42,11 @@ test("active conditional rules block", () => {
 
 test("only fully proven non-executable synthetic records are exempt", () => {
   assert.equal(classifyBrokerOrder(synthetic, syntheticContext), "synthetic");
+  assert.equal(
+    classifyBrokerOrder({ ...synthetic, producttype: "CARRYFORWARD" }, syntheticContext),
+    "synthetic",
+  );
+  assert.equal(classifyBrokerOrder({ ...synthetic, producttype: "DELIVERY" }, syntheticContext), "unknown");
   assert.equal(classifyBrokerOrder({ ...synthetic, strategycode: "" }, syntheticContext), "unknown");
   assert.equal(classifyBrokerOrder(synthetic, { ...syntheticContext, conditionalReadSucceeded: false }), "unknown");
   assert.equal(classifyBrokerOrder(synthetic, { ...syntheticContext, positions: [] }), "unknown");
