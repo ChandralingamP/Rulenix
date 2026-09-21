@@ -290,6 +290,16 @@ fn feed_generation_is_current(
     active.get(exchange) == Some(&generation)
 }
 
+fn market_feed_failure_code(message: &str) -> &'static str {
+    if message.contains("subscription is empty") {
+        "market_data_subscription_empty"
+    } else if message.contains("feed is stale") {
+        "market_data_no_ticks"
+    } else {
+        "market_feed_disconnected"
+    }
+}
+
 async fn state_feed_generation_is_current(
     state: &AppState,
     key: &str,
@@ -337,11 +347,13 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
                     rate_limited = crate::angel::is_rate_limit_error(&error.to_string());
                     let token_count: usize = requested.values().map(HashSet::len).sum();
                     tracing::warn!(exchanges = requested.len(), tokens = token_count, %error, attempt, "shared strategy market feed stopped");
+                    let message = error.to_string();
+                    let code = market_feed_failure_code(&message);
                     crate::strategy::operational_alert(
                         &state,
                         None,
                         "",
-                        "market_feed_disconnected",
+                        code,
                         "error",
                         &format!(
                             "Shared market feed stopped and will reconnect automatically: {error}"
@@ -354,6 +366,9 @@ pub async fn ensure_strategy_feed(state: AppState, exchange: String, token: Stri
             if refresh_all_requested_tokens(&state).await.is_empty()
                 || !state_feed_generation_is_current(&state, SHARED_FEED_KEY, generation).await
             {
+                // Pre-order requests are session-scoped. Durable order/trade
+                // tokens are reconstructed from PostgreSQL next session.
+                state.strategy_feed_tokens.lock().await.clear();
                 break;
             }
             let ceiling = if rate_limited {
@@ -412,9 +427,18 @@ async fn refresh_requested_tokens(state: &AppState, exchange: &str) -> HashSet<S
     let mut requested = state.strategy_feed_tokens.lock().await;
     let entry = requested.entry(exchange.to_owned()).or_default();
     if let Ok(tokens) = query {
-        *entry = tokens.into_iter().collect();
+        // A selected contract can be requested before its durable order row
+        // exists. Replacing this set dropped that token before subscription.
+        merge_requested_tokens(entry, tokens);
     }
     entry.clone()
+}
+
+fn merge_requested_tokens(
+    requested: &mut HashSet<String>,
+    derived: impl IntoIterator<Item = String>,
+) {
+    requested.extend(derived);
 }
 
 async fn refresh_all_requested_tokens(
@@ -487,13 +511,20 @@ async fn run_strategy_feed(state: &AppState, generation: uuid::Uuid) -> anyhow::
     let (mut sender, mut receiver) = socket.split();
     let mut subscribed = refresh_all_requested_tokens(state).await;
     if subscribed.is_empty() {
-        return Ok(());
+        anyhow::bail!("shared market data subscription is empty");
     }
+    let subscribed_token_count: usize = subscribed.values().map(HashSet::len).sum();
     sender.send(subscribe_groups_message(&subscribed)).await?;
+    tracing::info!(
+        exchanges = subscribed.len(),
+        tokens = subscribed_token_count,
+        "shared strategy market feed subscribed"
+    );
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut freshness = interval(Duration::from_secs(5));
     let mut subscriptions = interval(Duration::from_secs(5));
     let mut last_tick = Instant::now();
+    let mut first_tick_received = false;
     let mut freshness_threshold = shared_freshness_threshold(&subscribed);
     loop {
         tokio::select! {
@@ -537,6 +568,10 @@ async fn run_strategy_feed(state: &AppState, generation: uuid::Uuid) -> anyhow::
                     && let Some(tick_at)=tick_timestamp(&tick) {
                     let token = tick["token"].as_str().unwrap_or_default();
                     last_tick=Instant::now();
+                    if !first_tick_received {
+                        first_tick_received = true;
+                        tracing::info!(exchange, "shared strategy market feed received its first tick");
+                    }
                     crate::strategy::process_tick_shared(
                         state,
                         exchange,
@@ -609,5 +644,30 @@ mod tests {
         let active = std::collections::HashMap::from([("MCX".to_string(), replacement)]);
         assert!(!feed_generation_is_current(&active, "MCX", old));
         assert!(feed_generation_is_current(&active, "MCX", replacement));
+    }
+
+    #[test]
+    fn derived_tokens_do_not_discard_a_pre_order_subscription() {
+        let mut requested = HashSet::from(["pre-order-option".to_owned()]);
+        merge_requested_tokens(&mut requested, ["durable-order".to_owned()]);
+        assert_eq!(requested.len(), 2);
+        assert!(requested.contains("pre-order-option"));
+        assert!(requested.contains("durable-order"));
+    }
+
+    #[test]
+    fn empty_and_stale_feeds_have_actionable_failure_codes() {
+        assert_eq!(
+            market_feed_failure_code("shared market data subscription is empty"),
+            "market_data_subscription_empty"
+        );
+        assert_eq!(
+            market_feed_failure_code("shared Angel One feed is stale (no tick for 45 seconds)"),
+            "market_data_no_ticks"
+        );
+        assert_eq!(
+            market_feed_failure_code("connection reset"),
+            "market_feed_disconnected"
+        );
     }
 }

@@ -3,8 +3,12 @@ import http from "node:http";
 import https from "node:https";
 import {
   classifyBrokerOrder,
+  classifyConditionalOwnership,
+  classifyOrderOwnership,
+  classifyPositionOwnership,
   conditionalRuleIsActive,
   orderIdentity,
+  ownership,
 } from "./broker-exposure-classifier.mjs";
 import {
   deploymentAccountDecision,
@@ -146,6 +150,16 @@ let activeOrders = 0;
 let unknownOrders = 0;
 let syntheticOrders = 0;
 let activeConditionalRules = 0;
+const exposureTotals = {
+  positions: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
+  orders: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
+  conditionals: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
+};
+
+const safeReference = (value) => {
+  const raw = String(value ?? "");
+  return raw.length <= 4 ? raw : `...${raw.slice(-4)}`;
+};
 
 for (let index = 0; index < accounts.length; index += 1) {
   const account = accounts[index];
@@ -155,6 +169,8 @@ for (let index = 0; index < accounts.length; index += 1) {
   let brokerSafe = false;
   let brokerExposureObserved = false;
   let brokerCounts = null;
+  let ownershipCounts = { rulenix_owned: 0, manual_external: 0, ambiguous: 0 };
+  let evidence = [];
   let diagnostic = "";
   try {
     if (account.egress_ip && (account.egress_configuration_status !== "CONFIGURED"
@@ -203,11 +219,57 @@ for (let index = 0; index < accounts.length; index += 1) {
         conditionalReadSucceeded: conditionalRead.status === "fulfilled",
         detail,
       });
+      if (classification === "active" || classification === "unknown") {
+        const attribution = classification === "unknown"
+          ? { ownership: ownership.ambiguous, evidence: "unknown_broker_order_state" }
+          : classifyOrderOwnership(order, account.known_orders);
+        exposureTotals.orders[attribution.ownership] += 1;
+        ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
+          : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
+        evidence.push({
+          kind: "order", ownership: attribution.ownership, exchange: identity.exchange,
+          token: identity.symbolToken, symbol: identity.symbol,
+          reference: safeReference(identity.orderId || identity.uniqueOrderId),
+          reason: attribution.evidence,
+        });
+      }
       if (classification === "active") accountActiveOrders += 1;
       if (classification === "unknown") accountUnknownOrders += 1;
       if (classification === "synthetic") accountSyntheticOrders += 1;
     }
-    const accountActiveConditionalRules = conditionalRules.filter(conditionalRuleIsActive).length;
+    for (const position of positions) {
+      const quantity = Number.parseInt(String(position.netqty ?? position.netQty ?? "0"), 10);
+      if (Number.isFinite(quantity) && quantity === 0) continue;
+      const identity = orderIdentity(position);
+      const attribution = classifyPositionOwnership(position, {
+        orders, trades, knownOrders: account.known_orders,
+        openLocalPositions: account.open_local_positions,
+        rulenixContractHistory: account.rulenix_contract_history,
+        allowDurableNegativeProof: true,
+      });
+      exposureTotals.positions[attribution.ownership] += 1;
+      ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
+        : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
+      evidence.push({
+        kind: "position", ownership: attribution.ownership, exchange: identity.exchange,
+        token: identity.symbolToken, symbol: identity.symbol, quantity,
+        reason: attribution.evidence,
+        fill_attribution: attribution.details,
+      });
+    }
+    const activeRules = conditionalRules.filter(conditionalRuleIsActive);
+    for (const rule of activeRules) {
+      const identity = orderIdentity(rule);
+      const attribution = classifyConditionalOwnership(rule);
+      exposureTotals.conditionals[attribution.ownership] += 1;
+      ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
+        : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
+      evidence.push({
+        kind: "conditional", ownership: attribution.ownership, exchange: identity.exchange,
+        token: identity.symbolToken, symbol: identity.symbol, reason: attribution.evidence,
+      });
+    }
+    const accountActiveConditionalRules = activeRules.length;
     brokerCounts = {
       open_positions: accountOpenPositions,
       active_orders: accountActiveOrders,
@@ -219,7 +281,8 @@ for (let index = 0; index < accounts.length; index += 1) {
     const noObservedExposure = accountOpenPositions === 0 && accountActiveOrders === 0
       && accountUnknownOrders === 0 && accountActiveConditionalRules === 0;
     brokerExposureObserved = !noObservedExposure;
-    brokerSafe = brokerReadable && noObservedExposure;
+    brokerSafe = brokerReadable && ownershipCounts.rulenix_owned === 0
+      && ownershipCounts.ambiguous === 0;
     if (brokerReadable) {
       readableAccounts += 1;
     } else {
@@ -246,6 +309,8 @@ for (let index = 0; index < accounts.length; index += 1) {
     brokerReadable,
     brokerSafe,
     brokerExposureObserved,
+    rulenixOwnedExposure: ownershipCounts.rulenix_owned,
+    ambiguousExposure: ownershipCounts.ambiguous,
     local: account.local,
   });
   decisions.push(decision);
@@ -260,6 +325,8 @@ for (let index = 0; index < accounts.length; index += 1) {
     live_ready: decision.liveReady,
     classification: decision.classification,
     broker: brokerCounts,
+    ownership: ownershipCounts,
+    evidence,
     read_diagnostic: diagnostic,
   })}`);
 }
@@ -274,6 +341,14 @@ console.log(`BROKER_EXPOSURE_CAPABLE_ORDERS=${activeOrders}`);
 console.log(`BROKER_UNKNOWN_ORDERS=${unknownOrders}`);
 console.log(`BROKER_PROVEN_SYNTHETIC_RECORDS=${syntheticOrders}`);
 console.log(`ACTIVE_BROKER_CONDITIONAL_RULES=${activeConditionalRules}`);
+console.log(`RULENIX_OWNED_POSITIONS=${exposureTotals.positions[ownership.rulenix]}`);
+console.log(`RULENIX_OWNED_ACTIVE_ORDERS=${exposureTotals.orders[ownership.rulenix]}`);
+console.log(`MANUAL_EXTERNAL_POSITIONS=${exposureTotals.positions[ownership.manual]}`);
+console.log(`MANUAL_EXTERNAL_ACTIVE_ORDERS=${exposureTotals.orders[ownership.manual]}`);
+console.log(`AMBIGUOUS_POSITIONS=${exposureTotals.positions[ownership.ambiguous]}`);
+console.log(`AMBIGUOUS_ACTIVE_ORDERS=${exposureTotals.orders[ownership.ambiguous]}`);
+console.log(`MANUAL_EXTERNAL_CONDITIONAL_RULES=${exposureTotals.conditionals[ownership.manual]}`);
+console.log(`AMBIGUOUS_CONDITIONAL_RULES=${exposureTotals.conditionals[ownership.ambiguous]}`);
 console.log(`OFFLINE_SAFE_USER_IDS=${offlineSafeUserIds.join(",")}`);
 console.log(`DEPLOYMENT_GATE=${allowed ? "PASS" : "BLOCK"}`);
 if (!allowed) process.exit(2);

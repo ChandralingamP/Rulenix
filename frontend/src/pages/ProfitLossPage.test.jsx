@@ -81,7 +81,7 @@ describe("ProfitLossPage exit audit", () => {
     expect(screen.getByText("SuperTrend Index Options v1")).toBeInTheDocument();
   });
 
-  it("confirms and submits a close only for an open LIVE trade", async () => {
+  it("keeps the close action for an open LIVE trade", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     apiClient.post.mockResolvedValue({
       data: { status: "submitted", message: "Awaiting broker fill." },
@@ -107,5 +107,69 @@ describe("ProfitLossPage exit audit", () => {
         "/pnl/trades/trade-live/close"
       )
     );
+    expect(screen.getByText("LIVE")).toBeInTheDocument();
+  });
+
+  it("shows and completes the close action for an open DEMO trade", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    apiClient.post.mockResolvedValue({
+      data: { status: "completed", message: "DEMO trade closed locally." },
+    });
+    renderPage([{
+      id: "trade-demo",
+      status: "open",
+      execution_mode: "demo",
+      direction: "SELL",
+      quantity: 2,
+      strategy_key: "futures_breakout_v3",
+      instrument_label: "SILVERMIC",
+      contract_symbol: "SILVERMIC30NOV26FUT",
+      entry_price: 236315,
+      last_price: 236901,
+      pnl: 0,
+    }]);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Close Trade" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("running DEMO trade"));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("No Angel One order will be sent"));
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalledTimes(1));
+    expect(apiClient.post).toHaveBeenCalledWith("/pnl/trades/trade-demo/close");
+    await waitFor(() => expect(apiClient.get.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(screen.getByText("DEMO")).toBeInTheDocument();
+  });
+
+  it("offers close only for running DEMO and LIVE rows", async () => {
+    renderPage([
+      { id: "demo-open", status: "open", execution_mode: "demo", direction: "BUY", quantity: 1 },
+      { id: "live-open", status: "open", execution_mode: "live", direction: "SELL", quantity: 1 },
+      { id: "demo-closed", status: "closed", execution_mode: "demo", direction: "BUY", quantity: 1 },
+    ]);
+
+    expect(await screen.findAllByRole("button", { name: "Close Trade" })).toHaveLength(2);
+  });
+
+  it("prevents duplicate clicks while closing and reports the server error without an optimistic close", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    let rejectClose;
+    apiClient.post.mockReturnValue(new Promise((_, reject) => {
+      rejectClose = reject;
+    }));
+    renderPage([{
+      id: "demo-error",
+      status: "open",
+      execution_mode: "demo",
+      direction: "BUY",
+      quantity: 1,
+    }]);
+
+    const close = await screen.findByRole("button", { name: "Close Trade" });
+    fireEvent.click(close);
+    const pending = await screen.findByRole("button", { name: "Closing..." });
+    expect(pending).toBeDisabled();
+    fireEvent.click(pending);
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
+    rejectClose({ response: { data: { detail: "Fresh quote is unavailable." } } });
+    expect(await screen.findByText("Fresh quote is unavailable.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close Trade" })).toBeInTheDocument();
   });
 });

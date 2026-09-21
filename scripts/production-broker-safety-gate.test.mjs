@@ -62,6 +62,24 @@ test("readable broker exposure blocks even when local state is empty", () => {
   assert.equal(deploymentAccountDecision({ brokerReadable: true, brokerSafe: false, local: flat }).allow, false);
 });
 
+test("proven manual broker exposure permits deployment", () => {
+  const decision = deploymentAccountDecision({
+    brokerReadable: true, brokerExposureObserved: true,
+    rulenixOwnedExposure: 0, ambiguousExposure: 0, local: flat,
+  });
+  assert.equal(decision.allow, true);
+  assert.equal(decision.liveReady, true);
+});
+
+test("Rulenix-owned or ambiguous broker exposure blocks deployment", () => {
+  assert.equal(deploymentAccountDecision({
+    brokerReadable: true, rulenixOwnedExposure: 1, local: flat,
+  }).allow, false);
+  assert.equal(deploymentAccountDecision({
+    brokerReadable: true, ambiguousExposure: 1, local: flat,
+  }).allow, false);
+});
+
 test("readable broker-flat account still blocks on unresolved local state", () => {
   const decision = deploymentAccountDecision({
     brokerReadable: true,

@@ -31,10 +31,16 @@ See `infra/systemd/rulenix-backend.service` and `infra/nginx/rulenix.conf`.
 ## Upgrade
 
 1. Verify backups and restore verification are current.
-2. Deploy backend first so migrations run exactly once.
-3. Wait for `/api/health/ready`.
-4. Deploy frontend static bundle.
-5. Review `/api/metrics`, logs, and alert delivery attempts.
+2. Run the read-only production broker safety gate. It attributes exposure as `RULENIX_OWNED`, `MANUAL_EXTERNAL`, or `AMBIGUOUS` from durable broker IDs/client tags and authoritative order, trade, position, and conditional books. Broker read failures and ambiguous ownership fail closed.
+3. Deploy only when Rulenix-owned/unresolved and ambiguous exposure are zero. Proven manual exposure is reported but does not block restart and must never be cancelled, modified, closed, or adopted by deployment tooling.
+4. Deploy backend first so migrations run exactly once.
+5. Wait for `/api/health/ready`.
+6. Deploy frontend static bundle.
+7. Review `/api/metrics`, logs, and alert delivery attempts.
+
+Before a new LIVE entry, fresh broker observations also block only an exact
+account/exchange/contract collision with manual or ambiguous exposure. Manual
+activity in another contract does not globally disable LIVE or DEMO execution.
 
 ## Rollback
 

@@ -220,6 +220,7 @@ async fn main() -> Result<()> {
         angel_request_history: Default::default(),
         shared_historical_cooldowns: Default::default(),
         shared_market_cursor: Default::default(),
+        scheduler_health: Default::default(),
         strategy_execution_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         credentials: credential_store,
         abuse_prevention: Default::default(),

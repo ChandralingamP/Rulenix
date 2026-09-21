@@ -23,7 +23,122 @@ export function orderIdentity(item) {
     uniqueOrderId: text(item, "uniqueorderid", "uniqueOrderId"),
     symbol: text(item, "tradingsymbol", "tradingSymbol"),
     symbolToken: text(item, "symboltoken", "symbolToken"),
+    exchange: text(item, "exchange").toUpperCase(),
+    orderTag: text(item, "ordertag", "orderTag"),
+    side: text(item, "transactiontype", "transactionType", "side").toUpperCase(),
+    quantity: number(item, "quantity", "fillsize", "fillSize", "filledshares", "filledShares"),
   };
+}
+
+export const ownership = Object.freeze({
+  rulenix: "RULENIX_OWNED",
+  manual: "MANUAL_EXTERNAL",
+  ambiguous: "AMBIGUOUS",
+});
+
+export function isRulenixOrderTag(value) {
+  return /^RX[0-9A-F]{18}$/.test(String(value ?? "").trim().toUpperCase());
+}
+
+function knownOrderSets(knownOrders = []) {
+  return {
+    ids: new Set(knownOrders.map((item) => String(item.broker_order_id ?? "").trim()).filter(Boolean)),
+    tags: new Set(knownOrders.map((item) => String(item.client_order_id ?? "").trim()).filter(Boolean)),
+  };
+}
+
+export function classifyOrderOwnership(order, knownOrders = []) {
+  const id = orderIdentity(order);
+  const known = knownOrderSets(knownOrders);
+  if ((id.orderId && known.ids.has(id.orderId)) || (id.orderTag && known.tags.has(id.orderTag))) {
+    return { ownership: ownership.rulenix, evidence: "durable_local_order_identifier" };
+  }
+  if (isRulenixOrderTag(id.orderTag)) {
+    return { ownership: ownership.ambiguous, evidence: "unmatched_rulenix_order_tag" };
+  }
+  const structurallyComplete = id.orderId !== "" && id.exchange !== ""
+    && id.symbolToken !== "" && ["BUY", "SELL"].includes(id.side)
+    && Number.isFinite(id.quantity) && id.quantity > 0;
+  if (structurallyComplete) {
+    return {
+      ownership: ownership.manual,
+      evidence: id.orderTag ? "complete_non_rulenix_broker_order_tag" : "complete_untagged_broker_order",
+    };
+  }
+  return { ownership: ownership.ambiguous, evidence: "incomplete_unmatched_broker_order" };
+}
+
+function signedQuantity(item) {
+  const id = orderIdentity(item);
+  const fillQuantity = number(item, "fillsize", "fillSize", "filledshares", "filledShares", "quantity");
+  if (!Number.isFinite(fillQuantity) || fillQuantity <= 0) return undefined;
+  if (id.side === "BUY") return fillQuantity;
+  if (id.side === "SELL") return -fillQuantity;
+  return undefined;
+}
+
+export function classifyPositionOwnership(position, context = {}) {
+  const id = orderIdentity(position);
+  const net = number(position, "netqty", "netQty");
+  if (!id.exchange || !id.symbolToken || !Number.isInteger(net) || net === 0) {
+    return { ownership: ownership.ambiguous, evidence: "invalid_position_identity_or_quantity", details: { matchingFills: 0 } };
+  }
+  if ((context.openLocalPositions ?? []).some((local) =>
+    String(local.exchange_segment ?? "").toUpperCase() === id.exchange
+      && String(local.contract_token ?? "") === id.symbolToken)) {
+    return { ownership: ownership.rulenix, evidence: "open_local_live_trade_contract", details: { matchingFills: 0 } };
+  }
+  const orderById = new Map((context.orders ?? []).map((order) => [orderIdentity(order).orderId, order]));
+  const totals = { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 };
+  let matchingFills = 0;
+  for (const fill of context.trades ?? []) {
+    const fillId = orderIdentity(fill);
+    if (fillId.exchange !== id.exchange || fillId.symbolToken !== id.symbolToken) continue;
+    const signed = signedQuantity(fill);
+    if (signed === undefined) {
+      totals[ownership.ambiguous] += Math.sign(net);
+      matchingFills += 1;
+      continue;
+    }
+    const source = orderById.get(fillId.orderId) ?? fill;
+    const attribution = classifyOrderOwnership(source, context.knownOrders);
+    totals[attribution.ownership] += signed;
+    matchingFills += 1;
+  }
+  if (matchingFills > 0 && totals[ownership.rulenix] === net
+      && totals[ownership.manual] === 0 && totals[ownership.ambiguous] === 0) {
+    return { ownership: ownership.rulenix, evidence: "net_position_matches_rulenix_fills", details: { matchingFills, ...totals } };
+  }
+  if (matchingFills > 0 && totals[ownership.manual] === net
+      && totals[ownership.rulenix] === 0 && totals[ownership.ambiguous] === 0) {
+    return { ownership: ownership.manual, evidence: "net_position_matches_manual_fills", details: { matchingFills, ...totals } };
+  }
+  const durableContractHistory = (context.rulenixContractHistory ?? []).some((item) =>
+    String(item.exchange_segment ?? "").toUpperCase() === id.exchange
+      && String(item.contract_token ?? "") === id.symbolToken
+      && Number(item.evidence_rows ?? 0) > 0);
+  if (context.allowDurableNegativeProof === true && !durableContractHistory) {
+    return {
+      ownership: ownership.manual,
+      evidence: "no_rulenix_durable_contract_history",
+      details: { matchingFills, ...totals },
+    };
+  }
+  return {
+    ownership: ownership.ambiguous,
+    evidence: "position_fill_ownership_not_exclusive",
+    details: { matchingFills, ...totals },
+  };
+}
+
+export function classifyConditionalOwnership(rule) {
+  const id = orderIdentity(rule);
+  const reference = text(rule, "id", "ruleid", "ruleId", "uniqueid", "uniqueId");
+  const quantity = number(rule, "qty", "quantity");
+  if (reference && id.exchange && id.symbolToken && Number.isFinite(quantity) && quantity > 0) {
+    return { ownership: ownership.manual, evidence: "complete_external_conditional_rule" };
+  }
+  return { ownership: ownership.ambiguous, evidence: "incomplete_conditional_rule" };
 }
 
 function sameInstrument(left, right) {
@@ -42,7 +157,9 @@ function strictSyntheticShape(order) {
     && id.uniqueOrderId.startsWith("SE-")
     && text(order, "ordertype", "orderType").toUpperCase() === "OCO_LIMIT"
     && text(order, "variety").toUpperCase() === "NORMAL"
-    && text(order, "producttype", "productType").toUpperCase() === "INTRADAY"
+    && ["INTRADAY", "CARRYFORWARD"].includes(
+      text(order, "producttype", "productType").toUpperCase(),
+    )
     && /^N_Spark_(Android|IOS)_/.test(text(order, "strategycode", "strategyCode"))
     && (number(order, "quantity") ?? 0) > 0
     && number(order, "filledshares", "filledShares") === 0

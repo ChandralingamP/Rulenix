@@ -241,7 +241,7 @@ Key table groups:
 - Identity and auth: `users`, `user_profiles`, `email_otps`, `user_sessions`, `broker_secrets`
 - Strategies: `user_strategy_activations`, `user_strategy_configs`, `strategy_market_snapshots`, `strategy_orders`, `strategy_events`, `strategy_scheduler_runs`
 - Execution and P&L: `trades`, `broker_order_events`, `strategy_reversal_intents`
-- Risk/ops: `risk_limits`, `risk_kill_switches`, `risk_decisions`, `market_price_ticks`, `broker_reconciliation_health`, `market_calendar`
+- Risk/ops: `risk_limits`, `risk_kill_switches`, `risk_decisions`, `market_price_ticks`, `broker_reconciliation_health`, `manual_broker_close_evidence`, `market_calendar`
 - Backtesting: `backtest_market_candles`, `backtest_runs`, `backtest_trades`
 - Audit/alerts: `audit_events`, `alert_delivery_attempts`
 

@@ -29,7 +29,11 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    future::Future,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
@@ -3136,6 +3140,23 @@ async fn process_execution_intents(state: &AppState, signal_id: Option<Uuid>) ->
             tracing::warn!(%error,"strategy execution intent task failed");
         }
     }
+    // ENTRY and SQUARE_OFF refreshes run concurrently. Lock each scope in the
+    // same stable order before updating so PostgreSQL cannot invert row locks.
+    let mut status_transaction = state.db.begin().await?;
+    let _status_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT s.id
+         FROM strategy_signals s
+         WHERE ($1::uuid IS NULL OR s.id=$1)
+           AND EXISTS(
+             SELECT 1 FROM strategy_execution_intents i
+             WHERE i.signal_id=s.id AND i.action='ENTRY'
+           )
+         ORDER BY s.id
+         FOR UPDATE OF s",
+    )
+    .bind(signal_id)
+    .fetch_all(&mut *status_transaction)
+    .await?;
     sqlx::query(
         "UPDATE strategy_signals s SET status=summary.status,updated_at=NOW()
          FROM (
@@ -3147,13 +3168,14 @@ async fn process_execution_intents(state: &AppState, signal_id: Option<Uuid>) ->
                ELSE 'completed'
              END AS status
            FROM strategy_execution_intents
-           WHERE ($1::uuid IS NULL OR signal_id=$1)
+           WHERE action='ENTRY' AND ($1::uuid IS NULL OR signal_id=$1)
            GROUP BY signal_id
          ) summary WHERE s.id=summary.signal_id",
     )
     .bind(signal_id)
-    .execute(&state.db)
+    .execute(&mut *status_transaction)
     .await?;
+    status_transaction.commit().await?;
     Ok(count)
 }
 
@@ -4777,14 +4799,29 @@ async fn reconcile_square_off_intents(state: &AppState) -> AppResult<()> {
     )
     .execute(&state.db)
     .await?;
+    // Match the ENTRY refresh lock order while keeping the action scopes disjoint.
+    let mut status_transaction = state.db.begin().await?;
+    let _status_signal_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT s.id
+         FROM strategy_signals s
+         WHERE EXISTS(
+           SELECT 1 FROM strategy_execution_intents i
+           WHERE i.signal_id=s.id AND i.action='SQUARE_OFF'
+         )
+         ORDER BY s.id
+         FOR UPDATE OF s",
+    )
+    .fetch_all(&mut *status_transaction)
+    .await?;
     sqlx::query(
         "UPDATE strategy_signals s SET status=summary.status,updated_at=NOW()
          FROM (SELECT signal_id,CASE WHEN BOOL_OR(status IN ('pending','claimed','retry_wait','submitted')) THEN 'dispatching' WHEN BOOL_OR(status='failed') THEN 'partial' ELSE 'completed' END status
                FROM strategy_execution_intents WHERE action='SQUARE_OFF' GROUP BY signal_id) summary
          WHERE s.id=summary.signal_id",
     )
-    .execute(&state.db)
+    .execute(&mut *status_transaction)
     .await?;
+    status_transaction.commit().await?;
     Ok(())
 }
 
@@ -5710,308 +5747,508 @@ fn retry_alert_severity(message: &str) -> &'static str {
     }
 }
 
-pub fn start(state: AppState) {
+struct BackgroundLease(Arc<AtomicBool>);
+
+impl BackgroundLease {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for BackgroundLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Default)]
+struct SchedulerLeaseRegistry(Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>);
+
+impl SchedulerLeaseRegistry {
+    fn try_acquire(&self, key: impl Into<String>) -> Option<BackgroundLease> {
+        let key = key.into();
+        let flag = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
+        BackgroundLease::try_acquire(&flag)
+    }
+}
+
+#[derive(Clone, Default)]
+struct SchedulerDispatchTracker(Arc<StdMutex<HashSet<String>>>);
+
+impl SchedulerDispatchTracker {
+    fn completed(&self, key: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(key)
+    }
+
+    fn mark_completed(&self, key: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key);
+    }
+
+    fn retain_date(&self, date: NaiveDate) {
+        let prefix = date.to_string();
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key| key.starts_with(&prefix));
+    }
+}
+
+#[derive(Clone, Default)]
+struct SchedulerJobRegistry {
+    leases: SchedulerLeaseRegistry,
+    dispatches: SchedulerDispatchTracker,
+}
+
+fn spawn_scheduler_job<F>(
+    state: AppState,
+    jobs: &SchedulerJobRegistry,
+    key: impl Into<String>,
+    completion_key: Option<String>,
+    job_name: &'static str,
+    timeout: Option<std::time::Duration>,
+    job: F,
+) -> bool
+where
+    F: Future<Output = AppResult<()>> + Send + 'static,
+{
+    if completion_key
+        .as_deref()
+        .is_some_and(|key| jobs.dispatches.completed(key))
+    {
+        return false;
+    }
+    let Some(lease) = jobs.leases.try_acquire(key) else {
+        return false;
+    };
+    state.scheduler_health.record_dispatch();
+    let dispatches = jobs.dispatches.clone();
     tokio::spawn(async move {
-        let _leader_connection = loop {
-            match state.db.acquire().await {
-                Ok(mut connection) => {
-                    let acquired: bool = sqlx::query_scalar(
-                        "SELECT pg_try_advisory_lock(hashtext('rulenix:strategy_scheduler'))",
-                    )
-                    .fetch_one(&mut *connection)
+        // The monitor owns the lease, so a worker panic also releases it and a
+        // later scheduler tick can retry without restarting the service.
+        let outcome = tokio::spawn(async move {
+            if let Some(timeout) = timeout {
+                tokio::time::timeout(timeout, job)
                     .await
-                    .unwrap_or(false);
-                    if acquired {
-                        tracing::info!("strategy scheduler leadership acquired");
-                        break connection;
-                    }
-                    operational_alert(
-                        &state,
-                        None,
-                        "",
-                        "scheduler_leadership_unavailable",
-                        "warning",
-                        "This backend replica is not the active scheduler leader.",
-                    )
-                    .await;
+                    .map(Some)
+                    .unwrap_or(None)
+            } else {
+                Some(job.await)
+            }
+        })
+        .await;
+        match outcome {
+            Ok(Some(Ok(()))) => {
+                if let Some(key) = completion_key {
+                    dispatches.mark_completed(key);
                 }
+                state
+                    .scheduler_health
+                    .record_dispatch_success(Utc::now().timestamp());
+            }
+            Ok(Some(Err(error))) => {
+                state.scheduler_health.record_dispatch_error();
+                tracing::warn!(job = job_name, %error, "scheduler job failed and will retry");
+            }
+            Ok(None) => {
+                state.scheduler_health.record_dispatch_error();
+                tracing::error!(job = job_name, "scheduler job timed out and will retry");
+            }
+            Err(error) => {
+                state.scheduler_health.record_dispatch_error();
+                tracing::error!(job = job_name, %error, "scheduler job panicked and will retry");
+            }
+        }
+        drop(lease);
+    });
+    true
+}
+
+struct SchedulerLeadershipGuard(Arc<crate::state::SchedulerHealth>);
+
+impl Drop for SchedulerLeadershipGuard {
+    fn drop(&mut self) {
+        self.0.leadership_lost();
+    }
+}
+
+pub fn start(state: AppState) {
+    let watchdog_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(30));
+        let mut alerted = false;
+        loop {
+            timer.tick().await;
+            let snapshot = watchdog_state
+                .scheduler_health
+                .snapshot_at(Utc::now().timestamp());
+            if snapshot.stale && !alerted {
+                alerted = true;
+                let age = Utc::now()
+                    .timestamp()
+                    .saturating_sub(snapshot.last_advance_epoch.unwrap_or_default());
+                tracing::error!(age_seconds = age, "strategy scheduler heartbeat is stale");
+                operational_alert_for(
+                    &watchdog_state,
+                    STRATEGY_KEY,
+                    None,
+                    "",
+                    "strategy_scheduler_stalled",
+                    "critical",
+                    &format!("Strategy scheduler has not advanced for {age} seconds."),
+                )
+                .await;
+            } else if !snapshot.stale {
+                alerted = false;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        loop {
+            state.scheduler_health.leadership_lost();
+            let runner = tokio::spawn(run_scheduler_leader(state.clone())).await;
+            state.scheduler_health.leadership_lost();
+            match runner {
+                Ok(()) => tracing::warn!("strategy scheduler leader loop exited; restarting"),
                 Err(error) => {
-                    tracing::warn!(%error, "could not acquire scheduler leadership connection");
-                    operational_alert(
-                        &state,
-                        None,
-                        "",
-                        "scheduler_leadership_loss",
-                        "error",
-                        "The backend could not acquire a database connection for scheduler leadership.",
-                    )
-                    .await;
+                    state.scheduler_health.record_dispatch_error();
+                    tracing::error!(%error, "strategy scheduler leader loop panicked; restarting");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        };
-        if let Err(error) = sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW(),last_error='Backend restarted while this action was running',updated_at=NOW() WHERE status='running'")
-            .execute(&state.db).await {
-            tracing::warn!(%error, "could not recover interrupted scheduler runs");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
-        if let Err(error) = sqlx::query("UPDATE strategy_execution_intents SET status='retry_wait',next_attempt_at=NOW(),last_error='Backend restarted while this execution intent was claimed.',updated_at=NOW() WHERE status='claimed'")
-            .execute(&state.db).await {
-            tracing::warn!(%error, "could not recover interrupted execution intents");
-        }
-        let startup_date = ist_now().date_naive();
-        if let Err(error) = ensure_supported_contract_metadata(&state, startup_date).await {
-            for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
-                tracing::warn!(%instrument, %error, "startup contract selection failed");
+    });
+}
+
+async fn run_scheduler_leader(state: AppState) {
+    let mut leader_connection = loop {
+        match state.db.acquire().await {
+            Ok(mut connection) => {
+                // Advisory locks are session-scoped. Never return this
+                // connection to the pool with the leadership lock held.
+                connection.close_on_drop();
+                let acquired: bool = sqlx::query_scalar(
+                    "SELECT pg_try_advisory_lock(hashtext('rulenix:strategy_scheduler'))",
+                )
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap_or(false);
+                if acquired {
+                    tracing::info!("strategy scheduler leadership acquired");
+                    break connection;
+                }
                 operational_alert(
                     &state,
                     None,
-                    instrument,
-                    "contract_selection_failed",
+                    "",
+                    "scheduler_leadership_unavailable",
+                    "warning",
+                    "This backend replica is not the active scheduler leader.",
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not acquire scheduler leadership connection");
+                operational_alert(
+                    &state,
+                    None,
+                    "",
+                    "scheduler_leadership_loss",
                     "error",
-                    &format!("Contract selection failed and will retry: {error}"),
+                    "The backend could not acquire a database connection for scheduler leadership.",
                 )
                 .await;
             }
         }
-        if let Err(error) = ensure_supertrend_option_contract_metadata(&state, startup_date).await {
-            tracing::warn!(%error, "startup SuperTrend option contract metadata failed");
-            operational_alert_for(
-                &state,
-                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
-                None,
-                "",
-                "supertrend_contract_metadata_failed",
-                "error",
-                &format!(
-                    "SuperTrend option contract metadata refresh failed and will retry: {error}"
-                ),
-            )
-            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    };
+    state
+        .scheduler_health
+        .leadership_acquired(Utc::now().timestamp());
+    let _leadership = SchedulerLeadershipGuard(state.scheduler_health.clone());
+    let mut timer = interval(std::time::Duration::from_secs(5));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let jobs = SchedulerJobRegistry::default();
+    let startup_state = state.clone();
+    spawn_scheduler_job(
+        state.clone(),
+        &jobs,
+        "startup-recovery",
+        Some("startup-recovery".into()),
+        "startup recovery",
+        Some(std::time::Duration::from_secs(30)),
+        async move {
+            sqlx::query("UPDATE strategy_scheduler_runs SET status='failed',next_attempt_at=NOW(),last_error='Backend restarted while this action was running',updated_at=NOW() WHERE status='running'")
+                    .execute(&startup_state.db).await?;
+            sqlx::query("UPDATE strategy_execution_intents SET status='retry_wait',next_attempt_at=NOW(),last_error='Backend restarted while this execution intent was claimed.',updated_at=NOW() WHERE status='claimed'")
+                    .execute(&startup_state.db).await?;
+            Ok(())
+        },
+    );
+    loop {
+        timer.tick().await;
+        let leader_alive = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&mut *leader_connection),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if !leader_alive {
+            tracing::error!("scheduler leadership connection was lost; entering re-election");
+            return;
         }
-        let mut timer = interval(std::time::Duration::from_secs(5));
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut dispatched = HashSet::new();
-        loop {
-            timer.tick().await;
-            let now = ist_now();
-            let date = now.date_naive();
-            dispatched.retain(|key: &String| key.starts_with(&date.to_string()));
-            if dispatched.insert(format!("{date}:expire"))
-                && let Err(error) = sqlx::query("UPDATE strategy_orders o SET status='cancelled',broker_status='Demo DAY order expired',updated_at=NOW() FROM strategy_market_snapshots s WHERE s.id=o.snapshot_id AND s.trade_date<$1 AND o.execution_mode='demo' AND o.status IN ('pending','submitted')")
-                    .bind(date).execute(&state.db).await {
-                tracing::warn!(%error, "could not expire prior-day strategy orders");
-            }
-            if dispatched.insert(format!(
-                "{date}:contract-expiry-checkpoint:{}",
-                now.format("%H%M")
-            )) && let Err(error) = close_lingering_expired_contract_trades(&state, now).await
-            {
-                tracing::warn!(%error, "could not close lingering expired contract trades");
-            }
-            let mut contracts_ready = true;
-            for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
-                let ready = load_snapshot(&state, instrument, date)
+        state
+            .scheduler_health
+            .record_advance(Utc::now().timestamp());
+        let now = ist_now();
+        let date = now.date_naive();
+        jobs.dispatches.retain_date(date);
+
+        let expire_key = format!("{date}:expire");
+        let expire_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "daily-expiry",
+            Some(expire_key.clone()),
+            "prior-day DEMO order expiry",
+            Some(std::time::Duration::from_secs(30)),
+            async move {
+                sqlx::query("UPDATE strategy_orders o SET status='cancelled',broker_status='Demo DAY order expired',updated_at=NOW() FROM strategy_market_snapshots s WHERE s.id=o.snapshot_id AND s.trade_date<$1 AND o.execution_mode='demo' AND o.status IN ('pending','submitted')")
+                        .bind(date).execute(&expire_state.db).await?;
+                Ok(())
+            },
+        );
+
+        let expiry_key = format!("{date}:contract-expiry-checkpoint:{}", now.format("%H%M"));
+        let expiry_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "expired-contract-close",
+            Some(expiry_key),
+            "expired contract close",
+            None,
+            async move { close_lingering_expired_contract_trades(&expiry_state, now).await },
+        );
+
+        let contract_bucket = format!("{date}:contracts:{}:{}", now.hour(), now.minute() / 5);
+        let contract_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "futures-contract-metadata",
+            Some(contract_bucket),
+            "Futures contract metadata",
+            Some(std::time::Duration::from_secs(120)),
+            async move {
+                ensure_supported_contract_metadata(&contract_state, date)
                     .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|snapshot| has_valid_contract_metadata(&snapshot, date));
-                contracts_ready &= ready;
-            }
-            if !contracts_ready
-                && dispatched.insert(format!(
-                    "{date}:contracts:{}:{}",
-                    now.hour(),
-                    now.minute() / 5
-                ))
-            {
-                let cloned = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = ensure_supported_contract_metadata(&cloned, date).await {
-                        for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
-                            tracing::warn!(%instrument, %error, "daily contract selection failed");
-                            operational_alert(
-                                &cloned,
-                                None,
-                                instrument,
-                                "contract_selection_failed",
-                                "error",
-                                &format!("Contract selection failed and will retry: {error}"),
-                            )
-                            .await;
-                        }
-                    }
-                });
-            }
-            if dispatched.insert(format!(
-                "{date}:supertrend-option-contracts:{}:{}",
-                now.hour(),
-                now.minute() / 5
-            )) {
-                let cloned = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        ensure_supertrend_option_contract_metadata(&cloned, date).await
-                    {
-                        tracing::warn!(%error, "daily SuperTrend option contract metadata failed");
-                        operational_alert_for(
-                            &cloned,
-                            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
-                            None,
-                            "",
-                            "supertrend_contract_metadata_failed",
-                            "error",
-                            &format!(
-                                "SuperTrend option contract metadata refresh failed and will retry: {error}"
-                            ),
-                        )
-                        .await;
-                    }
-                });
-            }
-            let calendar = tokio::try_join!(
-                session_is_open(&state, date, "day"),
-                session_is_open(&state, date, "evening")
-            );
-            let (day_open, evening_open) = match scheduler_session_flags(calendar) {
-                Ok(flags) => flags,
-                Err(error) => {
-                    tracing::error!(%date, %error, "market calendar lookup failed; new entries remain closed");
-                    if dispatched.insert(format!("{date}:calendar-error:{}", now.format("%H%M"))) {
-                        operational_alert_for(
-                            &state,
-                            STRATEGY_KEY,
-                            None,
-                            "",
-                            "market_calendar_unavailable",
-                            "critical",
-                            &format!("Market session state could not be determined; all new strategy entries are fail-closed while protection and reconciliation continue: {error}"),
-                        )
-                        .await;
-                    }
-                    (false, false)
-                }
-            };
-            if (now.hour(), now.minute()) >= (8, 30) && (day_open || evening_open) {
-                for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
-                    let snapshot = load_snapshot(&state, instrument, date).await.ok().flatten();
-                    let metadata_ready = snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| has_valid_contract_metadata(snapshot, date));
-                    let levels_ready = snapshot.is_some_and(|snapshot| {
-                        snapshot.status == "ready"
-                            && snapshot
-                                .previous_close
-                                .is_some_and(|value| value.is_finite() && value > 0.0)
-                    });
-                    if metadata_ready
-                        && !levels_ready
-                        && dispatched.insert(format!(
-                            "{date}:levels:{instrument}:{}:{}",
-                            now.hour(),
-                            now.minute()
-                        ))
-                    {
-                        let cloned = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = create_snapshot(&cloned, instrument, date).await {
-                                record_snapshot_failure(
-                                    &cloned,
-                                    instrument,
-                                    date,
-                                    &error.to_string(),
-                                )
-                                .await;
-                                tracing::warn!(%instrument, %error, "daily market snapshot failed");
-                                operational_alert(
-                                    &cloned,
-                                    None,
-                                    instrument,
-                                    "snapshot_refresh_failed",
-                                    "error",
-                                    "Market data is temporarily unavailable. No trades will be placed until it recovers",
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                }
-            }
+                    .map(|_| ())
+            },
+        );
+
+        let option_contract_bucket = format!(
+            "{date}:supertrend-option-contracts:{}:{}",
+            now.hour(),
+            now.minute() / 5
+        );
+        let option_contract_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "supertrend-contract-metadata",
+            Some(option_contract_bucket),
+            "SuperTrend contract metadata",
+            Some(std::time::Duration::from_secs(120)),
+            async move {
+                ensure_supertrend_option_contract_metadata(&option_contract_state, date).await
+            },
+        );
+
+        if (now.hour(), now.minute()) >= (8, 30) {
             for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
-                if let Err(error) = schedule_session(&state, now, instrument, "day", 9).await {
-                    tracing::warn!(%instrument, %error, "day scheduler failed");
-                }
-                if let Err(error) = schedule_session(&state, now, instrument, "evening", 17).await {
-                    tracing::warn!(%instrument, %error, "evening scheduler failed");
-                }
+                let snapshot_key =
+                    format!("{date}:levels:{instrument}:{}:{}", now.hour(), now.minute());
+                let snapshot_state = state.clone();
+                spawn_scheduler_job(
+                    state.clone(),
+                    &jobs,
+                    format!("snapshot:{instrument}"),
+                    Some(snapshot_key),
+                    "Futures snapshot preparation",
+                    Some(std::time::Duration::from_secs(120)),
+                    async move {
+                        let calendar = tokio::try_join!(
+                            session_is_open(&snapshot_state, date, "day"),
+                            session_is_open(&snapshot_state, date, "evening")
+                        );
+                        let (day_open, evening_open) = scheduler_session_flags(calendar)?;
+                        if !day_open && !evening_open {
+                            return Ok(());
+                        }
+                        let snapshot = load_snapshot(&snapshot_state, instrument, date).await?;
+                        let metadata_ready = snapshot
+                            .as_ref()
+                            .is_some_and(|value| has_valid_contract_metadata(value, date));
+                        let levels_ready = snapshot.is_some_and(|value| {
+                            value.status == "ready"
+                                && value
+                                    .previous_close
+                                    .is_some_and(|price| price.is_finite() && price > 0.0)
+                        });
+                        if !metadata_ready || levels_ready {
+                            return Ok(());
+                        }
+                        let snapshot = create_snapshot(&snapshot_state, instrument, date).await?;
+                        if snapshot.status != "ready" {
+                            let reason = snapshot
+                                .error
+                                .as_deref()
+                                .unwrap_or("Daily market levels are not ready.");
+                            operational_alert(&snapshot_state, None, instrument, "futures_snapshot_missing", "error", &format!("Futures snapshot is still missing after the preparation window opened: {reason}")).await;
+                        }
+                        Ok(())
+                    },
+                );
             }
-            let minute_of_day = now.hour() * 60 + now.minute();
-            if option_square_off_due(now)
-                && dispatched.insert(format!(
-                    "{date}:mandatory-option-squareoff:{}",
-                    now.format("%H%M")
-                ))
-            {
-                let cloned = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = process_supertrend_square_off(&cloned, now).await {
-                        tracing::warn!(%error,"mandatory SuperTrend square-off retry failed");
-                    }
-                    if let Err(error) = close_lingering_expired_contract_trades(&cloned, now).await
-                    {
-                        tracing::warn!(%error,"mandatory expiry square-off retry failed");
-                    }
-                    if let Err(error) = reconcile_square_off_intents(&cloned).await {
-                        tracing::warn!(%error,"square-off intent reconciliation failed");
-                    }
-                });
-            }
-            if (SUPERTREND_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE)
-                .contains(&minute_of_day)
-                && minute_of_day.is_multiple_of(5)
-                && dispatched.insert(format!("{date}:supertrend-options:{}", now.format("%H%M")))
-            {
-                let cloned = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = run_supertrend_cycle(&cloned, now).await {
-                        tracing::warn!(%error, "supertrend index options cycle failed");
-                        operational_alert_for(
-                            &cloned,
-                            SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY,
-                            None,
-                            "",
-                            "supertrend_cycle_failed",
-                            "error",
-                            &format!("SuperTrend Index Options v1 cycle failed: {error}"),
-                        )
-                        .await;
-                    }
-                });
-            }
-            let active_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE) UNION SELECT DISTINCT s.exchange_segment,s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)")
-                .fetch_all(&state.db).await.unwrap_or_default();
-            for (exchange, token) in active_tokens {
-                crate::market_ws::ensure_strategy_feed(state.clone(), exchange, token).await;
-            }
-            if let Err(error) = enforce_entry_shutdowns(&state).await {
-                tracing::warn!(%error, "entry shutdown enforcement failed");
-            }
-            if let Err(error) = recover_unprotected_trades(&state).await {
-                tracing::warn!(%error, "trade protection recovery failed");
-            }
-            if let Err(error) = reconcile_live(&state).await {
-                tracing::warn!(%error,"strategy order reconciliation failed");
-            }
-            if let Err(error) = recover_sl2_reversal_intents(&state).await {
-                tracing::warn!(%error, "SL2 reversal recovery failed");
-            }
-            let cloned = state.clone();
-            tokio::spawn(async move {
-                if let Err(error) = process_execution_intents(&cloned, None).await {
-                    tracing::warn!(%error,"durable strategy execution recovery failed");
-                }
-            });
         }
-    });
+        for instrument in FUTURES_BREAKOUT_INSTRUMENTS {
+            for (session, hour) in [("day", 9), ("evening", 17)] {
+                let session_state = state.clone();
+                spawn_scheduler_job(
+                    state.clone(),
+                    &jobs,
+                    format!("futures-session:{instrument}:{session}"),
+                    None,
+                    "Futures session dispatch",
+                    None,
+                    async move {
+                        schedule_session(&session_state, now, instrument, session, hour).await
+                    },
+                );
+            }
+        }
+        let minute_of_day = now.hour() * 60 + now.minute();
+        if option_square_off_due(now) {
+            let squareoff_key = format!("{date}:mandatory-option-squareoff:{}", now.format("%H%M"));
+            let squareoff_state = state.clone();
+            spawn_scheduler_job(
+                state.clone(),
+                &jobs,
+                "mandatory-option-squareoff",
+                Some(squareoff_key),
+                "SuperTrend mandatory square-off",
+                None,
+                async move {
+                    process_supertrend_square_off(&squareoff_state, now).await?;
+                    close_lingering_expired_contract_trades(&squareoff_state, now).await?;
+                    reconcile_square_off_intents(&squareoff_state).await
+                },
+            );
+        }
+        if (SUPERTREND_ENTRY_START_MINUTE..=OPTION_SCHEDULER_END_MINUTE).contains(&minute_of_day)
+            && minute_of_day.is_multiple_of(5)
+        {
+            let supertrend_key = format!("{date}:supertrend-options:{}", now.format("%H%M"));
+            let supertrend_state = state.clone();
+            spawn_scheduler_job(
+                state.clone(),
+                &jobs,
+                "supertrend-cycle",
+                Some(supertrend_key),
+                "SuperTrend cycle",
+                None,
+                async move { run_supertrend_cycle(&supertrend_state, now).await },
+            );
+        }
+        let feed_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "active-feed-refresh",
+            None,
+            "active market feed refresh",
+            Some(std::time::Duration::from_secs(30)),
+            async move {
+                let active_tokens: Vec<(String, String)> = sqlx::query_as("SELECT DISTINCT s.exchange_segment,s.contract_token FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id WHERE o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE) UNION SELECT DISTINCT s.exchange_segment,s.contract_token FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id WHERE t.status='open' AND s.contract_token IS NOT NULL AND (s.contract_expiry IS NULL OR s.contract_expiry>=CURRENT_DATE)")
+                        .fetch_all(&feed_state.db).await?;
+                for (exchange, token) in active_tokens {
+                    crate::market_ws::ensure_strategy_feed(feed_state.clone(), exchange, token)
+                        .await;
+                }
+                Ok(())
+            },
+        );
+        let shutdown_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "entry-shutdown",
+            None,
+            "entry shutdown enforcement",
+            None,
+            async move { enforce_entry_shutdowns(&shutdown_state).await },
+        );
+        let protection_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "protection-recovery",
+            None,
+            "trade protection recovery",
+            None,
+            async move { recover_unprotected_trades(&protection_state).await },
+        );
+        let reconcile_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "live-reconciliation",
+            None,
+            "LIVE reconciliation",
+            None,
+            async move { reconcile_live(&reconcile_state).await },
+        );
+        let reversal_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "sl2-reversal-recovery",
+            None,
+            "SL2 reversal recovery",
+            None,
+            async move { recover_sl2_reversal_intents(&reversal_state).await },
+        );
+        let execution_state = state.clone();
+        spawn_scheduler_job(
+            state.clone(),
+            &jobs,
+            "execution-intent-recovery",
+            None,
+            "execution intent recovery",
+            None,
+            async move {
+                process_execution_intents(&execution_state, None)
+                    .await
+                    .map(|_| ())
+            },
+        );
+    }
 }
 
 pub fn refresh_after_broker_connect(state: AppState, user_id: Uuid) {
@@ -6546,6 +6783,7 @@ struct BrokerNetPosition {
 #[derive(Debug, Clone, PartialEq)]
 struct BrokerTradeFill {
     order_id: String,
+    order_tag: String,
     exchange: String,
     token: String,
     symbol: String,
@@ -6553,6 +6791,147 @@ struct BrokerTradeFill {
     quantity: i32,
     price: f64,
     filled_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerExposureOwnership {
+    RulenixOwned,
+    ManualExternal,
+    Ambiguous,
+}
+
+impl BrokerExposureOwnership {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RulenixOwned => "rulenix_owned",
+            Self::ManualExternal => "manual_external",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+fn is_rulenix_order_tag(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with("RX")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn broker_order_ownership(
+    item: &Value,
+    known_broker_ids: &HashSet<String>,
+    known_client_ids: &HashSet<String>,
+) -> BrokerExposureOwnership {
+    let broker_id = broker_text(item, &["orderid", "orderId"])
+        .unwrap_or("")
+        .trim();
+    let client_id = broker_text(item, &["ordertag", "orderTag"])
+        .unwrap_or("")
+        .trim();
+    if (!broker_id.is_empty() && known_broker_ids.contains(broker_id))
+        || (!client_id.is_empty() && known_client_ids.contains(client_id))
+    {
+        return BrokerExposureOwnership::RulenixOwned;
+    }
+    if is_rulenix_order_tag(&client_id.to_uppercase()) {
+        return BrokerExposureOwnership::Ambiguous;
+    }
+    let exchange = broker_text(item, &["exchange"]).unwrap_or("").trim();
+    let token = broker_text(item, &["symboltoken", "symbolToken"])
+        .unwrap_or("")
+        .trim();
+    let side = broker_text(item, &["transactiontype", "transactionType", "side"])
+        .unwrap_or("")
+        .trim()
+        .to_uppercase();
+    let quantity = broker_i32(
+        item,
+        &[
+            "quantity",
+            "fillsize",
+            "fillSize",
+            "filledshares",
+            "filledShares",
+        ],
+    );
+    if !broker_id.is_empty()
+        && !exchange.is_empty()
+        && !token.is_empty()
+        && matches!(side.as_str(), "BUY" | "SELL")
+        && quantity.is_some_and(|value| value > 0)
+    {
+        BrokerExposureOwnership::ManualExternal
+    } else {
+        BrokerExposureOwnership::Ambiguous
+    }
+}
+
+fn position_fill_ownership(
+    position: &BrokerNetPosition,
+    fills: &[BrokerTradeFill],
+    order_book: &[Value],
+    known_broker_ids: &HashSet<String>,
+    known_client_ids: &HashSet<String>,
+) -> BrokerExposureOwnership {
+    let broker_orders: HashMap<&str, &Value> = order_book
+        .iter()
+        .filter_map(|item| {
+            broker_text(item, &["orderid", "orderId"])
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value.trim(), item))
+        })
+        .collect();
+    let mut totals = [0_i64; 3];
+    let mut matched = 0_i64;
+    for fill in fills
+        .iter()
+        .filter(|fill| fill.exchange == position.exchange && fill.token == position.token)
+    {
+        let ownership = broker_orders.get(fill.order_id.as_str()).map_or_else(
+            || {
+                if known_broker_ids.contains(&fill.order_id)
+                    || (!fill.order_tag.is_empty() && known_client_ids.contains(&fill.order_tag))
+                {
+                    BrokerExposureOwnership::RulenixOwned
+                } else if is_rulenix_order_tag(&fill.order_tag.to_uppercase()) {
+                    BrokerExposureOwnership::Ambiguous
+                } else if !fill.order_id.is_empty() {
+                    BrokerExposureOwnership::ManualExternal
+                } else {
+                    BrokerExposureOwnership::Ambiguous
+                }
+            },
+            |item| broker_order_ownership(item, known_broker_ids, known_client_ids),
+        );
+        let signed = if fill.side == "BUY" {
+            i64::from(fill.quantity)
+        } else {
+            -i64::from(fill.quantity)
+        };
+        let index = match ownership {
+            BrokerExposureOwnership::RulenixOwned => 0,
+            BrokerExposureOwnership::ManualExternal => 1,
+            BrokerExposureOwnership::Ambiguous => 2,
+        };
+        totals[index] += signed;
+        matched += 1;
+    }
+    let broker_net = i64::from(position.net_quantity);
+    if matched > 0 && totals[0] == broker_net && totals[1] == 0 && totals[2] == 0 {
+        BrokerExposureOwnership::RulenixOwned
+    } else if matched > 0 && totals[1] == broker_net && totals[0] == 0 && totals[2] == 0 {
+        BrokerExposureOwnership::ManualExternal
+    } else {
+        BrokerExposureOwnership::Ambiguous
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AttributedManualClose {
+    quantity: i32,
+    weighted_price: f64,
+    order_ids: Vec<String>,
+    first_fill_at: DateTime<Utc>,
+    last_fill_at: DateTime<Utc>,
 }
 
 fn parse_broker_fill_time(value: &str) -> Option<DateTime<Utc>> {
@@ -6576,12 +6955,20 @@ fn parse_broker_fill_time(value: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-fn parse_broker_trade_fills(value: &Value) -> Vec<BrokerTradeFill> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
+fn broker_book_items<'a>(value: &'a Value, name: &str) -> AppResult<&'a [Value]> {
+    match value {
+        Value::Null => Ok(&[]),
+        Value::Array(items) => Ok(items),
+        _ => Err(AppError::BadRequest(format!(
+            "Angel One returned malformed {name} data; broker state is unknown."
+        ))),
+    }
+}
+
+fn parse_broker_trade_fills(value: &Value) -> AppResult<Vec<BrokerTradeFill>> {
+    broker_book_items(value, "trade-book")?
+        .iter()
+        .map(|item| {
             let quantity = broker_i32(
                 item,
                 &[
@@ -6591,9 +6978,28 @@ fn parse_broker_trade_fills(value: &Value) -> Vec<BrokerTradeFill> {
                     "filledShares",
                     "quantity",
                 ],
-            )?;
-            let price = broker_f64(item, &["fillprice", "fillPrice", "averageprice"])?;
-            let side = broker_text(item, &["transactiontype", "transactionType", "side"])?
+            )
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Angel One returned a trade-book fill without an authoritative quantity."
+                        .into(),
+                )
+            })?;
+            let price = broker_f64(
+                item,
+                &["fillprice", "fillPrice", "averageprice", "averagePrice", "price"],
+            )
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Angel One returned a trade-book fill without an authoritative price.".into(),
+                )
+            })?;
+            let side = broker_text(item, &["transactiontype", "transactionType", "side"])
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Angel One returned a trade-book fill without a side.".into(),
+                    )
+                })?
                 .trim()
                 .to_uppercase();
             let filled_at = broker_text(
@@ -6604,15 +7010,45 @@ fn parse_broker_trade_fills(value: &Value) -> Vec<BrokerTradeFill> {
                     "tradetime",
                     "tradeTime",
                     "updatetime",
+                    "updateTime",
+                    "exchtime",
+                    "exchangeTime",
                 ],
             )
-            .and_then(parse_broker_fill_time)?;
+            .and_then(parse_broker_fill_time)
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Angel One returned a trade-book fill without an authoritative execution time."
+                        .into(),
+                )
+            })?;
             let fill = BrokerTradeFill {
-                order_id: broker_text(item, &["orderid", "orderId"])?
+                order_id: broker_text(item, &["orderid", "orderId"])
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Angel One returned a trade-book fill without an order ID.".into(),
+                        )
+                    })?
                     .trim()
                     .to_owned(),
-                exchange: broker_text(item, &["exchange"])?.trim().to_uppercase(),
-                token: broker_text(item, &["symboltoken", "symbolToken"])?
+                order_tag: broker_text(item, &["ordertag", "orderTag"])
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned(),
+                exchange: broker_text(item, &["exchange"])
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Angel One returned a trade-book fill without an exchange.".into(),
+                        )
+                    })?
+                    .trim()
+                    .to_uppercase(),
+                token: broker_text(item, &["symboltoken", "symbolToken"])
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Angel One returned a trade-book fill without a contract token.".into(),
+                        )
+                    })?
                     .trim()
                     .to_owned(),
                 symbol: broker_text(item, &["tradingsymbol", "tradingSymbol"])
@@ -6624,12 +7060,21 @@ fn parse_broker_trade_fills(value: &Value) -> Vec<BrokerTradeFill> {
                 price,
                 filled_at,
             };
-            (!fill.order_id.is_empty()
+            if !fill.order_id.is_empty()
+                && !fill.exchange.is_empty()
+                && !fill.token.is_empty()
                 && matches!(fill.side.as_str(), "BUY" | "SELL")
                 && fill.quantity > 0
                 && fill.price.is_finite()
-                && fill.price > 0.0)
-                .then_some(fill)
+                && fill.price > 0.0
+            {
+                Ok(fill)
+            } else {
+                Err(AppError::BadRequest(
+                    "Angel One returned a structurally invalid trade-book fill; broker state is unknown."
+                        .into(),
+                ))
+            }
         })
         .collect()
 }
@@ -6641,40 +7086,55 @@ struct ManualFillExpectation<'a> {
     direction: &'a str,
     quantity: i32,
     entry_at: DateTime<Utc>,
+    evidence_since: DateTime<Utc>,
     known_order_ids: &'a HashSet<String>,
 }
 
 fn attributable_manual_flat_fill(
     fills: &[BrokerTradeFill],
     expected: &ManualFillExpectation<'_>,
-) -> Option<f64> {
+) -> Option<AttributedManualClose> {
     let exit_side = if expected.direction == "BUY" {
         "SELL"
     } else {
         "BUY"
     };
-    let matching: Vec<&BrokerTradeFill> = fills
+    let external: Vec<&BrokerTradeFill> = fills
         .iter()
         .filter(|fill| {
             fill.exchange.eq_ignore_ascii_case(expected.exchange)
                 && fill.token == expected.token
-                && (expected.symbol.is_empty() || fill.symbol.eq_ignore_ascii_case(expected.symbol))
-                && fill.side == exit_side
                 && fill.filled_at >= expected.entry_at
+                && fill.filled_at >= expected.evidence_since
                 && !expected.known_order_ids.contains(&fill.order_id)
         })
         .collect();
-    let total: i64 = matching.iter().map(|fill| i64::from(fill.quantity)).sum();
+    if external.is_empty()
+        || external.iter().any(|fill| {
+            (!expected.symbol.is_empty() && !fill.symbol.eq_ignore_ascii_case(expected.symbol))
+                || fill.side != exit_side
+        })
+    {
+        return None;
+    }
+    let total: i64 = external.iter().map(|fill| i64::from(fill.quantity)).sum();
     if total != i64::from(expected.quantity) || total <= 0 {
         return None;
     }
-    Some(
-        matching
+    let mut order_ids: Vec<String> = external.iter().map(|fill| fill.order_id.clone()).collect();
+    order_ids.sort();
+    order_ids.dedup();
+    Some(AttributedManualClose {
+        quantity: expected.quantity,
+        weighted_price: external
             .iter()
             .map(|fill| fill.price * f64::from(fill.quantity))
             .sum::<f64>()
             / total as f64,
-    )
+        order_ids,
+        first_fill_at: external.iter().map(|fill| fill.filled_at).min()?,
+        last_fill_at: external.iter().map(|fill| fill.filled_at).max()?,
+    })
 }
 
 fn position_mismatch_type(broker_quantity: i32, local_quantity: i32) -> Option<&'static str> {
@@ -6685,6 +7145,13 @@ fn position_mismatch_type(broker_quantity: i32, local_quantity: i32) -> Option<&
     } else {
         Some("QUANTITY_OR_DIRECTION_MISMATCH")
     }
+}
+
+fn is_aggregate_position_mismatch(incident_type: &str) -> bool {
+    matches!(
+        incident_type,
+        "LOCAL_POSITION_BROKER_FLAT" | "QUANTITY_OR_DIRECTION_MISMATCH" | "AVERAGE_ENTRY_MISMATCH"
+    )
 }
 
 fn parse_broker_positions(value: &Value) -> Vec<BrokerNetPosition> {
@@ -6725,6 +7192,18 @@ fn parse_broker_positions(value: &Value) -> Vec<BrokerNetPosition> {
         .collect()
 }
 
+fn parse_authoritative_broker_positions(value: &Value) -> AppResult<Vec<BrokerNetPosition>> {
+    let items = broker_book_items(value, "position-book")?;
+    let parsed = parse_broker_positions(value);
+    if parsed.len() != items.len() {
+        return Err(AppError::BadRequest(
+            "Angel One returned a structurally invalid position record; broker state is unknown."
+                .into(),
+        ));
+    }
+    Ok(parsed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn record_position_incident(
     state: &AppState,
@@ -6743,8 +7222,9 @@ async fn record_position_incident(
     product: &str,
     raw_broker_position: Option<&Value>,
 ) -> AppResult<()> {
+    let mut transaction = state.db.begin().await?;
     let alert_needed: bool = !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM broker_position_incidents WHERE user_id=$1 AND exchange_segment=$2 AND contract_token=$3 AND incident_type=$4 AND status IN ('open','operator_required'))")
-        .bind(user_id).bind(exchange).bind(token).bind(incident_type).fetch_one(&state.db).await?;
+        .bind(user_id).bind(exchange).bind(token).bind(incident_type).fetch_one(&mut *transaction).await?;
     let operator_required = matches!(
         incident_type,
         "ORPHAN_POSITION"
@@ -6762,16 +7242,22 @@ async fn record_position_incident(
         incident_type,
         "ORPHAN_POSITION" | "UNMAPPED_BROKER_POSITION"
     ) {
-        "detected_unattributed"
+        "ambiguous"
     } else {
         "strategy_related"
     };
+    if is_aggregate_position_mismatch(incident_type) {
+        sqlx::query("UPDATE broker_position_incidents SET status='resolved',resolved_at=NOW(),last_detected_at=NOW() WHERE user_id=$1 AND exchange_segment=$2 AND contract_token=$3 AND incident_type IN ('LOCAL_POSITION_BROKER_FLAT','QUANTITY_OR_DIRECTION_MISMATCH','AVERAGE_ENTRY_MISMATCH') AND incident_type<>$4 AND status IN ('open','operator_required')")
+            .bind(user_id).bind(exchange).bind(token).bind(incident_type)
+            .execute(&mut *transaction).await?;
+    }
     sqlx::query("INSERT INTO broker_position_incidents(id,user_id,strategy_key,instrument,exchange_segment,contract_token,contract_symbol,incident_type,status,broker_quantity,local_quantity,broker_average_price,trade_id,detail,product_type,ownership_status,raw_broker_position) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(user_id,exchange_segment,contract_token,incident_type) DO UPDATE SET status=EXCLUDED.status,resolved_at=NULL,broker_quantity=EXCLUDED.broker_quantity,local_quantity=EXCLUDED.local_quantity,broker_average_price=EXCLUDED.broker_average_price,trade_id=EXCLUDED.trade_id,detail=EXCLUDED.detail,product_type=EXCLUDED.product_type,ownership_status=EXCLUDED.ownership_status,raw_broker_position=EXCLUDED.raw_broker_position,last_detected_at=NOW()")
-        .bind(Uuid::new_v4()).bind(user_id).bind(strategy_key).bind(instrument).bind(exchange).bind(token).bind(symbol).bind(incident_type).bind(status).bind(broker_quantity).bind(local_quantity).bind(broker_average_price).bind(trade_id).bind(detail).bind(product).bind(ownership_status).bind(raw_broker_position.cloned().unwrap_or_else(|| json!({}))).execute(&state.db).await?;
+        .bind(Uuid::new_v4()).bind(user_id).bind(strategy_key).bind(instrument).bind(exchange).bind(token).bind(symbol).bind(incident_type).bind(status).bind(broker_quantity).bind(local_quantity).bind(broker_average_price).bind(trade_id).bind(detail).bind(product).bind(ownership_status).bind(raw_broker_position.cloned().unwrap_or_else(|| json!({}))).execute(&mut *transaction).await?;
     if let Some(trade_id) = trade_id {
         sqlx::query("UPDATE trades SET safety_status='RECONCILIATION_REQUIRED',broker_net_quantity=$2,broker_average_price=$3,last_position_reconciled_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='open'")
-            .bind(trade_id).bind(broker_quantity).bind(broker_average_price).execute(&state.db).await?;
+            .bind(trade_id).bind(broker_quantity).bind(broker_average_price).execute(&mut *transaction).await?;
     }
+    transaction.commit().await?;
     if alert_needed {
         operational_alert_for(
             state,
@@ -6990,10 +7476,34 @@ type LocalBrokerPositionRow = (
 async fn reconcile_broker_positions(
     state: &AppState,
     user_id: Uuid,
+    broker_credential_revision: i64,
     value: &Value,
     trade_book: Option<&Value>,
+    order_book: &Value,
 ) -> AppResult<()> {
-    let broker_positions = parse_broker_positions(value);
+    let broker_positions = parse_authoritative_broker_positions(value)?;
+    let broker_trade_fills = trade_book.map(parse_broker_trade_fills).transpose()?;
+    let broker_orders = broker_book_items(order_book, "order-book")?;
+    let known_orders: Vec<(String, String)> = sqlx::query_as(
+        "SELECT broker_order_id,client_order_id FROM strategy_orders
+         WHERE user_id=$1 AND execution_mode='live'
+           AND (broker_order_id<>'' OR client_order_id<>'')",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let known_broker_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(broker_id, _)| broker_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let known_client_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(_, client_id)| client_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
     let broker_by_key: HashMap<(String, String), BrokerNetPosition> = broker_positions
         .into_iter()
         .map(|position| {
@@ -7061,7 +7571,10 @@ async fn reconcile_broker_positions(
         });
         let broker = broker_by_key.get(&(exchange_key.clone(), token_key.clone()));
         let broker_quantity = broker.map_or(0, |position| position.net_quantity);
-        if broker_quantity == 0 && group.len() == 1 {
+        let flat_position_symbol_matches = broker.is_none_or(|position| {
+            first.12.is_empty() || position.symbol.eq_ignore_ascii_case(&first.12)
+        });
+        if broker_quantity == 0 && group.len() == 1 && flat_position_symbol_matches {
             let local = &group[0];
             let known_close_fill: Option<(f64, String)> = sqlx::query_as(
                 "SELECT average_fill_price::float8,session_key
@@ -7102,21 +7615,85 @@ async fn reconcile_broker_positions(
             .await?
             .into_iter()
             .collect();
-            let manual_exit_price = trade_book.and_then(|book| {
-                attributable_manual_flat_fill(
-                    &parse_broker_trade_fills(book),
-                    &ManualFillExpectation {
-                        exchange: exchange_key,
-                        token: token_key,
-                        symbol: &local.12,
-                        direction: &local.3,
-                        quantity: local.6,
-                        entry_at: local.11,
-                        known_order_ids: &known_order_ids,
-                    },
-                )
-            });
-            if let Some(exit_price) = manual_exit_price {
+            let close_side = if local.3 == "BUY" { "SELL" } else { "BUY" };
+            let saved_evidence: Option<(i32, f64, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+                "SELECT filled_quantity,weighted_fill_price::float8,first_fill_at,last_fill_at
+                 FROM manual_broker_close_evidence
+                 WHERE trade_id=$1 AND user_id=$2 AND broker_credential_revision=$3
+                   AND exchange_segment=$4 AND contract_token=$5 AND contract_symbol=$6
+                   AND close_side=$7 AND filled_quantity=$8 AND consumed_at IS NULL",
+            )
+            .bind(local.0)
+            .bind(user_id)
+            .bind(broker_credential_revision)
+            .bind(exchange_key)
+            .bind(token_key)
+            .bind(&local.12)
+            .bind(close_side)
+            .bind(local.6)
+            .fetch_optional(&state.db)
+            .await?;
+            let mut manual_evidence =
+                saved_evidence.map(|(quantity, weighted_price, first_fill_at, last_fill_at)| {
+                    AttributedManualClose {
+                        quantity,
+                        weighted_price,
+                        order_ids: Vec::new(),
+                        first_fill_at,
+                        last_fill_at,
+                    }
+                });
+            if manual_evidence.is_none() {
+                let expected_signed = if local.3 == "BUY" { local.6 } else { -local.6 };
+                let prior_position: (Option<i32>, Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+                    sqlx::query_as("SELECT broker_net_quantity,last_position_reconciled_at,last_exact_broker_exposure_at FROM trades WHERE id=$1")
+                        .bind(local.0).fetch_one(&state.db).await?;
+                let evidence_since = prior_position.2.or_else(|| {
+                    (prior_position.0 == Some(expected_signed))
+                        .then_some(prior_position.1)
+                        .flatten()
+                });
+                manual_evidence = evidence_since.and_then(|evidence_since| {
+                    attributable_manual_flat_fill(
+                        broker_trade_fills.as_deref().unwrap_or_default(),
+                        &ManualFillExpectation {
+                            exchange: exchange_key,
+                            token: token_key,
+                            symbol: &local.12,
+                            direction: &local.3,
+                            quantity: local.6,
+                            entry_at: local.11,
+                            evidence_since,
+                            known_order_ids: &known_order_ids,
+                        },
+                    )
+                });
+                if let Some(evidence) = &manual_evidence {
+                    sqlx::query(
+                        "INSERT INTO manual_broker_close_evidence
+                         (trade_id,user_id,broker_credential_revision,exchange_segment,contract_token,contract_symbol,close_side,
+                          filled_quantity,weighted_fill_price,broker_order_ids,first_fill_at,last_fill_at)
+                         VALUES($1,$2,$3,$4,$5,$6,$7,$8,($9::float8)::numeric,$10,$11,$12)
+                         ON CONFLICT(trade_id) DO NOTHING",
+                    )
+                    .bind(local.0)
+                    .bind(user_id)
+                    .bind(broker_credential_revision)
+                    .bind(exchange_key)
+                    .bind(token_key)
+                    .bind(&local.12)
+                    .bind(close_side)
+                    .bind(evidence.quantity)
+                    .bind(evidence.weighted_price)
+                    .bind(&evidence.order_ids)
+                    .bind(evidence.first_fill_at)
+                    .bind(evidence.last_fill_at)
+                    .execute(&state.db)
+                    .await?;
+                }
+            }
+            if let Some(evidence) = manual_evidence {
+                let exit_price = evidence.weighted_price;
                 sqlx::query("UPDATE trades SET safety_status='RECONCILIATION_REQUIRED',broker_net_quantity=0,last_position_reconciled_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='open'")
                     .bind(local.0).execute(&state.db).await?;
                 cancel_active_exits(state, user_id, local.0).await?;
@@ -7129,13 +7706,19 @@ async fn reconcile_broker_positions(
                         exit_price,
                         runtime_pnl_units(&local.2, local.6, local.10),
                     );
-                    let changed = sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=NOW(),exit_reason='MANUAL_BROKER_CLOSE',broker_net_quantity=0,last_position_reconciled_at=NOW(),notes=CONCAT(notes,'; broker-side manual close verified from position and trade books'),updated_at=NOW() WHERE id=$1 AND status='open'")
-                        .bind(local.0).bind(exit_price).bind(local.13 + realized).execute(&state.db).await?;
+                    let mut close_tx = state.db.begin().await?;
+                    let changed = sqlx::query("UPDATE trades SET status='closed',safety_status='CLOSED',remaining_lots=0,exit_price=($2::float8)::numeric,last_price=($2::float8)::numeric,pnl=($3::float8)::numeric,exit_datetime=$4,exit_reason='MANUAL_BROKER_CLOSE',broker_net_quantity=0,last_position_reconciled_at=NOW(),notes=CONCAT(notes,'; broker-side manual close verified from position and trade books'),updated_at=NOW() WHERE id=$1 AND status='open'")
+                        .bind(local.0).bind(exit_price).bind(local.13 + realized).bind(evidence.last_fill_at).execute(&mut *close_tx).await?;
                     if changed.rows_affected() > 0 {
                         sqlx::query("UPDATE manual_trade_close_intents SET status='completed',completed_at=NOW(),last_error='',updated_at=NOW() WHERE trade_id=$1")
-                            .bind(local.0).execute(&state.db).await?;
+                            .bind(local.0).execute(&mut *close_tx).await?;
+                        sqlx::query("UPDATE manual_broker_close_evidence SET consumed_at=COALESCE(consumed_at,NOW()) WHERE trade_id=$1")
+                            .bind(local.0).execute(&mut *close_tx).await?;
+                        close_tx.commit().await?;
                         resolve_position_incidents(state, user_id, &local.4, &local.5).await?;
                         operational_alert_for(state,&local.1,Some(user_id),&local.2,"broker_manual_close_reconciled","info",&format!("Broker position and attributable trade-book fills confirmed manual closure of trade {} at weighted fill price {:.4}.",local.0,exit_price)).await;
+                    } else {
+                        close_tx.rollback().await?;
                     }
                 }
                 continue;
@@ -7176,7 +7759,7 @@ async fn reconcile_broker_positions(
             .map(|position| position.average_price)
             .filter(|value| *value > 0.0);
         for local in group {
-            sqlx::query("UPDATE trades SET broker_net_quantity=$2,broker_average_price=$3,last_position_reconciled_at=NOW(),safety_status=CASE WHEN safety_status='RECONCILIATION_REQUIRED' AND (SELECT COALESCE(SUM(GREATEST(quantity-processed_quantity,0)),0) FROM strategy_orders WHERE trade_id=$1 AND role IN ('SL1','SL2') AND status IN ('submitted','partially_filled') AND broker_order_id<>'' AND last_reconciled_at IS NOT NULL)>=$4 THEN 'PROTECTED' WHEN safety_status='RECONCILIATION_REQUIRED' THEN 'PROTECTION_REQUIRED' ELSE safety_status END,updated_at=NOW() WHERE id=$1")
+            sqlx::query("UPDATE trades SET broker_net_quantity=$2,broker_average_price=$3,last_position_reconciled_at=NOW(),last_exact_broker_exposure_at=CASE WHEN $2=(CASE WHEN direction='BUY' THEN quantity ELSE -quantity END) THEN NOW() ELSE last_exact_broker_exposure_at END,safety_status=CASE WHEN safety_status='RECONCILIATION_REQUIRED' AND (SELECT COALESCE(SUM(GREATEST(quantity-processed_quantity,0)),0) FROM strategy_orders WHERE trade_id=$1 AND role IN ('SL1','SL2') AND status IN ('submitted','partially_filled') AND broker_order_id<>'' AND last_reconciled_at IS NOT NULL)>=$4 THEN 'PROTECTED' WHEN safety_status='RECONCILIATION_REQUIRED' THEN 'PROTECTION_REQUIRED' ELSE safety_status END,updated_at=NOW() WHERE id=$1")
                 .bind(local.0).bind(broker_quantity).bind(broker_average).bind(local.6).execute(&state.db).await?;
         }
         let same_direction = group.iter().all(|local| local.3 == first.3);
@@ -7223,6 +7806,18 @@ async fn reconcile_broker_positions(
         if broker.net_quantity == 0 || local_keys.contains(&(exchange.clone(), token.clone())) {
             continue;
         }
+        let exposure_ownership = position_fill_ownership(
+            &broker,
+            broker_trade_fills.as_deref().unwrap_or_default(),
+            broker_orders,
+            &known_broker_ids,
+            &known_client_ids,
+        );
+        if exposure_ownership == BrokerExposureOwnership::ManualExternal {
+            sqlx::query("UPDATE broker_position_incidents SET status='resolved',ownership_status='manual_external',resolved_at=NOW(),last_detected_at=NOW() WHERE user_id=$1 AND exchange_segment=$2 AND contract_token=$3 AND incident_type IN ('ORPHAN_POSITION','UNMAPPED_BROKER_POSITION') AND status IN ('open','operator_required')")
+                .bind(user_id).bind(&exchange).bind(&token).execute(&state.db).await?;
+            continue;
+        }
         let broker_exposure_lock = format!("broker-exposure:{user_id}:{exchange}:{token}");
         let mut broker_exposure_guard = state.db.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
@@ -7251,7 +7846,10 @@ async fn reconcile_broker_positions(
             continue;
         }
         type OverCloseSourceRow = (Uuid, String, String, Uuid, i32, String, Option<i32>);
-        let over_close_source: Option<OverCloseSourceRow> = sqlx::query_as(
+        let over_close_source: Option<OverCloseSourceRow> = if exposure_ownership
+            == BrokerExposureOwnership::RulenixOwned
+        {
+            sqlx::query_as(
             "SELECT t.id,t.strategy_key,t.instrument_label,t.strategy_snapshot_id,t.quantity,COALESCE(t.contract_symbol,''),s.lot_size
              FROM trades t
              JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
@@ -7265,7 +7863,10 @@ async fn reconcile_broker_positions(
         .bind(&exchange)
         .bind(&token)
         .fetch_optional(&state.db)
-        .await?;
+        .await?
+        } else {
+            None
+        };
         if let Some((
             source_trade_id,
             strategy_key,
@@ -7562,6 +8163,234 @@ fn conditional_rule_is_active(rule: &Value) -> bool {
     )
 }
 
+type ExposureObservation = (
+    String,
+    String,
+    BrokerExposureOwnership,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    String,
+);
+
+async fn replace_broker_exposure_observations(
+    state: &AppState,
+    user_id: Uuid,
+    broker_credential_revision: i64,
+    positions: &[BrokerNetPosition],
+    order_book: &Value,
+    trade_book: &Value,
+    conditional_rules: &[Value],
+) -> AppResult<(i64, i64, i64)> {
+    let orders = broker_book_items(order_book, "order-book")?;
+    let fills = parse_broker_trade_fills(trade_book)?;
+    let known_orders: Vec<(String, String)> = sqlx::query_as(
+        "SELECT broker_order_id,client_order_id FROM strategy_orders
+         WHERE user_id=$1 AND execution_mode='live'
+           AND (broker_order_id<>'' OR client_order_id<>'')",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let known_broker_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(broker_id, _)| broker_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let known_client_ids: HashSet<String> = known_orders
+        .iter()
+        .map(|(_, client_id)| client_id.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let local_contracts: HashSet<(String, String)> = sqlx::query_as(
+        "SELECT UPPER(s.exchange_segment),s.contract_token
+         FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
+           AND s.contract_token IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let mut observations: Vec<ExposureObservation> = Vec::new();
+    for position in positions
+        .iter()
+        .filter(|position| position.net_quantity != 0)
+    {
+        let ownership =
+            if local_contracts.contains(&(position.exchange.clone(), position.token.clone())) {
+                BrokerExposureOwnership::RulenixOwned
+            } else {
+                position_fill_ownership(
+                    position,
+                    &fills,
+                    orders,
+                    &known_broker_ids,
+                    &known_client_ids,
+                )
+            };
+        observations.push((
+            "position".into(),
+            format!("{}:{}", position.exchange, position.token),
+            ownership,
+            position.exchange.clone(),
+            position.token.clone(),
+            position.symbol.clone(),
+            if position.net_quantity > 0 {
+                "BUY"
+            } else {
+                "SELL"
+            }
+            .into(),
+            position.net_quantity,
+            match ownership {
+                BrokerExposureOwnership::RulenixOwned => {
+                    "open local trade or exclusively Rulenix-attributable fills"
+                }
+                BrokerExposureOwnership::ManualExternal => {
+                    "net position exclusively matches complete external broker fills"
+                }
+                BrokerExposureOwnership::Ambiguous => {
+                    "position fill ownership is incomplete or mixed"
+                }
+            }
+            .into(),
+        ));
+    }
+    for (index, item) in orders.iter().enumerate() {
+        let status = broker_text(item, &["status", "orderstatus", "orderStatus"])
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if broker_order_is_terminal(&status) {
+            continue;
+        }
+        let mut ownership = broker_order_ownership(item, &known_broker_ids, &known_client_ids);
+        if status.is_empty() {
+            ownership = BrokerExposureOwnership::Ambiguous;
+        }
+        let broker_id = broker_text(item, &["orderid", "orderId"])
+            .unwrap_or("")
+            .trim();
+        let client_id = broker_text(item, &["ordertag", "orderTag"])
+            .unwrap_or("")
+            .trim();
+        observations.push((
+            "order".into(),
+            if !broker_id.is_empty() {
+                broker_id.into()
+            } else if !client_id.is_empty() {
+                client_id.into()
+            } else {
+                format!("unknown:{index}")
+            },
+            ownership,
+            broker_text(item, &["exchange"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            broker_text(item, &["symboltoken", "symbolToken"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(item, &["tradingsymbol", "tradingSymbol"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(item, &["transactiontype", "transactionType", "side"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            broker_i32(item, &["quantity"]).unwrap_or(0),
+            match ownership {
+                BrokerExposureOwnership::RulenixOwned => {
+                    "durable local broker order ID or client tag"
+                }
+                BrokerExposureOwnership::ManualExternal => {
+                    "complete unmatched broker order without a Rulenix tag"
+                }
+                BrokerExposureOwnership::Ambiguous => {
+                    "unmatched Rulenix tag or incomplete broker order"
+                }
+            }
+            .into(),
+        ));
+    }
+    for (index, rule) in conditional_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| conditional_rule_is_active(rule))
+    {
+        let reference = broker_text(rule, &["id", "ruleid", "ruleId", "uniqueid", "uniqueId"])
+            .unwrap_or("")
+            .trim();
+        let exchange = broker_text(rule, &["exchange"])
+            .unwrap_or("")
+            .trim()
+            .to_uppercase();
+        let token = broker_text(rule, &["symboltoken", "symbolToken"])
+            .unwrap_or("")
+            .trim();
+        let quantity = broker_i32(rule, &["qty", "quantity"]).unwrap_or(0);
+        let ownership =
+            if !reference.is_empty() && !exchange.is_empty() && !token.is_empty() && quantity > 0 {
+                BrokerExposureOwnership::ManualExternal
+            } else {
+                BrokerExposureOwnership::Ambiguous
+            };
+        observations.push((
+            "conditional".into(),
+            if reference.is_empty() {
+                format!("unknown:{index}")
+            } else {
+                reference.into()
+            },
+            ownership,
+            exchange,
+            token.into(),
+            broker_text(rule, &["tradingsymbol", "tradingSymbol"])
+                .unwrap_or("")
+                .trim()
+                .into(),
+            broker_text(rule, &["transactiontype", "transactionType", "side"])
+                .unwrap_or("")
+                .trim()
+                .to_uppercase(),
+            quantity,
+            if ownership == BrokerExposureOwnership::ManualExternal {
+                "complete external conditional rule"
+            } else {
+                "incomplete conditional rule"
+            }
+            .into(),
+        ));
+    }
+    let counts = observations
+        .iter()
+        .fold((0_i64, 0_i64, 0_i64), |mut counts, row| {
+            match row.2 {
+                BrokerExposureOwnership::RulenixOwned => counts.0 += 1,
+                BrokerExposureOwnership::ManualExternal => counts.1 += 1,
+                BrokerExposureOwnership::Ambiguous => counts.2 += 1,
+            }
+            counts
+        });
+    let mut transaction = state.db.begin().await?;
+    sqlx::query("DELETE FROM broker_exposure_observations WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
+    for row in observations {
+        sqlx::query("INSERT INTO broker_exposure_observations(user_id,exposure_kind,broker_reference,ownership_status,exchange_segment,contract_token,contract_symbol,side,quantity,evidence,broker_credential_revision,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())")
+            .bind(user_id).bind(row.0).bind(row.1).bind(row.2.as_str()).bind(row.3).bind(row.4).bind(row.5).bind(row.6).bind(row.7).bind(row.8).bind(broker_credential_revision).execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
+    Ok(counts)
+}
+
 async fn live_clear_rejection(state: &AppState, user_id: Uuid, detail: String) -> AppError {
     let _ = risk::set_reconciliation_health(state, user_id, false, &detail).await;
     AppError::BadRequest(detail)
@@ -7747,6 +8576,11 @@ async fn reconcile_live_user_with_scope(
     user_id: Uuid,
     full_readiness: bool,
 ) -> AppResult<()> {
+    let broker_credential_revision: i64 =
+        sqlx::query_scalar("SELECT broker_credential_revision FROM user_profiles WHERE user_id=$1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
     let credentials = state.credentials.load(user_id).await?;
     let values =
         match angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
@@ -7785,27 +8619,67 @@ async fn reconcile_live_user_with_scope(
             return Err(error);
         }
     };
-    let broker_positions = parse_broker_positions(&positions);
-    let local_contracts: Vec<(String, String)> = sqlx::query_as(
-        "SELECT UPPER(s.exchange_segment),s.contract_token
+    if let Err(error) = broker_book_items(&values, "order-book") {
+        let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+        return Err(error);
+    }
+    let broker_positions = match parse_authoritative_broker_positions(&positions) {
+        Ok(positions) => positions,
+        Err(error) => {
+            let _ =
+                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
+            return Err(error);
+        }
+    };
+    let current_credential_revision: i64 =
+        sqlx::query_scalar("SELECT broker_credential_revision FROM user_profiles WHERE user_id=$1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
+    if current_credential_revision != broker_credential_revision {
+        let detail =
+            "Broker credentials changed during reconciliation; broker state was discarded.";
+        let _ = risk::set_reconciliation_health(state, user_id, false, detail).await;
+        return Err(AppError::BadRequest(detail.into()));
+    }
+    let local_contracts: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
+        "SELECT t.id,UPPER(s.exchange_segment),s.contract_token,
+                EXISTS(SELECT 1 FROM manual_broker_close_evidence evidence
+                       WHERE evidence.trade_id=t.id AND evidence.user_id=t.user_id
+                         AND evidence.broker_credential_revision=$2
+                         AND evidence.consumed_at IS NULL)
          FROM trades t
          JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
          WHERE t.user_id=$1 AND t.execution_mode='live' AND t.status='open'
            AND s.contract_token IS NOT NULL",
     )
     .bind(user_id)
+    .bind(broker_credential_revision)
     .fetch_all(&state.db)
     .await?;
-    let needs_trade_book = local_contracts.iter().any(|(exchange, token)| {
-        broker_positions
-            .iter()
-            .find(|position| position.exchange == *exchange && position.token == *token)
-            .is_none_or(|position| position.net_quantity == 0)
-    });
+    let needs_trade_book = local_contracts
+        .iter()
+        .any(|(_, exchange, token, has_evidence)| {
+            if *has_evidence {
+                return false;
+            }
+            broker_positions
+                .iter()
+                .find(|position| position.exchange == *exchange && position.token == *token)
+                .is_none_or(|position| position.net_quantity == 0)
+        });
     let trade_book = if full_readiness || needs_trade_book {
         match angel::trade_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
         {
-            Ok(value) => Some(value),
+            Ok(value) => match parse_broker_trade_fills(&value) {
+                Ok(_) => Some(value),
+                Err(error) => {
+                    let _ =
+                        risk::set_reconciliation_health(state, user_id, false, &error.to_string())
+                            .await;
+                    return Err(error);
+                }
+            },
             Err(error) => {
                 let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
                     .await;
@@ -8026,7 +8900,25 @@ async fn reconcile_live_user_with_scope(
                 .bind(order.id).execute(&state.db).await?;
         }
     }
-    reconcile_broker_positions(state, user_id, &positions, trade_book.as_ref()).await?;
+    let final_credential_revision: i64 =
+        sqlx::query_scalar("SELECT broker_credential_revision FROM user_profiles WHERE user_id=$1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
+    if final_credential_revision != broker_credential_revision {
+        let detail = "Broker credentials changed during reconciliation; broker results were not applied to positions.";
+        let _ = risk::set_reconciliation_health(state, user_id, false, detail).await;
+        return Err(AppError::BadRequest(detail.into()));
+    }
+    reconcile_broker_positions(
+        state,
+        user_id,
+        broker_credential_revision,
+        &positions,
+        trade_book.as_ref(),
+        &values,
+    )
+    .await?;
     let unresolved_incidents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broker_position_incidents WHERE user_id=$1 AND status IN ('open','operator_required')")
         .bind(user_id).fetch_one(&state.db).await?;
     if unresolved_incidents > 0 {
@@ -8044,63 +8936,48 @@ async fn reconcile_live_user_with_scope(
         }
     }
     if full_readiness {
-        let known_orders: Vec<(String, String)> = sqlx::query_as("SELECT broker_order_id,client_order_id FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND (broker_order_id<>'' OR client_order_id<>'')")
-            .bind(user_id).fetch_all(&state.db).await?;
-        let known_ids: HashSet<String> = known_orders
-            .iter()
-            .flat_map(|(broker_id, client_id)| [broker_id, client_id])
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .collect();
-        let mut active_unknown_orders = 0_i64;
-        let mut structurally_unknown_orders = 0_i64;
-        for item in values.as_array().into_iter().flatten() {
-            let status = broker_text(item, &["status", "orderstatus", "orderStatus"])
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            if broker_order_is_terminal(&status) {
-                continue;
-            }
-            let broker_id = broker_text(item, &["orderid", "orderId"]).unwrap_or("");
-            let client_id = broker_text(item, &["ordertag", "orderTag"]).unwrap_or("");
-            if status.is_empty() {
-                structurally_unknown_orders += 1;
-            } else if !known_ids.contains(broker_id) && !known_ids.contains(client_id) {
-                active_unknown_orders += 1;
-            }
-        }
-        let active_conditionals = conditional_rules
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter(|rule| conditional_rule_is_active(rule))
-            .count() as i64;
+        let trade_book = trade_book.as_ref().ok_or_else(|| {
+            AppError::BadRequest(
+                "Full broker readiness requires an authoritative trade book.".into(),
+            )
+        })?;
+        let (rulenix_owned_exposure, manual_external_exposure, ambiguous_exposure) =
+            replace_broker_exposure_observations(
+                state,
+                user_id,
+                broker_credential_revision,
+                &broker_positions,
+                &values,
+                trade_book,
+                conditional_rules.as_deref().unwrap_or_default(),
+            )
+            .await?;
         let ambiguous_local_orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_orders WHERE user_id=$1 AND execution_mode='live' AND status IN ('submitting','ambiguous')")
             .bind(user_id).fetch_one(&state.db).await?;
-        let broker_mutation_blockers =
-            active_unknown_orders + structurally_unknown_orders + active_conditionals;
+        let broker_mutation_blockers = ambiguous_exposure;
         if broker_mutation_blockers > 0 {
             let blocker_detail = format!(
-                "Full broker reconciliation found external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}."
+                "Full broker reconciliation found Rulenix-owned exposure={rulenix_owned_exposure}, manual/external exposure={manual_external_exposure}, ambiguous exposure={ambiguous_exposure}."
             );
-            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'open',$2,$3,$4,$5,NOW(),NOW(),NULL) ON CONFLICT(user_id) DO UPDATE SET status='open',external_active_orders=EXCLUDED.external_active_orders,structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=EXCLUDED.active_conditional_rules,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL")
+            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'open',0,$2,0,$3,$2,$4,$5,NOW(),NOW(),NULL) ON CONFLICT(user_id) DO UPDATE SET status='open',external_active_orders=0,structurally_unknown_orders=EXCLUDED.structurally_unknown_orders,active_conditional_rules=0,rulenix_owned_exposure=EXCLUDED.rulenix_owned_exposure,ambiguous_exposure=EXCLUDED.ambiguous_exposure,manual_external_exposure=EXCLUDED.manual_external_exposure,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NULL")
                 .bind(user_id)
-                .bind(active_unknown_orders)
-                .bind(structurally_unknown_orders)
-                .bind(active_conditionals)
+                .bind(ambiguous_exposure)
+                .bind(rulenix_owned_exposure)
+                .bind(manual_external_exposure)
                 .bind(&blocker_detail)
                 .execute(&state.db)
                 .await?;
         } else {
-            sqlx::query("UPDATE broker_reconciliation_blockers SET status='resolved',external_active_orders=0,structurally_unknown_orders=0,active_conditional_rules=0,detail='Authoritative full broker reconciliation found no unresolved broker mutations.',last_checked_at=NOW(),resolved_at=NOW() WHERE user_id=$1 AND status='open'")
+            sqlx::query("INSERT INTO broker_reconciliation_blockers(user_id,status,external_active_orders,structurally_unknown_orders,active_conditional_rules,rulenix_owned_exposure,ambiguous_exposure,manual_external_exposure,detail,first_detected_at,last_checked_at,resolved_at) VALUES($1,'resolved',0,0,0,$2,0,$3,'Authoritative full broker reconciliation found no ambiguous broker mutations.',NOW(),NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET status='resolved',external_active_orders=0,structurally_unknown_orders=0,active_conditional_rules=0,rulenix_owned_exposure=EXCLUDED.rulenix_owned_exposure,ambiguous_exposure=0,manual_external_exposure=EXCLUDED.manual_external_exposure,detail=EXCLUDED.detail,last_checked_at=NOW(),resolved_at=NOW()")
                 .bind(user_id)
+                .bind(rulenix_owned_exposure)
+                .bind(manual_external_exposure)
                 .execute(&state.db)
                 .await?;
         }
         if unresolved_incidents > 0 || broker_mutation_blockers > 0 || ambiguous_local_orders > 0 {
             let detail = format!(
-                "Full broker reconciliation is unsafe: incidents={unresolved_incidents}, external_active_orders={active_unknown_orders}, unknown_orders={structurally_unknown_orders}, active_conditionals={active_conditionals}, ambiguous_local_orders={ambiguous_local_orders}."
+                "Full broker reconciliation is unsafe: incidents={unresolved_incidents}, ambiguous_exposure={ambiguous_exposure}, ambiguous_local_orders={ambiguous_local_orders}."
             );
             risk::set_reconciliation_health(state, user_id, false, &detail).await?;
             return Err(AppError::BadRequest(detail));
@@ -8109,7 +8986,7 @@ async fn reconcile_live_user_with_scope(
             state,
             user_id,
             true,
-            "Full Angel positions, orders, trades, and conditional state reconciled.",
+            &format!("Full Angel state reconciled: Rulenix-owned exposure={rulenix_owned_exposure}, manual/external exposure={manual_external_exposure}, ambiguous exposure=0."),
         )
         .await?;
         if !risk::reconciliation_ready(state, user_id).await? {
@@ -8625,6 +9502,211 @@ async fn recover_unprotected_trades(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+async fn close_demo_trade(
+    state: &AppState,
+    user: &AuthUser,
+    trade_id: Uuid,
+    headers: HeaderMap,
+    context: Option<Extension<crate::security::RequestContext>>,
+) -> AppResult<Json<Value>> {
+    type DemoCloseRow = (
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        i32,
+        f64,
+        f64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i32>,
+    );
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,0))")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    let trade: Option<DemoCloseRow> = sqlx::query_as(
+        "SELECT t.status,t.execution_mode,t.direction,t.quantity,t.total_lots,t.remaining_lots,
+                t.entry_price::float8,t.pnl::float8,t.strategy_key,t.instrument_label,
+                COALESCE(t.contract_symbol,''),UPPER(s.exchange_segment),s.contract_token,s.lot_size
+         FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+         WHERE t.id=$1 AND t.user_id=$2 FOR UPDATE OF t",
+    )
+    .bind(trade_id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((
+        status,
+        mode,
+        direction,
+        quantity,
+        total_lots,
+        _,
+        entry_price,
+        stored_pnl,
+        strategy_key,
+        instrument,
+        symbol,
+        exchange,
+        token,
+        lot_size,
+    )) = trade
+    else {
+        return Err(AppError::NotFound("Trade was not found.".into()));
+    };
+    if status == "closed" {
+        tx.commit().await?;
+        return Ok(Json(json!({
+            "trade_id":trade_id,
+            "status":"completed",
+            "execution_mode":"demo",
+            "message":"Trade is already closed."
+        })));
+    }
+    if mode != "demo" || status != "open" || quantity <= 0 {
+        return Err(AppError::BadRequest(
+            "Only an eligible running DEMO trade can be closed locally.".into(),
+        ));
+    }
+
+    let active_orders: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id,status FROM strategy_orders
+         WHERE trade_id=$1 AND execution_mode='demo'
+           AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+         FOR UPDATE",
+    )
+    .bind(trade_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if active_orders
+        .iter()
+        .any(|(_, status)| status == "processing")
+    {
+        return Err(AppError::BadRequest(
+            "A DEMO exit fill is already being processed; refresh the trade before closing it."
+                .into(),
+        ));
+    }
+
+    let max_price_age_seconds: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(u.max_price_age_seconds,g.max_price_age_seconds)::int4
+         FROM risk_limits g LEFT JOIN risk_limits u ON u.user_id=$1
+         WHERE g.user_id IS NULL",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let exit_price: Option<f64> = sqlx::query_scalar(
+        "SELECT price::float8 FROM market_price_ticks
+         WHERE exchange_segment=$1 AND contract_token=$2
+           AND received_at>NOW()-($3::text || ' seconds')::interval
+           AND price>0
+         ORDER BY received_at DESC LIMIT 1",
+    )
+    .bind(&exchange)
+    .bind(&token)
+    .bind(max_price_age_seconds.max(1))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let exit_price = exit_price
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "DEMO close stopped because no fresh valid market price is available.".into(),
+            )
+        })?;
+    let realized = trade_pnl(
+        &direction,
+        entry_price,
+        exit_price,
+        runtime_pnl_units(&instrument, quantity, lot_size),
+    );
+    let pnl = stored_pnl + realized;
+    let reporting_quantity = if strategy_key == STRATEGY_KEY {
+        total_lots.saturating_mul(lot_size.unwrap_or(1).max(1))
+    } else {
+        quantity
+    };
+
+    sqlx::query(
+        "UPDATE strategy_orders
+         SET status='cancelled',broker_status='DEMO order terminalized by user close',
+             state_version=state_version+1,updated_at=NOW()
+         WHERE trade_id=$1 AND execution_mode='demo'
+           AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','cancelling')",
+    )
+    .bind(trade_id)
+    .execute(&mut *tx)
+    .await?;
+    let changed = sqlx::query(
+        "UPDATE trades
+         SET status='closed',safety_status='CLOSED',quantity=$3,remaining_lots=0,
+             exit_price=($4::float8)::numeric,last_price=($4::float8)::numeric,
+             pnl=($5::float8)::numeric,exit_datetime=NOW(),exit_reason='MANUAL_RULENIX_CLOSE',
+             notes=CONCAT(notes,'; running DEMO trade closed locally by user'),updated_at=NOW()
+         WHERE id=$1 AND user_id=$2 AND execution_mode='demo' AND status='open'",
+    )
+    .bind(trade_id)
+    .bind(user.id)
+    .bind(reporting_quantity)
+    .bind(exit_price)
+    .bind(pnl)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(AppError::BadRequest(
+            "DEMO trade state changed while the close was being processed; refresh and try again."
+                .into(),
+        ));
+    }
+    tx.commit().await?;
+
+    let request_context = crate::audit::optional_context(context);
+    if let Err(error) = crate::audit::record(
+        state,
+        crate::audit::AuditEvent {
+            context: request_context.as_ref(),
+            headers: Some(&headers),
+            event_type: "manual_demo_trade_closed",
+            actor_user_id: Some(user.id),
+            target_user_id: Some(user.id),
+            summary: "User closed an attributable running DEMO trade locally",
+            metadata: json!({"trade_id":trade_id,"exit_price":exit_price,"quantity":quantity}),
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error,%trade_id,"could not write DEMO close audit event");
+    }
+    emit_for(
+        state,
+        &strategy_key,
+        Some(user.id),
+        &instrument,
+        "demo_trade_manually_closed",
+        json!({"trade_id":trade_id,"contract_symbol":symbol,"exit_price":exit_price,"pnl":pnl}),
+    )
+    .await;
+    Ok(Json(json!({
+        "trade_id":trade_id,
+        "status":"completed",
+        "execution_mode":"demo",
+        "exit_price":exit_price,
+        "pnl":pnl,
+        "message":"DEMO trade closed locally at the latest authoritative simulated price."
+    })))
+}
+
 pub async fn manual_close_trade(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -8654,9 +9736,12 @@ pub async fn manual_close_trade(
             "message":"Trade is already closed."
         })));
     }
+    if mode == "demo" {
+        return close_demo_trade(&state, &user, trade_id, headers, context).await;
+    }
     if mode != "live" {
         return Err(AppError::BadRequest(
-            "Close Trade is currently available only for running LIVE trades.".into(),
+            "Close Trade is available only for running DEMO or LIVE trades.".into(),
         ));
     }
 
@@ -8664,13 +9749,14 @@ pub async fn manual_close_trade(
     // successful fresh order and position reads for this user action.
     reconcile_live_user(&state, user.id).await?;
     let credentials = state.credentials.load(user.id).await?;
-    angel::order_book(
+    let order_book = angel::order_book(
         &state,
         user.id,
         &credentials.api_key,
         &credentials.jwt_token,
     )
     .await?;
+    broker_book_items(&order_book, "order-book")?;
     let positions = angel::positions(
         &state,
         user.id,
@@ -8678,6 +9764,7 @@ pub async fn manual_close_trade(
         &credentials.jwt_token,
     )
     .await?;
+    let authoritative_positions = parse_authoritative_broker_positions(&positions)?;
 
     let refreshed: Option<ManualCloseLookup> = sqlx::query_as(
         "SELECT t.status,t.execution_mode,t.direction,t.quantity,
@@ -8716,7 +9803,7 @@ pub async fn manual_close_trade(
             "Close Trade requires exactly one attributable open Rulenix trade for {exchange}/{token}; found {attributable_rows}."
         )));
     }
-    let broker = parse_broker_positions(&positions)
+    let broker = authoritative_positions
         .into_iter()
         .find(|position| position.exchange == exchange && position.token == token);
     let expected_signed = if direction == "BUY" {
@@ -11445,6 +12532,68 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::{collections::VecDeque, path::Path, time::Duration as StdDuration};
 
+    #[derive(Debug, Deserialize)]
+    struct HistoricalReplayEvent {
+        at: String,
+        strategy: String,
+        instrument: String,
+        signal: String,
+        price: f64,
+        demo_users: usize,
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct HistoricalReplayCounts {
+        futures_dispatched: usize,
+        futures_evaluated: usize,
+        futures_demo_path: usize,
+        supertrend_dispatched: usize,
+        supertrend_evaluated: usize,
+        supertrend_demo_path: usize,
+        duplicate_dispatches: usize,
+    }
+
+    fn historical_replay_events() -> Vec<HistoricalReplayEvent> {
+        serde_json::from_str(include_str!("../tests/fixtures/sep_14_18_demo_replay.json"))
+            .expect("the audited Sep 14-18 replay fixture must parse")
+    }
+
+    fn replay_scheduler_delivery(events: &[HistoricalReplayEvent]) -> HistoricalReplayCounts {
+        let mut counts = HistoricalReplayCounts::default();
+        let mut dispatched = HashSet::new();
+        for _ in 0..2 {
+            for event in events {
+                let key = format!(
+                    "{}:{}:{}:{}",
+                    event.at, event.strategy, event.instrument, event.signal
+                );
+                if !dispatched.insert(key) {
+                    // A repeated scheduler observation is suppressed before
+                    // evaluation; it is not counted as a duplicate dispatch.
+                    continue;
+                }
+                let target = if event.strategy == STRATEGY_KEY {
+                    (
+                        &mut counts.futures_dispatched,
+                        &mut counts.futures_evaluated,
+                        &mut counts.futures_demo_path,
+                    )
+                } else {
+                    assert_eq!(event.strategy, SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY);
+                    (
+                        &mut counts.supertrend_dispatched,
+                        &mut counts.supertrend_evaluated,
+                        &mut counts.supertrend_demo_path,
+                    )
+                };
+                *target.0 += event.demo_users;
+                *target.1 += event.demo_users;
+                *target.2 += event.demo_users;
+            }
+        }
+        counts
+    }
+
     fn isolated_test_database_url() -> String {
         let raw = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must point to an explicitly disposable local database");
@@ -11587,11 +12736,179 @@ mod tests {
             angel_request_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             shared_historical_cooldowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             shared_market_cursor: Arc::new(tokio::sync::Mutex::new(0)),
+            scheduler_health: Default::default(),
             strategy_execution_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             credentials: crate::credentials::CredentialStore::for_isolated_test(db.clone()),
             abuse_prevention: crate::security::AbusePrevention::default(),
             db,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn sep_14_18_replay_persists_66_demo_intents_exactly_once() {
+        let state = isolated_test_state().await;
+        let users = [Uuid::new_v4(), Uuid::new_v4()];
+        for (index, user_id) in users.iter().copied().enumerate() {
+            sqlx::query(
+                "INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,'test-only')",
+            )
+            .bind(user_id)
+            .bind(format!("historical-demo-{index}"))
+            .bind(format!("historical-demo-{index}@example.test"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+                .bind(user_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+
+        let events = historical_replay_events();
+        let mut snapshots = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            let at = DateTime::parse_from_rfc3339(&event.at).unwrap();
+            let trade_date = at.date_naive();
+            let snapshot_key = (event.strategy.clone(), event.instrument.clone(), trade_date);
+            let snapshot_id = if let Some(id) = snapshots.get(&snapshot_key) {
+                *id
+            } else {
+                let id = Uuid::new_v4();
+                sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,lot_size,exchange_segment,product_type,execution_key) VALUES($1,$2,$3,$4,'ready',$5,$3,1,'TEST','INTRADAY',$6)")
+                    .bind(id)
+                    .bind(&event.strategy)
+                    .bind(&event.instrument)
+                    .bind(trade_date)
+                    .bind(format!("replay-token-{index}"))
+                    .bind(format!("historical-replay-{index}"))
+                    .execute(&state.db)
+                    .await
+                    .unwrap();
+                snapshots.insert(snapshot_key, id);
+                id
+            };
+            let session_key = format!("replay-{index}-{}", at.format("%Y%m%d%H%M"));
+            let side: &'static str = if event.signal == "SELL" {
+                "SELL"
+            } else {
+                "BUY"
+            };
+            let role: &'static str = if side == "SELL" {
+                "SELL_ENTRY"
+            } else {
+                "BUY_ENTRY"
+            };
+            let order_type: &'static str = if event.strategy == STRATEGY_KEY {
+                "STOPLOSS_LIMIT"
+            } else {
+                "MARKET"
+            };
+            let intents = users
+                .iter()
+                .take(event.demo_users)
+                .map(|user_id| PreparedExecutionIntent {
+                    user_id: *user_id,
+                    snapshot_id,
+                    strategy_key: event.strategy.clone(),
+                    instrument: event.instrument.clone(),
+                    session_key: session_key.clone(),
+                    action: "ENTRY",
+                    role,
+                    side,
+                    order_type,
+                    lots: 1,
+                    quantity: None,
+                    price: event.price,
+                    trigger_price: (order_type == "STOPLOSS_LIMIT").then_some(event.price),
+                    trade_id: None,
+                    expires_at: None,
+                })
+                .collect::<Vec<_>>();
+            let (_, inserted) = materialize_signal_intents(
+                &state,
+                &event.strategy,
+                &event.instrument,
+                &session_key,
+                role,
+                at.with_timezone(&Utc),
+                Some(snapshot_id),
+                json!({"historical_replay":true,"source_at":event.at}),
+                &intents,
+            )
+            .await
+            .unwrap();
+            assert!(inserted);
+            let (_, duplicate_inserted) = materialize_signal_intents(
+                &state,
+                &event.strategy,
+                &event.instrument,
+                &session_key,
+                role,
+                at.with_timezone(&Utc),
+                Some(snapshot_id),
+                json!({"historical_replay":true,"source_at":event.at}),
+                &intents,
+            )
+            .await
+            .unwrap();
+            assert!(!duplicate_inserted);
+        }
+
+        let counts: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT s.strategy_key,COUNT(DISTINCT s.id),COUNT(i.id)
+             FROM strategy_signals s JOIN strategy_execution_intents i ON i.signal_id=s.id
+             GROUP BY s.strategy_key ORDER BY s.strategy_key",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            counts,
+            vec![
+                (STRATEGY_KEY.into(), 6, 8),
+                (SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY.into(), 29, 58),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn scheduler_advisory_leadership_is_single_and_reacquired_after_connection_loss() {
+        let state = isolated_test_state().await;
+        let mut first = state.db.acquire().await.unwrap();
+        first.close_on_drop();
+        let first_acquired: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtext('rulenix:test:strategy_scheduler'))",
+        )
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+        assert!(first_acquired);
+
+        let mut second = state.db.acquire().await.unwrap();
+        second.close_on_drop();
+        let duplicate_acquired: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtext('rulenix:test:strategy_scheduler'))",
+        )
+        .fetch_one(&mut *second)
+        .await
+        .unwrap();
+        assert!(!duplicate_acquired, "a second instance must remain standby");
+
+        first.close().await.unwrap();
+        let reacquired: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtext('rulenix:test:strategy_scheduler'))",
+        )
+        .fetch_one(&mut *second)
+        .await
+        .unwrap();
+        assert!(
+            reacquired,
+            "standby must acquire leadership after leader loss"
+        );
+        second.close().await.unwrap();
     }
 
     #[derive(Clone, Default)]
@@ -11607,6 +12924,10 @@ mod tests {
         quote_ltps: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
         quote_unavailable: Arc<tokio::sync::Mutex<bool>>,
         conditional_unavailable: Arc<tokio::sync::Mutex<bool>>,
+        order_book_unavailable: Arc<tokio::sync::Mutex<bool>>,
+        order_book_timeout: Arc<tokio::sync::Mutex<bool>>,
+        positions_unavailable: Arc<tokio::sync::Mutex<bool>>,
+        trade_book_unavailable: Arc<tokio::sync::Mutex<bool>>,
     }
 
     #[derive(Clone, Copy)]
@@ -11705,28 +13026,64 @@ mod tests {
         )
     }
 
-    async fn fake_order_book(State(fake): State<DeterministicFakeBroker>) -> Json<Value> {
-        Json(json!({
-            "status":true,
-            "message":"SUCCESS",
-            "data":fake.order_book.lock().await.clone()
-        }))
+    async fn fake_order_book(
+        State(fake): State<DeterministicFakeBroker>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        if *fake.order_book_timeout.lock().await {
+            tokio::time::sleep(StdDuration::from_millis(600)).await;
+        }
+        if *fake.order_book_unavailable.lock().await {
+            return (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"status":false,"message":"order book unavailable","data":null})),
+            );
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "status":true,
+                "message":"SUCCESS",
+                "data":fake.order_book.lock().await.clone()
+            })),
+        )
     }
 
-    async fn fake_positions(State(fake): State<DeterministicFakeBroker>) -> Json<Value> {
-        Json(json!({
-            "status":true,
-            "message":"SUCCESS",
-            "data":fake.positions.lock().await.clone()
-        }))
+    async fn fake_positions(
+        State(fake): State<DeterministicFakeBroker>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        if *fake.positions_unavailable.lock().await {
+            return (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"status":false,"message":"positions unavailable","data":null})),
+            );
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "status":true,
+                "message":"SUCCESS",
+                "data":fake.positions.lock().await.clone()
+            })),
+        )
     }
 
-    async fn fake_trade_book(State(fake): State<DeterministicFakeBroker>) -> Json<Value> {
-        Json(json!({
-            "status":true,
-            "message":"SUCCESS",
-            "data":fake.trade_book.lock().await.clone()
-        }))
+    async fn fake_trade_book(
+        State(fake): State<DeterministicFakeBroker>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        if *fake.trade_book_unavailable.lock().await {
+            return (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"status":false,"message":"trade book unavailable","data":null})),
+            );
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "status":true,
+                "message":"SUCCESS",
+                "data":fake.trade_book.lock().await.clone()
+            })),
+        )
     }
 
     async fn fake_conditional_rules(
@@ -12790,6 +14147,82 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_position_mismatch_types_supersede_each_other() {
+        assert!(is_aggregate_position_mismatch("LOCAL_POSITION_BROKER_FLAT"));
+        assert!(is_aggregate_position_mismatch(
+            "QUANTITY_OR_DIRECTION_MISMATCH"
+        ));
+        assert!(is_aggregate_position_mismatch("AVERAGE_ENTRY_MISMATCH"));
+        assert!(!is_aggregate_position_mismatch("ORPHAN_POSITION"));
+    }
+
+    #[test]
+    fn background_lease_prevents_overlapping_reconciliation_and_releases_on_drop() {
+        let active = Arc::new(AtomicBool::new(false));
+        let lease = BackgroundLease::try_acquire(&active).expect("first lease must be acquired");
+        assert!(BackgroundLease::try_acquire(&active).is_none());
+        drop(lease);
+        assert!(BackgroundLease::try_acquire(&active).is_some());
+    }
+
+    #[tokio::test]
+    async fn scheduler_job_lease_recovers_after_panic_timeout_and_shutdown() {
+        let leases = SchedulerLeaseRegistry::default();
+        let lease = leases.try_acquire("worker").expect("worker starts");
+        let panic = tokio::spawn(async move {
+            let _lease = lease;
+            panic!("isolated worker panic");
+        })
+        .await;
+        assert!(panic.is_err());
+        assert!(leases.try_acquire("worker").is_some());
+
+        let lease = leases.try_acquire("timeout").expect("worker starts");
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(5), async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(timed_out.is_err());
+        assert!(leases.try_acquire("timeout").is_some());
+
+        let lease = leases.try_acquire("shutdown").expect("worker starts");
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+        assert!(leases.try_acquire("shutdown").is_some());
+    }
+
+    #[test]
+    fn completed_scheduler_dispatches_are_exactly_once_but_failures_can_retry() {
+        let dispatches = SchedulerDispatchTracker::default();
+        assert!(!dispatches.completed("2026-09-18:event"));
+        dispatches.mark_completed("2026-09-18:event".into());
+        assert!(dispatches.completed("2026-09-18:event"));
+        assert!(!dispatches.completed("2026-09-18:failed-event"));
+        dispatches.retain_date(NaiveDate::from_ymd_opt(2026, 9, 19).unwrap());
+        assert!(!dispatches.completed("2026-09-18:event"));
+    }
+
+    #[test]
+    fn sep_14_18_replay_delivers_all_66_demo_entries_once() {
+        let events = historical_replay_events();
+        assert_eq!(events.len(), 35);
+        assert!(events.iter().all(|event| event.price > 0.0));
+        let counts = replay_scheduler_delivery(&events);
+        assert_eq!(counts.futures_dispatched, 8);
+        assert_eq!(counts.futures_evaluated, 8);
+        assert_eq!(counts.futures_demo_path, 8);
+        assert_eq!(counts.supertrend_dispatched, 58);
+        assert_eq!(counts.supertrend_evaluated, 58);
+        assert_eq!(counts.supertrend_demo_path, 58);
+        assert_eq!(counts.duplicate_dispatches, 0);
+    }
+
+    #[test]
     fn cancelling_orders_process_each_new_fill_delta_before_terminal_state() {
         let first_partial = reconciliation_plan("cancelling", "open", 10, 0);
         assert_eq!(first_partial.prepare_state, "submitted");
@@ -13053,6 +14486,98 @@ mod tests {
                 residual_incoming: 0,
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn concurrent_signal_status_refreshes_do_not_deadlock() {
+        let state = isolated_test_state().await;
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users(id,username,email,password_hash) VALUES($1,'signal-lock-test','signal-lock-test@example.test','test-only')",
+        )
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for index in 0..64 {
+            let signal_id = Uuid::new_v4();
+            let action = if index % 2 == 0 {
+                "ENTRY"
+            } else {
+                "SQUARE_OFF"
+            };
+            let signal_type = if action == "ENTRY" {
+                "ENTRY"
+            } else {
+                "SQUARE_OFF"
+            };
+            sqlx::query(
+                "INSERT INTO strategy_signals(id,strategy_key,instrument,session_key,signal_at,signal_type,status,expected_users)
+                 VALUES($1,$2,'LOCK_TEST',$3,NOW(),$4,'dispatching',1)",
+            )
+            .bind(signal_id)
+            .bind(if action == "ENTRY" {
+                STRATEGY_KEY
+            } else {
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+            })
+            .bind(format!("signal-lock-{index}"))
+            .bind(signal_type)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO strategy_execution_intents(
+                   id,signal_id,user_id,strategy_key,instrument,session_key,action,role,side,
+                   order_type,lots,quantity,price,status,completed_at)
+                 VALUES(gen_random_uuid(),$1,$2,$3,'LOCK_TEST',$4,$5,'EMERGENCY_CLOSE','SELL',
+                        'MARKET',1,1,1,'completed',NOW())",
+            )
+            .bind(signal_id)
+            .bind(user_id)
+            .bind(if action == "ENTRY" {
+                STRATEGY_KEY
+            } else {
+                SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY
+            })
+            .bind(format!("signal-lock-{index}"))
+            .bind(action)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for worker in 0..16 {
+            let task_state = state.clone();
+            tasks.spawn(async move {
+                for _ in 0..20 {
+                    if worker % 2 == 0 {
+                        process_execution_intents(&task_state, None).await?;
+                    } else {
+                        reconcile_square_off_intents(&task_state).await?;
+                    }
+                }
+                AppResult::Ok(())
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(result) = tasks.join_next().await {
+                result.expect("status refresh task must not panic").unwrap();
+            }
+        })
+        .await
+        .expect("deterministically ordered status refreshes must not stall");
+
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM strategy_signals
+             WHERE instrument='LOCK_TEST' AND status='completed'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(completed, 64);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13708,9 +15233,16 @@ mod tests {
             "avgnetprice":"4321.25",
             "brokerExtra":"retained"
         });
-        reconcile_broker_positions(&state, user_id, &json!([raw_position.clone()]), None)
-            .await
-            .expect("unknown broker position reconciliation must succeed");
+        reconcile_broker_positions(
+            &state,
+            user_id,
+            0,
+            &json!([raw_position.clone()]),
+            None,
+            &json!([]),
+        )
+        .await
+        .expect("unknown broker position reconciliation must succeed");
         let incident: (String, String, String, String, i32, Option<f64>, Value) = sqlx::query_as(
             "SELECT incident_type,status,ownership_status,product_type,
                         broker_quantity,broker_average_price,raw_broker_position
@@ -13723,7 +15255,7 @@ mod tests {
         .expect("unmapped broker exposure must be persisted");
         assert_eq!(incident.0, "UNMAPPED_BROKER_POSITION");
         assert_eq!(incident.1, "operator_required");
-        assert_eq!(incident.2, "detected_unattributed");
+        assert_eq!(incident.2, "ambiguous");
         assert_eq!(incident.3, "CARRYFORWARD");
         assert_eq!(incident.4, 7);
         assert_eq!(incident.5, Some(4321.25));
@@ -13843,6 +15375,7 @@ mod tests {
             ("partial-sl-full-tp", 50, 50, 25),
         ];
         let mut broker_positions = Vec::new();
+        let mut broker_trade_fills = Vec::new();
         let mut contracts = Vec::new();
         let mut expected = HashMap::new();
         for (case_index, (case_name, entry_quantity, target_fill, stop_fill)) in
@@ -13898,6 +15431,16 @@ mod tests {
                     .bind(format!("source-client-{case_index}-{order_index}"))
                     .bind(processed)
                     .execute(&state.db).await.unwrap();
+                if processed > 0 {
+                    broker_trade_fills.push(json!({
+                        "orderid":format!("SRC-{case_index}-{order_index}"),
+                        "ordertag":format!("source-client-{case_index}-{order_index}"),
+                        "exchange":"MCX", "symboltoken":token,
+                        "tradingsymbol":symbol, "transactiontype":side,
+                        "fillsize":processed.to_string(), "fillprice":"100",
+                        "filltime":Utc::now().to_rfc3339()
+                    }));
+                }
             }
             let residual = target_fill + stop_fill - entry_quantity;
             assert!(residual > 0);
@@ -13927,16 +15470,35 @@ mod tests {
         crate::contract_master::set_isolated_test_cache(contracts).await;
 
         let positions = json!(broker_positions);
+        let trade_book = json!(broker_trade_fills);
         let first_state = state.clone();
         let first_positions = positions.clone();
+        let first_trade_book = trade_book.clone();
         let second_state = state.clone();
         let second_positions = positions.clone();
+        let second_trade_book = trade_book.clone();
         let (first, second) = tokio::join!(
             tokio::spawn(async move {
-                reconcile_broker_positions(&first_state, user_id, &first_positions, None).await
+                reconcile_broker_positions(
+                    &first_state,
+                    user_id,
+                    0,
+                    &first_positions,
+                    Some(&first_trade_book),
+                    &json!([]),
+                )
+                .await
             }),
             tokio::spawn(async move {
-                reconcile_broker_positions(&second_state, user_id, &second_positions, None).await
+                reconcile_broker_positions(
+                    &second_state,
+                    user_id,
+                    0,
+                    &second_positions,
+                    Some(&second_trade_book),
+                    &json!([]),
+                )
+                .await
             })
         );
         first.unwrap().unwrap();
@@ -13999,7 +15561,7 @@ mod tests {
 
         sqlx::query("UPDATE strategy_orders SET status='filled',filled_quantity=quantity,processed_quantity=quantity,average_fill_price=price,last_reconciled_at=NOW() WHERE user_id=$1 AND role='EMERGENCY_CLOSE'")
             .bind(user_id).execute(&state.db).await.unwrap();
-        reconcile_broker_positions(&state, user_id, &json!([]), None)
+        reconcile_broker_positions(&state, user_id, 0, &json!([]), None, &json!([]))
             .await
             .unwrap();
         let still_open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE user_id=$1 AND status='open' AND exposure_origin='broker_over_close'")
@@ -15586,10 +17148,30 @@ mod tests {
             fake.order_book.lock().await.clear();
             fake.trade_book.lock().await.clear();
             fake.positions.lock().await.clear();
-            let (user_id, snapshot_id, trade_id, token, _) =
+            let (user_id, snapshot_id, trade_id, token, symbol) =
                 seed_live_futures_protection_fixture(&state, &format!("reversal-{index}")).await;
-            sqlx::query("UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=DATE '2026-09-30' WHERE id=$1")
-                .bind(snapshot_id).bind(ist_now().date_naive()).execute(&state.db).await.unwrap();
+            let contract_expiry = ist_now().date_naive() + chrono::Duration::days(30);
+            contract_master::set_isolated_test_cache(vec![MasterContract {
+                token: token.clone(),
+                symbol: symbol.clone(),
+                name: "GOLDTEN".into(),
+                expiry: contract_expiry.format("%d%b%Y").to_string().to_uppercase(),
+                strike: "0".into(),
+                lotsize: "10".into(),
+                tick_size: "100.000000".into(),
+                instrumenttype: "FUTCOM".into(),
+                exch_seg: "MCX".into(),
+            }])
+            .await;
+            sqlx::query(
+                "UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=$3 WHERE id=$1",
+            )
+            .bind(snapshot_id)
+            .bind(ist_now().date_naive())
+            .bind(contract_expiry)
+            .execute(&state.db)
+            .await
+            .unwrap();
             sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active) VALUES($1,$2,TRUE) ON CONFLICT(user_id,strategy_key) DO UPDATE SET is_active=TRUE")
                 .bind(user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
             sqlx::query("UPDATE trades SET status='closed',direction=$2,exit_reason='SL2',exit_datetime=NOW()-INTERVAL '1 second',remaining_lots=0,safety_status='CLOSED',broker_net_quantity=0,last_position_reconciled_at=NOW() WHERE id=$1")
@@ -15641,15 +17223,35 @@ mod tests {
     async fn demo_sl2_reversal_is_simulated_without_angel_mutation() {
         let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
         let state = isolated_test_state_with_broker(&broker_url).await;
-        let (user_id, snapshot_id, trade_id, token, _) =
+        let (user_id, snapshot_id, trade_id, token, symbol) =
             seed_live_futures_protection_fixture(&state, "demo-reversal").await;
+        let contract_expiry = ist_now().date_naive() + chrono::Duration::days(30);
+        contract_master::set_isolated_test_cache(vec![MasterContract {
+            token: token.clone(),
+            symbol,
+            name: "GOLDTEN".into(),
+            expiry: contract_expiry.format("%d%b%Y").to_string().to_uppercase(),
+            strike: "0".into(),
+            lotsize: "10".into(),
+            tick_size: "100.000000".into(),
+            instrumenttype: "FUTCOM".into(),
+            exch_seg: "MCX".into(),
+        }])
+        .await;
         sqlx::query("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=$1")
             .bind(user_id)
             .execute(&state.db)
             .await
             .unwrap();
-        sqlx::query("UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=DATE '2026-09-30' WHERE id=$1")
-            .bind(snapshot_id).bind(ist_now().date_naive()).execute(&state.db).await.unwrap();
+        sqlx::query(
+            "UPDATE strategy_market_snapshots SET trade_date=$2,contract_expiry=$3 WHERE id=$1",
+        )
+        .bind(snapshot_id)
+        .bind(ist_now().date_naive())
+        .bind(contract_expiry)
+        .execute(&state.db)
+        .await
+        .unwrap();
         sqlx::query("UPDATE trades SET execution_mode='demo',status='closed',exit_reason='SL2',exit_datetime=NOW(),remaining_lots=0,safety_status='CLOSED',broker_net_quantity=NULL,last_position_reconciled_at=NULL WHERE id=$1")
             .bind(trade_id).execute(&state.db).await.unwrap();
         sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active) VALUES($1,$2,TRUE)")
@@ -15802,6 +17404,377 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn aggregate_position_incident_transition_is_atomic_and_fail_closed() {
+        let state = isolated_test_state().await;
+        let (user_id, _snapshot_id, trade_id, token, symbol) =
+            seed_live_futures_protection_fixture(&state, "incident-transition").await;
+        sqlx::query("INSERT INTO broker_position_incidents(id,user_id,strategy_key,instrument,exchange_segment,contract_token,contract_symbol,incident_type,status,broker_quantity,local_quantity,detail) VALUES($1,$2,$3,'GOLDTEN','MCX',$4,$5,'QUANTITY_OR_DIRECTION_MISMATCH','open',-100,50,'old aggregate state')")
+            .bind(Uuid::new_v4()).bind(user_id).bind(STRATEGY_KEY).bind(&token).bind(&symbol)
+            .execute(&state.db).await.unwrap();
+
+        record_position_incident(
+            &state,
+            user_id,
+            STRATEGY_KEY,
+            "GOLDTEN",
+            "MCX",
+            &token,
+            &symbol,
+            "LOCAL_POSITION_BROKER_FLAT",
+            0,
+            50,
+            None,
+            Some(trade_id),
+            "current aggregate state",
+            "CARRYFORWARD",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let incidents: Vec<(String, String)> = sqlx::query_as(
+            "SELECT incident_type,status FROM broker_position_incidents
+             WHERE user_id=$1 AND contract_token=$2 ORDER BY incident_type",
+        )
+        .bind(user_id)
+        .bind(&token)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            incidents,
+            vec![
+                ("LOCAL_POSITION_BROKER_FLAT".into(), "open".into()),
+                ("QUANTITY_OR_DIRECTION_MISMATCH".into(), "resolved".into()),
+            ]
+        );
+        let trade: (String, Option<i32>) =
+            sqlx::query_as("SELECT safety_status,broker_net_quantity FROM trades WHERE id=$1")
+                .bind(trade_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(trade, ("RECONCILIATION_REQUIRED".into(), Some(0)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn broker_manual_close_evidence_survives_protection_cleanup_and_trade_book_expiry() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, snapshot_id, trade_id, token, symbol) =
+            seed_live_futures_protection_fixture(&state, "durable-manual").await;
+        sqlx::query(
+            "UPDATE trades SET last_exact_broker_exposure_at=NOW()-INTERVAL '1 minute' WHERE id=$1",
+        )
+        .bind(trade_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let stop_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,trigger_price,status,broker_order_id,idempotency_key,client_order_id) VALUES($1,$2,$3,$4,'durable-manual-stop','SL1','SELL','STOPLOSS_MARKET','live',5,50,98,98,'submitted','DURABLE-STOP','durable-manual-stop-key','DURABLE-STOP-TAG')")
+            .bind(stop_id).bind(user_id).bind(snapshot_id).bind(trade_id).execute(&state.db).await.unwrap();
+        fake.positions.lock().await.clear();
+        let fill_at = Utc::now();
+        *fake.trade_book.lock().await = vec![
+            json!({
+                "orderid":"EXTERNAL-1","exchange":"MCX","symboltoken":token,
+                "tradingsymbol":symbol,"transactiontype":"SELL","fillsize":"10",
+                "fillprice":"102","filltime":fill_at.to_rfc3339()
+            }),
+            json!({
+                "orderid":"EXTERNAL-2","exchange":"MCX","symboltoken":token,
+                "tradingsymbol":symbol,"transactiontype":"SELL","fillsize":"40",
+                "fillprice":"104","filltime":fill_at.to_rfc3339()
+            }),
+        ];
+
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let first: (String, String, i64, f64, i64) = sqlx::query_as(
+            "SELECT t.status,o.status,
+                    (SELECT COUNT(*) FROM manual_broker_close_evidence e WHERE e.trade_id=t.id),
+                    (SELECT weighted_fill_price::float8 FROM manual_broker_close_evidence e WHERE e.trade_id=t.id),
+                    (SELECT broker_credential_revision FROM manual_broker_close_evidence e WHERE e.trade_id=t.id)
+             FROM trades t JOIN strategy_orders o ON o.id=$2 WHERE t.id=$1",
+        )
+        .bind(trade_id)
+        .bind(stop_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            first.0, "open",
+            "executable protection blocks terminalization"
+        );
+        assert_eq!(first.1, "cancelling");
+        assert_eq!(
+            first.2, 1,
+            "exact external evidence must be durable before cleanup"
+        );
+        assert_eq!(first.3, 103.6);
+        assert_eq!(
+            first.4, 0,
+            "evidence must be scoped to the broker account revision"
+        );
+        assert_eq!(
+            fake.cancelled_orders.lock().await.as_slice(),
+            ["DURABLE-STOP"]
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+
+        fake.trade_book.lock().await.clear();
+        *fake.trade_book_unavailable.lock().await = true;
+        *fake.order_book.lock().await = vec![json!({
+            "orderid":"DURABLE-STOP","ordertag":"DURABLE-STOP-TAG","status":"cancelled",
+            "filledshares":"0","averageprice":"0"
+        })];
+        sqlx::query("UPDATE user_profiles SET broker_credential_revision=1 WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            reconcile_live_user(&state, user_id).await.is_err(),
+            "evidence from another broker credential revision must not be reused"
+        );
+        let stale_revision_status: String =
+            sqlx::query_scalar("SELECT status FROM trades WHERE id=$1")
+                .bind(trade_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(stale_revision_status, "open");
+        sqlx::query("UPDATE user_profiles SET broker_credential_revision=0 WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let closed: (String, String, f64, f64, bool, DateTime<Utc>) = sqlx::query_as(
+            "SELECT status,exit_reason,exit_price::float8,pnl::float8,
+                    EXISTS(SELECT 1 FROM manual_broker_close_evidence e WHERE e.trade_id=$1 AND e.consumed_at IS NOT NULL)
+                    ,exit_datetime
+             FROM trades WHERE id=$1",
+        )
+        .bind(trade_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(closed.0, "closed");
+        assert_eq!(closed.1, "MANUAL_BROKER_CLOSE");
+        assert_eq!(closed.2, 103.6);
+        assert_eq!(closed.3, 18.0);
+        assert!(closed.4);
+        assert!(
+            (closed.5 - fill_at).num_milliseconds().abs() < 1,
+            "the local exit timestamp must be the attributable broker fill time"
+        );
+        assert_eq!(fake.cancelled_orders.lock().await.len(), 1);
+        assert!(
+            fake.placed_orders.lock().await.is_empty(),
+            "an already external close cannot submit another broker close"
+        );
+
+        reconcile_live_user(&state, user_id).await.unwrap();
+        assert_eq!(fake.cancelled_orders.lock().await.len(), 1);
+        assert!(fake.placed_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn broker_manual_flat_fails_closed_for_partial_ambiguous_or_missing_evidence() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (user_id, snapshot_id, trade_id, token, symbol) =
+            seed_live_futures_protection_fixture(&state, "manual-fail-closed").await;
+        sqlx::query(
+            "UPDATE trades SET last_exact_broker_exposure_at=NOW()-INTERVAL '1 minute' WHERE id=$1",
+        )
+        .bind(trade_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        fake.positions.lock().await.clear();
+
+        *fake.order_book_unavailable.lock().await = true;
+        assert!(reconcile_live_user(&state, user_id).await.is_err());
+        *fake.order_book_unavailable.lock().await = false;
+        *fake.order_book_timeout.lock().await = true;
+        assert!(reconcile_live_user(&state, user_id).await.is_err());
+        *fake.order_book_timeout.lock().await = false;
+        *fake.positions_unavailable.lock().await = true;
+        assert!(reconcile_live_user(&state, user_id).await.is_err());
+        *fake.positions_unavailable.lock().await = false;
+
+        fake.trade_book.lock().await.clear();
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let missing: (String, i64) = sqlx::query_as(
+            "SELECT status,(SELECT COUNT(*) FROM manual_broker_close_evidence WHERE trade_id=$1) FROM trades WHERE id=$1",
+        )
+        .bind(trade_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(missing, ("open".into(), 0));
+
+        *fake.trade_book.lock().await = vec![json!({
+            "orderid":"PARTIAL","exchange":"MCX","symboltoken":token,
+            "tradingsymbol":symbol,"transactiontype":"SELL","fillsize":"25",
+            "fillprice":"102.5","filltime":Utc::now().to_rfc3339()
+        })];
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let partial: (String, String, i64) = sqlx::query_as(
+            "SELECT status,safety_status,(SELECT COUNT(*) FROM manual_broker_close_evidence WHERE trade_id=$1) FROM trades WHERE id=$1",
+        )
+        .bind(trade_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(
+            partial,
+            ("open".into(), "RECONCILIATION_REQUIRED".into(), 0)
+        );
+
+        *fake.trade_book_unavailable.lock().await = true;
+        assert!(reconcile_live_user(&state, user_id).await.is_err());
+        let after_failure: String = sqlx::query_scalar("SELECT status FROM trades WHERE id=$1")
+            .bind(trade_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(after_failure, "open");
+        *fake.trade_book_unavailable.lock().await = false;
+
+        let second_trade = Uuid::new_v4();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,notes,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status,last_exact_broker_exposure_at) VALUES($1,$2,'live','open','BUY',50,100,100,0,NOW()-INTERVAL '2 minutes','GOLDTEN',$3,'ambiguous second local trade',$4,$5,5,5,'RECONCILIATION_REQUIRED',NOW()-INTERVAL '1 minute')")
+            .bind(second_trade).bind(user_id).bind(&symbol).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
+        *fake.trade_book.lock().await = vec![json!({
+            "orderid":"EXACT-BUT-AMBIGUOUS","exchange":"MCX","symboltoken":token,
+            "tradingsymbol":symbol,"transactiontype":"SELL","fillsize":"50",
+            "fillprice":"103","filltime":Utc::now().to_rfc3339()
+        })];
+        reconcile_live_user(&state, user_id).await.unwrap();
+        let ambiguous_closed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE id IN ($1,$2) AND status='closed'",
+        )
+        .bind(trade_id)
+        .bind(second_trade)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            ambiguous_closed, 0,
+            "multiple local trades prevent attribution"
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn demo_manual_close_is_owned_idempotent_and_never_calls_angel() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let user_id = Uuid::new_v4();
+        let other_user_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let trade_id = Uuid::new_v4();
+        let stop_id = Uuid::new_v4();
+        for (id, username) in [
+            (user_id, "demo-close-owner"),
+            (other_user_id, "demo-close-other"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,'test-only')",
+            )
+            .bind(id)
+            .bind(username)
+            .bind(format!("{username}@example.test"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO user_profiles(user_id,trading_mode) VALUES($1,'demo')")
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,lot_size,exchange_segment,product_type,execution_key) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready','demo-close-token','GOLDTEN-DEMO-FUT',10,'MCX','CARRYFORWARD','demo-close')")
+            .bind(snapshot_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO trades(id,user_id,execution_mode,status,direction,quantity,entry_price,last_price,pnl,entry_datetime,instrument_label,contract_symbol,strategy_key,strategy_snapshot_id,total_lots,remaining_lots,safety_status) VALUES($1,$2,'demo','open','SELL',20,100,100,5,NOW(),'GOLDTEN','GOLDTEN-DEMO-FUT',$3,$4,2,2,'PROTECTED')")
+            .bind(trade_id).bind(user_id).bind(STRATEGY_KEY).bind(snapshot_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO strategy_orders(id,user_id,snapshot_id,trade_id,session_key,role,side,order_type,execution_mode,lots,quantity,price,trigger_price,status,broker_order_id,idempotency_key,client_order_id) VALUES($1,$2,$3,$4,'demo-close-stop','SL1','BUY','STOPLOSS_MARKET','demo',2,20,105,105,'submitted','DEMO-STOP','demo-close-stop-key','DEMO-STOP-TAG')")
+            .bind(stop_id).bind(user_id).bind(snapshot_id).bind(trade_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX','demo-close-token',98,NOW())")
+            .execute(&state.db).await.unwrap();
+        let auth = |id, username: &str| AuthUser {
+            id,
+            username: username.into(),
+            can_administer: false,
+            can_live_trade: false,
+            can_backtest: false,
+            can_backtest_on_trading_days: false,
+            trading_mode: "demo".into(),
+            session_id: Uuid::new_v4(),
+        };
+        assert!(matches!(
+            manual_close_trade(
+                State(state.clone()),
+                Extension(auth(other_user_id, "demo-close-other")),
+                Path(trade_id),
+                HeaderMap::new(),
+                None,
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        let first = manual_close_trade(
+            State(state.clone()),
+            Extension(auth(user_id, "demo-close-owner")),
+            Path(trade_id),
+            HeaderMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0["status"], "completed");
+        assert_eq!(first.0["execution_mode"], "demo");
+        let closed: (String, String, f64, f64, i32, String) = sqlx::query_as(
+            "SELECT t.status,t.exit_reason,t.exit_price::float8,t.pnl::float8,t.remaining_lots,o.status FROM trades t JOIN strategy_orders o ON o.id=$2 WHERE t.id=$1",
+        )
+        .bind(trade_id).bind(stop_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(
+            closed,
+            (
+                "closed".into(),
+                "MANUAL_RULENIX_CLOSE".into(),
+                98.0,
+                9.0,
+                0,
+                "cancelled".into()
+            )
+        );
+        let duplicate = manual_close_trade(
+            State(state.clone()),
+            Extension(auth(user_id, "demo-close-owner")),
+            Path(trade_id),
+            HeaderMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate.0["status"], "completed");
+        let live_side_effects: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM manual_trade_close_intents WHERE trade_id=$1),
+                    (SELECT COUNT(*) FROM strategy_orders WHERE trade_id=$1 AND execution_mode='live')",
+        )
+        .bind(trade_id).fetch_one(&state.db).await.unwrap();
+        assert_eq!(live_side_effects, (0, 0));
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn deployment_safety_inventory_covers_all_durable_live_exposure() {
         let state = isolated_test_state().await;
         let user_id = seed_flat_linked_live_account(&state, "deployment-inventory").await;
@@ -15931,6 +17904,142 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn manual_broker_exposure_is_reported_narrow_and_never_mutated() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let user_id = seed_flat_linked_live_account(&state, "manual-narrow").await;
+        let manual_order = json!({
+            "orderid":"MANUAL-1", "ordertag":"", "status":"open", "exchange":"MCX",
+            "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "transactiontype":"BUY", "quantity":"10", "filledshares":"10"
+        });
+        *fake.order_book.lock().await = vec![manual_order];
+        *fake.positions.lock().await = vec![json!({
+            "exchange":"MCX", "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "producttype":"CARRYFORWARD", "netqty":"10", "avgnetprice":"100"
+        })];
+        *fake.trade_book.lock().await = vec![json!({
+            "orderid":"MANUAL-1", "ordertag":"", "exchange":"MCX",
+            "symboltoken":"manual-token", "tradingsymbol":"MANUALFUT",
+            "transactiontype":"BUY", "fillsize":"10", "fillprice":"100",
+            "filltime":Utc::now().to_rfc3339()
+        })];
+        reconcile_live_user_readiness(&state, user_id)
+            .await
+            .unwrap();
+        assert!(risk::reconciliation_ready(&state, user_id).await.unwrap());
+        let ownership: Vec<(String, String)> = sqlx::query_as(
+            "SELECT exposure_kind,ownership_status FROM broker_exposure_observations
+             WHERE user_id=$1 ORDER BY exposure_kind",
+        )
+        .bind(user_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            ownership,
+            vec![
+                ("order".into(), "manual_external".into()),
+                ("position".into(), "manual_external".into()),
+            ]
+        );
+        reconcile_live_user_readiness(&state, user_id)
+            .await
+            .unwrap();
+        let observation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM broker_exposure_observations WHERE user_id=$1",
+        )
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            observation_count, 2,
+            "restart/reconciliation must only refresh manual evidence"
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+
+        let mut snapshots = HashMap::new();
+        for (token, key) in [
+            ("unrelated-token", "manual-narrow-unrelated"),
+            ("manual-token", "manual-narrow-exact"),
+        ] {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO strategy_market_snapshots(id,strategy_key,instrument,trade_date,status,contract_token,contract_symbol,lot_size,exchange_segment,product_type,execution_key) VALUES($1,$2,'GOLDTEN',CURRENT_DATE,'ready',$3,$3,10,'MCX','CARRYFORWARD',$4)")
+                .bind(id).bind(STRATEGY_KEY).bind(token).bind(key).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX',$1,100,NOW())")
+                .bind(token).execute(&state.db).await.unwrap();
+            snapshots.insert(token, id);
+        }
+        let unrelated_snapshot = snapshots["unrelated-token"];
+        let manual_snapshot = snapshots["manual-token"];
+        let risk_order =
+            |snapshot_id, token: &'static str, mode: &'static str, key: &'static str| {
+                risk::OrderRisk {
+                    user_id,
+                    snapshot_id,
+                    trade_id: None,
+                    session: key,
+                    role: "BUY_ENTRY",
+                    side: "BUY",
+                    mode,
+                    lots: 1,
+                    quantity: 10,
+                    price: 100.0,
+                    trigger_price: None,
+                    idempotency_key: key,
+                    snapshot_ready: true,
+                    snapshot_current: true,
+                    exchange_segment: "MCX",
+                    contract_token: token,
+                    live_reconciled: true,
+                    originated_at: None,
+                }
+            };
+        assert!(
+            risk::assess_and_reserve(
+                &state,
+                &risk_order(
+                    unrelated_snapshot,
+                    "unrelated-token",
+                    "live",
+                    "manual-unrelated-live"
+                ),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        let collision = risk::assess_and_reserve(
+            &state,
+            &risk_order(manual_snapshot, "manual-token", "live", "manual-exact-live"),
+        )
+        .await
+        .expect_err("exact manual contract must block only this LIVE mutation");
+        assert!(collision.to_string().contains("exact LIVE contract"));
+
+        sqlx::query("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            risk::assess_and_reserve(
+                &state,
+                &risk_order(manual_snapshot, "manual-token", "demo", "manual-exact-demo"),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+        assert!(fake.cancelled_orders.lock().await.is_empty());
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn disconnected_flat_account_is_live_blocked_without_platform_exposure() {
         let state = isolated_test_state().await;
         let user_id = seed_flat_linked_live_account(&state, "offline-flat").await;
@@ -15960,6 +18069,7 @@ mod tests {
         let known = HashSet::from(["RULENIX-SL".to_string()]);
         let fill = |order_id: &str, side: &str, quantity: i32, seconds: i64| BrokerTradeFill {
             order_id: order_id.into(),
+            order_tag: String::new(),
             exchange: "MCX".into(),
             token: "123".into(),
             symbol: "GOLDTEN30SEP26FUT".into(),
@@ -15975,10 +18085,12 @@ mod tests {
             direction: "BUY",
             quantity: 20,
             entry_at,
+            evidence_since: entry_at,
             known_order_ids: &known,
         };
         assert_eq!(
-            attributable_manual_flat_fill(&[fill("MANUAL-1", "SELL", 20, 1)], &expected,),
+            attributable_manual_flat_fill(&[fill("MANUAL-1", "SELL", 20, 1)], &expected,)
+                .map(|evidence| evidence.weighted_price),
             Some(101.5)
         );
         assert!(
@@ -15991,17 +18103,135 @@ mod tests {
             "partial or ambiguous attribution must fail closed"
         );
         assert!(
+            attributable_manual_flat_fill(
+                &[fill("MANUAL-BEFORE-ENTRY", "SELL", 20, -1)],
+                &expected,
+            )
+            .is_none(),
+            "a fill before the local entry cannot close the trade"
+        );
+        let weighted = attributable_manual_flat_fill(
+            &[
+                BrokerTradeFill {
+                    price: 100.0,
+                    ..fill("MANUAL-1", "SELL", 5, 1)
+                },
+                BrokerTradeFill {
+                    price: 104.0,
+                    ..fill("MANUAL-2", "SELL", 15, 2)
+                },
+            ],
+            &expected,
+        )
+        .expect("multiple exact external fills must be attributable");
+        assert_eq!(weighted.quantity, 20);
+        assert_eq!(weighted.weighted_price, 103.0);
+        assert_eq!(weighted.order_ids, ["MANUAL-1", "MANUAL-2"]);
+        assert!(
+            attributable_manual_flat_fill(&[fill("MANUAL-1", "SELL", 21, 1)], &expected,).is_none(),
+            "an external over-close cannot be treated as an exact close"
+        );
+        assert!(
             attributable_manual_flat_fill(&[fill("MANUAL-1", "BUY", 20, 1)], &expected,).is_none(),
             "same-side or unrelated fills cannot close the trade"
+        );
+        assert!(
+            attributable_manual_flat_fill(
+                &[
+                    fill("MANUAL-1", "SELL", 20, 1),
+                    fill("UNRELATED", "BUY", 1, 2),
+                ],
+                &expected,
+            )
+            .is_none(),
+            "conflicting external activity on the same contract must fail closed"
+        );
+        assert!(
+            attributable_manual_flat_fill(
+                &[BrokerTradeFill {
+                    symbol: "WRONG".into(),
+                    ..fill("MANUAL-1", "SELL", 20, 1)
+                }],
+                &expected,
+            )
+            .is_none(),
+            "a wrong-symbol fill cannot be attributed even when a token matches"
+        );
+        assert!(
+            attributable_manual_flat_fill(
+                &[BrokerTradeFill {
+                    token: "wrong-token".into(),
+                    ..fill("MANUAL-1", "SELL", 20, 1)
+                }],
+                &expected,
+            )
+            .is_none(),
+            "a wrong-token fill cannot be attributed"
+        );
+        let stale_expected = ManualFillExpectation {
+            evidence_since: entry_at + Duration::seconds(3),
+            ..expected
+        };
+        assert!(
+            attributable_manual_flat_fill(
+                &[fill("MANUAL-BEFORE-MATCH", "SELL", 20, 2)],
+                &stale_expected,
+            )
+            .is_none(),
+            "a fill before the last exact broker/local exposure match is stale evidence"
         );
         let short_expected = ManualFillExpectation {
             direction: "SELL",
             ..expected
         };
         assert_eq!(
-            attributable_manual_flat_fill(&[fill("MANUAL-SHORT", "BUY", 20, 1)], &short_expected,),
+            attributable_manual_flat_fill(&[fill("MANUAL-SHORT", "BUY", 20, 1)], &short_expected,)
+                .map(|evidence| evidence.weighted_price),
             Some(101.5)
         );
+    }
+
+    #[test]
+    fn broker_exposure_ownership_requires_durable_or_complete_evidence() {
+        let manual = json!({
+            "orderid":"MANUAL", "exchange":"MCX", "symboltoken":"123",
+            "transactiontype":"BUY", "quantity":"10", "ordertag":""
+        });
+        assert_eq!(
+            broker_order_ownership(&manual, &HashSet::new(), &HashSet::new()),
+            BrokerExposureOwnership::ManualExternal
+        );
+        assert_eq!(
+            broker_order_ownership(
+                &json!({"orderid":"ORPHAN", "exchange":"MCX", "symboltoken":"123", "transactiontype":"BUY", "quantity":"10", "ordertag":"RX0123456789ABCDEF01"}),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
+            BrokerExposureOwnership::Ambiguous
+        );
+        assert_eq!(
+            broker_order_ownership(&manual, &HashSet::from(["MANUAL".into()]), &HashSet::new(),),
+            BrokerExposureOwnership::RulenixOwned
+        );
+    }
+
+    #[test]
+    fn broker_trade_parser_accepts_angel_exchange_time_and_fails_closed_on_malformed_rows() {
+        let parsed = parse_broker_trade_fills(&json!([{
+            "orderid":"MANUAL-1","exchange":"MCX","symboltoken":"123",
+            "tradingsymbol":"GOLDTEN30SEP26FUT","transactiontype":"SELL",
+            "quantity":"20","price":"101.25","exchtime":"11-Sep-2026 12:15:01"
+        }]))
+        .expect("the observed Angel trade-book aliases must parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].price, 101.25);
+        assert!(
+            parse_broker_trade_fills(&json!([{
+                "orderid":"MANUAL-1","exchange":"MCX","symboltoken":"123"
+            }]))
+            .is_err()
+        );
+        assert!(parse_broker_trade_fills(&json!({"unexpected":[]})).is_err());
     }
 
     #[test]
