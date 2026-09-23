@@ -184,17 +184,31 @@ class ReconciliationSnapshot:
             self.account_id
             and self.egress_identity
             and all(item.status is EvidenceStatus.SUCCESS for item in self.evidence)
+            and all(
+                item.status is EvidenceStatus.SUCCESS
+                for item in self.individual_orders.values()
+            )
             and all(item.credential_revision == self.credential_revision for item in self.evidence)
+            and all(
+                item.credential_revision == self.credential_revision
+                for item in self.individual_orders.values()
+            )
             and bool(self.account_validation.data)
             and (self.current_credential_revision is None or self.current_credential_revision == self.credential_revision)
         )
 
     @property
     def failure_detail(self) -> str:
-        return "; ".join(f"{name}={item.status.value}:{item.error}" for name, item in (
+        failures = [f"{name}={item.status.value}:{item.error}" for name, item in (
             ("positions", self.positions), ("orders", self.orders), ("fills", self.fills),
             ("conditional_rules", self.conditional_rules), ("account", self.account_validation),
-        ) if item.status is not EvidenceStatus.SUCCESS)
+        ) if item.status is not EvidenceStatus.SUCCESS]
+        failures.extend(
+            f"individual_order[{order_id}]={item.status.value}:{item.error}"
+            for order_id, item in self.individual_orders.items()
+            if item.status is not EvidenceStatus.SUCCESS
+        )
+        return "; ".join(failures)
 
 
 class PositionClassification(StrEnum):

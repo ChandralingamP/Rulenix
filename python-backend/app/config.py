@@ -21,6 +21,26 @@ class Settings(BaseSettings):
     live_authority_lease_owner: str = Field(
         default="", validation_alias="PYTHON_LIVE_AUTHORITY_LEASE_OWNER"
     )
+    runtime_mode: str = Field(default="off", validation_alias="PYTHON_RUNTIME_MODE")
+    authority_lease_seconds: int = Field(
+        default=30, validation_alias="PYTHON_AUTHORITY_LEASE_SECONDS"
+    )
+    worker_interval_seconds: int = Field(
+        default=5, validation_alias="PYTHON_WORKER_INTERVAL_SECONDS"
+    )
+    angel_base_url: str = Field(
+        default="https://apiconnect.angelone.in",
+        validation_alias="ANGEL_BASE_URL",
+    )
+    angel_websocket_url: str = Field(
+        default="wss://smartapisocket.angelone.in/smart-stream",
+        validation_alias="ANGEL_WEBSOCKET_URL",
+    )
+    angel_client_local_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_LOCAL_IP")
+    angel_client_public_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_PUBLIC_IP")
+    angel_client_mac_address: str = Field(
+        default="", validation_alias="ANGEL_CLIENT_MAC_ADDRESS"
+    )
     egress_helper_socket: str = Field(default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET")
     log_directory: str = Field(default="./logs", validation_alias="RULENIX_LOG_DIRECTORY")
 
@@ -34,6 +54,17 @@ class Settings(BaseSettings):
         return url
 
     def validate_production(self) -> None:
+        mode = self.runtime_mode.strip().lower()
+        if mode not in {"off", "shadow", "authoritative"}:
+            raise ValueError("PYTHON_RUNTIME_MODE must be off, shadow, or authoritative")
+        if not 5 <= self.authority_lease_seconds <= 300:
+            raise ValueError("PYTHON_AUTHORITY_LEASE_SECONDS must be between 5 and 300")
+        if not 1 <= self.worker_interval_seconds <= 60:
+            raise ValueError("PYTHON_WORKER_INTERVAL_SECONDS must be between 1 and 60")
+        if self.live_trading_enabled != (mode == "authoritative"):
+            raise ValueError(
+                "PYTHON_LIVE_TRADING_ENABLED must be true only in authoritative runtime mode"
+            )
         if self.live_trading_enabled:
             if not self.async_database_url:
                 raise ValueError("DATABASE_URL is required for Python LIVE mutation")
@@ -50,6 +81,16 @@ class Settings(BaseSettings):
                 raise ValueError("OTP_HASH_KEY must contain at least 32 bytes")
             if not self.frontend_origin.startswith("https://"):
                 raise ValueError("FRONTEND_ORIGIN must use HTTPS outside development")
+            if mode != "off" and not self.credential_keys:
+                raise ValueError("CREDENTIAL_ENCRYPTION_KEYS is required for runtime broker reads")
+            if mode != "off" and not all(
+                (
+                    self.angel_client_local_ip,
+                    self.angel_client_public_ip,
+                    self.angel_client_mac_address,
+                )
+            ):
+                raise ValueError("Angel client network identity is required for runtime broker reads")
 
 
 @lru_cache

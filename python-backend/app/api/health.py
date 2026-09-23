@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,15 +38,18 @@ async def live() -> dict:
 async def ready(request: Request):
     database_ready = await ping(request.app.state.engine)
     scheduler = request.app.state.scheduler_health.snapshot()
-    ready = database_ready and not scheduler.stale
+    runtime = getattr(request.app.state, "production_runtime", None)
+    runtime_ready = True if runtime is None else runtime.ready()
+    ready = database_ready and not scheduler.stale and runtime_ready
     payload = {
         "status": "ready" if ready else "unready",
         "checks": {
             "database": "ok" if database_ready else "unavailable",
             "strategy_scheduler": _scheduler_payload(scheduler),
+            **({"python_runtime": runtime.status()} if runtime is not None else {}),
         },
     }
-    return JSONResponse(payload, status_code=200 if ready else 503)
+    return JSONResponse(jsonable_encoder(payload), status_code=200 if ready else 503)
 
 
 @router.get("/metrics")
@@ -70,5 +74,10 @@ async def metrics(
         "reconciliation_unhealthy": int(await scalar("SELECT COUNT(*) FROM broker_reconciliation_health WHERE healthy=FALSE OR checked_at<NOW()-INTERVAL '5 minutes'")),
         "strategy_scheduler": _scheduler_payload(
             request.app.state.scheduler_health.snapshot()
+        ),
+        **(
+            {"python_runtime": request.app.state.production_runtime.status()}
+            if getattr(request.app.state, "production_runtime", None) is not None
+            else {}
         ),
     }

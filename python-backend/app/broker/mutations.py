@@ -69,13 +69,16 @@ class LiveMutationCoordinator:
         client_factory: Callable[[UUID], Awaitable[AngelClient]],
         *,
         lease_owner: UUID,
-        enabled: bool,
+        enabled: bool | Callable[[], bool],
     ):
         self.session_factory = session_factory
         self.authority = authority
         self.client_factory = client_factory
         self.lease_owner = lease_owner
         self.enabled = enabled
+
+    def mutation_enabled(self) -> bool:
+        return self.enabled() if callable(self.enabled) else self.enabled
 
     async def _order(self, session: AsyncSession, order_id: UUID, *, lock: bool = False):
         suffix = " FOR UPDATE OF o" if lock else ""
@@ -316,12 +319,18 @@ class LiveMutationCoordinator:
                 },
             )
 
-    async def _safety(self, order, order_id: UUID, operation: str):
+    async def _safety(
+        self,
+        order,
+        order_id: UUID,
+        operation: str,
+        action: ActionKind | None = None,
+    ):
         async with self.session_factory() as session:
             return await RiskSafetyService(session).final_pre_mutation_check(
                 SafetyRequest(
                     user_id=UUID(str(order["user_id"])),
-                    action=_action(str(order["role"]), operation),
+                    action=action or _action(str(order["role"]), operation),
                     execution_mode="live",
                     trade_id=UUID(str(order["trade_id"])) if order["trade_id"] else None,
                     intent_id=UUID(str(order["execution_intent_id"])) if order["execution_intent_id"] else None,
@@ -338,8 +347,10 @@ class LiveMutationCoordinator:
                 )
             )
 
-    async def place_order(self, order_id: UUID) -> MutationOutcome:
-        if not self.enabled:
+    async def place_order(
+        self, order_id: UUID, *, action: ActionKind | None = None
+    ) -> MutationOutcome:
+        if not self.mutation_enabled():
             raise MutationPendingError("Python LIVE mutation is disabled by configuration.")
         async with self.session_factory() as session:
             initial = await self._order(session, order_id)
@@ -357,7 +368,11 @@ class LiveMutationCoordinator:
                 lease_owner=self.lease_owner,
                 user_id=user_id,
             ) as proof:
-                decision = await self._safety(order, order_id, "place_order")
+                if not self.mutation_enabled():
+                    raise AuthorityError("Python LIVE mutation capability was revoked.")
+                decision = await self._safety(
+                    order, order_id, "place_order", action
+                )
                 if not decision.allowed:
                     await self._finish(
                         attempt_id=attempt_id,
@@ -418,7 +433,7 @@ class LiveMutationCoordinator:
                 await client.close()
 
     async def cancel_order(self, order_id: UUID, *, variety: str) -> MutationOutcome:
-        if not self.enabled:
+        if not self.mutation_enabled():
             raise MutationPendingError("Python LIVE mutation is disabled by configuration.")
         async with self.session_factory() as session:
             initial = await self._order(session, order_id)
@@ -438,6 +453,8 @@ class LiveMutationCoordinator:
                 lease_owner=self.lease_owner,
                 user_id=user_id,
             ) as proof:
+                if not self.mutation_enabled():
+                    raise AuthorityError("Python LIVE mutation capability was revoked.")
                 decision = await self._safety(order, order_id, "cancel_order")
                 if not decision.allowed:
                     await self._finish(

@@ -28,6 +28,7 @@ from .config import get_settings
 from .db import make_engine, make_session_factory
 from .errors import DomainError, domain_error_handler, http_error_handler, validation_error_handler
 from .reconciliation.workers import BackgroundWorkerManager
+from .runtime.service import ProductionRuntime
 from .strategy.runtime import SchedulerHealth
 
 
@@ -39,13 +40,33 @@ async def lifespan(app: FastAPI):
     app.state.last_dev_otp = None
     app.state.worker_manager = BackgroundWorkerManager()
     app.state.scheduler_health = SchedulerHealth()
-    if app.state.session_factory and Path(app.state.settings.egress_helper_socket).exists():
-        async with app.state.session_factory() as session:
-            await rehydrate_configured_ips(session, EgressHelperClient(app.state.settings.egress_helper_socket))
-    yield
-    await app.state.worker_manager.stop()
-    if app.state.engine:
-        await app.state.engine.dispose()
+    app.state.production_runtime = None
+    try:
+        if app.state.session_factory and Path(app.state.settings.egress_helper_socket).exists():
+            async with app.state.session_factory() as session:
+                await rehydrate_configured_ips(
+                    session,
+                    EgressHelperClient(app.state.settings.egress_helper_socket),
+                )
+        if (
+            app.state.engine is not None
+            and app.state.session_factory is not None
+            and app.state.settings.runtime_mode.strip().lower() != "off"
+        ):
+            app.state.production_runtime = ProductionRuntime(
+                app.state.engine,
+                app.state.session_factory,
+                app.state.settings,
+                app.state.scheduler_health,
+            )
+            await app.state.production_runtime.start()
+        yield
+    finally:
+        if app.state.production_runtime is not None:
+            await app.state.production_runtime.stop()
+        await app.state.worker_manager.stop()
+        if app.state.engine:
+            await app.state.engine.dispose()
 
 app = FastAPI(title="Rulenix Python Foundation API", version="0.1.0", lifespan=lifespan)
 app.add_exception_handler(DomainError, domain_error_handler)
