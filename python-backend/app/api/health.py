@@ -5,8 +5,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import ping
 from ..dependencies import Principal, admin_only, get_db
+from ..strategy.runtime import SchedulerHealthSnapshot
 
 router = APIRouter(tags=["health"])
+
+
+def _scheduler_payload(snapshot: SchedulerHealthSnapshot) -> dict:
+    if snapshot.stale:
+        status = "stale"
+    elif snapshot.leader:
+        status = "advancing"
+    else:
+        status = "standby"
+    return {
+        "status": status,
+        "leader": snapshot.leader,
+        "last_advance_at": snapshot.last_advance_at,
+        "last_successful_dispatch_at": snapshot.last_successful_dispatch_at,
+        "dispatch_count": snapshot.dispatch_count,
+        "error_count": snapshot.error_count,
+    }
 
 
 @router.get("/health")
@@ -17,13 +35,22 @@ async def live() -> dict:
 
 @router.get("/health/ready")
 async def ready(request: Request):
-    ok = await ping(request.app.state.engine)
-    payload = {"status": "ready" if ok else "not_ready", "checks": {"database": "ok" if ok else "unavailable"}}
-    return JSONResponse(payload, status_code=200 if ok else 503)
+    database_ready = await ping(request.app.state.engine)
+    scheduler = request.app.state.scheduler_health.snapshot()
+    ready = database_ready and not scheduler.stale
+    payload = {
+        "status": "ready" if ready else "unready",
+        "checks": {
+            "database": "ok" if database_ready else "unavailable",
+            "strategy_scheduler": _scheduler_payload(scheduler),
+        },
+    }
+    return JSONResponse(payload, status_code=200 if ready else 503)
 
 
 @router.get("/metrics")
 async def metrics(
+    request: Request,
     _: Principal = Depends(admin_only),
     db: AsyncSession = Depends(get_db),
 ):
@@ -41,4 +68,7 @@ async def metrics(
         "risk_rejections_24h": int(await scalar("SELECT COUNT(*) FROM risk_decisions WHERE allowed=FALSE AND created_at>NOW()-INTERVAL '24 hours'")),
         "broker_errors_24h": int(await scalar("SELECT COUNT(*) FROM broker_order_events WHERE (event_type LIKE '%failed%' OR event_type LIKE '%error%') AND created_at>NOW()-INTERVAL '24 hours'")),
         "reconciliation_unhealthy": int(await scalar("SELECT COUNT(*) FROM broker_reconciliation_health WHERE healthy=FALSE OR checked_at<NOW()-INTERVAL '5 minutes'")),
+        "strategy_scheduler": _scheduler_payload(
+            request.app.state.scheduler_health.snapshot()
+        ),
     }

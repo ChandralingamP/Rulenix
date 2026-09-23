@@ -91,6 +91,7 @@ def test_scheduler_stale_detection_and_leadership_reacquisition() -> None:
     health.leadership_acquired(started + timedelta(minutes=2))
     health.record_advance(started + timedelta(minutes=2, seconds=1))
     assert health.snapshot(now=started + timedelta(minutes=2, seconds=2)).advancing
+    assert health.snapshot().last_advance_at == started + timedelta(minutes=2, seconds=1)
 
 
 def _fill(order: str, quantity: int, *, token: str = "T", minutes: int = 1) -> BrokerFill:

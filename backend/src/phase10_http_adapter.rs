@@ -54,6 +54,7 @@ pub async fn run() -> Result<()> {
         strategy_execution_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         credentials: CredentialStore::for_isolated_test(db),
         abuse_prevention: AbusePrevention::default(),
+        scheduler_health: Default::default(),
     };
 
     let public_api = Router::new()

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rulenix-python-foundation"
 version = "0.1.0"
-description = "Rulenix Python foundation API (broker layer intentionally deferred)"
+description = "Rulenix Python migration runtime (production LIVE authority disabled)"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1",

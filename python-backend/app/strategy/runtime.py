@@ -34,8 +34,10 @@ class SchedulerHealth:
         self.error_count = 0
 
     def leadership_acquired(self, now: datetime | None = None) -> None:
+        acquired_at = now or datetime.now(UTC)
         self.leader = True
-        self.leader_since = now or datetime.now(UTC)
+        self.leader_since = acquired_at
+        self.last_advance_at = acquired_at
 
     def leadership_lost(self) -> None:
         self.leader = False
