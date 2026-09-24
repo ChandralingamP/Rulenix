@@ -10,14 +10,23 @@ class Settings(BaseSettings):
 
     app_env: str = Field(default="development", validation_alias="APP_ENV")
     database_url: str = Field(default="", validation_alias="DATABASE_URL")
-    frontend_origin: str = Field(default="http://localhost:5173", validation_alias="FRONTEND_ORIGIN")
+    frontend_origin: str = Field(
+        default="http://localhost:5173", validation_alias="FRONTEND_ORIGIN"
+    )
     session_idle_minutes: int = Field(default=30, validation_alias="SESSION_IDLE_MINUTES")
     session_absolute_hours: int = Field(default=24, validation_alias="SESSION_ABSOLUTE_HOURS")
     otp_hash_key: str = Field(default="development-only-otp-key", validation_alias="OTP_HASH_KEY")
     credential_keys: str = Field(default="", validation_alias="CREDENTIAL_ENCRYPTION_KEYS")
-    credential_primary_version: int = Field(default=1, validation_alias=AliasChoices("CREDENTIAL_PRIMARY_VERSION", "CREDENTIAL_ENCRYPTION_PRIMARY_VERSION"))
+    credential_primary_version: int = Field(
+        default=1,
+        validation_alias=AliasChoices(
+            "CREDENTIAL_PRIMARY_VERSION", "CREDENTIAL_ENCRYPTION_PRIMARY_VERSION"
+        ),
+    )
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
-    live_trading_enabled: bool = Field(default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED")
+    live_trading_enabled: bool = Field(
+        default=False, validation_alias="PYTHON_LIVE_TRADING_ENABLED"
+    )
     live_authority_lease_owner: str = Field(
         default="", validation_alias="PYTHON_LIVE_AUTHORITY_LEASE_OWNER"
     )
@@ -28,6 +37,10 @@ class Settings(BaseSettings):
     worker_interval_seconds: int = Field(
         default=5, validation_alias="PYTHON_WORKER_INTERVAL_SECONDS"
     )
+    protection_ack_timeout_seconds: int = Field(
+        default=30, validation_alias="PROTECTION_ACK_TIMEOUT_SECONDS"
+    )
+    protection_max_attempts: int = Field(default=3, validation_alias="PROTECTION_MAX_ATTEMPTS")
     angel_base_url: str = Field(
         default="https://apiconnect.angelone.in",
         validation_alias="ANGEL_BASE_URL",
@@ -38,10 +51,10 @@ class Settings(BaseSettings):
     )
     angel_client_local_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_LOCAL_IP")
     angel_client_public_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_PUBLIC_IP")
-    angel_client_mac_address: str = Field(
-        default="", validation_alias="ANGEL_CLIENT_MAC_ADDRESS"
+    angel_client_mac_address: str = Field(default="", validation_alias="ANGEL_CLIENT_MAC_ADDRESS")
+    egress_helper_socket: str = Field(
+        default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET"
     )
-    egress_helper_socket: str = Field(default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET")
     log_directory: str = Field(default="./logs", validation_alias="RULENIX_LOG_DIRECTORY")
 
     @property
@@ -61,6 +74,10 @@ class Settings(BaseSettings):
             raise ValueError("PYTHON_AUTHORITY_LEASE_SECONDS must be between 5 and 300")
         if not 1 <= self.worker_interval_seconds <= 60:
             raise ValueError("PYTHON_WORKER_INTERVAL_SECONDS must be between 1 and 60")
+        if not 5 <= self.protection_ack_timeout_seconds <= 300:
+            raise ValueError("PROTECTION_ACK_TIMEOUT_SECONDS must be between 5 and 300")
+        if not 1 <= self.protection_max_attempts <= 10:
+            raise ValueError("PROTECTION_MAX_ATTEMPTS must be between 1 and 10")
         if self.live_trading_enabled != (mode == "authoritative"):
             raise ValueError(
                 "PYTHON_LIVE_TRADING_ENABLED must be true only in authoritative runtime mode"
@@ -90,7 +107,9 @@ class Settings(BaseSettings):
                     self.angel_client_mac_address,
                 )
             ):
-                raise ValueError("Angel client network identity is required for runtime broker reads")
+                raise ValueError(
+                    "Angel client network identity is required for runtime broker reads"
+                )
 
 
 @lru_cache

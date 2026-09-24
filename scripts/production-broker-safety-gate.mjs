@@ -3,17 +3,19 @@ import http from "node:http";
 import https from "node:https";
 import {
   classifyBrokerOrder,
-  classifyConditionalOwnership,
-  classifyOrderOwnership,
-  classifyPositionOwnership,
   conditionalRuleIsActive,
   orderIdentity,
-  ownership,
 } from "./broker-exposure-classifier.mjs";
 import {
   deploymentAccountDecision,
   platformDeploymentAllowed,
 } from "./production-broker-safety-gate-lib.mjs";
+import {
+  brokerAccountRef,
+  credentialFingerprint,
+  readDiagnostic,
+  strictAuthoritativeGate,
+} from "./production-broker-read-diagnostics.mjs";
 
 const input = await new Promise((resolve, reject) => {
   const chunks = [];
@@ -91,7 +93,11 @@ function rawRequest(path, apiKey, jwtToken, localAddress, method = "GET", body) 
       response.on("end", () => {
         let parsed = null;
         try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { /* classified below */ }
-        resolve({ httpStatus: response.statusCode ?? 0, payload: parsed });
+        resolve({
+          httpStatus: response.statusCode ?? 0,
+          payload: parsed,
+          localAddress: response.socket?.localAddress,
+        });
       });
     });
     request.on("timeout", () => request.destroy(new Error("broker read timeout")));
@@ -101,8 +107,25 @@ function rawRequest(path, apiKey, jwtToken, localAddress, method = "GET", body) 
   });
 }
 
-async function brokerRequest(path, apiKey, jwtToken, localAddress, method = "GET", body) {
+async function brokerRequest(
+  operation,
+  path,
+  apiKey,
+  jwtToken,
+  localAddress,
+  diagnostics,
+  method = "GET",
+  body,
+) {
   const response = await rawRequest(path, apiKey, jwtToken, localAddress, method, body);
+  diagnostics.push(readDiagnostic({
+    operation,
+    path,
+    method,
+    expectedLocalAddress: localAddress,
+    response,
+    secrets: [apiKey, jwtToken],
+  }));
   if (response.httpStatus < 200 || response.httpStatus >= 300 || response.payload?.status !== true) {
     const code = String(response.payload?.errorcode ?? `http_${response.httpStatus}`).replace(/[^a-zA-Z0-9_.-]/g, "_");
     throw new Error(`broker read failed (${code})`);
@@ -110,13 +133,22 @@ async function brokerRequest(path, apiKey, jwtToken, localAddress, method = "GET
   return Array.isArray(response.payload.data) ? response.payload.data : [];
 }
 
-async function brokerDetail(uniqueOrderId, apiKey, jwtToken, localAddress) {
+async function brokerDetail(uniqueOrderId, apiKey, jwtToken, localAddress, diagnostics) {
+  const path = `/rest/secure/angelbroking/order/v1/details/${encodeURIComponent(uniqueOrderId)}`;
   const response = await rawRequest(
-    `/rest/secure/angelbroking/order/v1/details/${encodeURIComponent(uniqueOrderId)}`,
+    path,
     apiKey,
     jwtToken,
     localAddress,
   );
+  diagnostics.push(readDiagnostic({
+    operation: "individual_order",
+    path,
+    method: "GET",
+    expectedLocalAddress: localAddress,
+    response,
+    secrets: [apiKey, jwtToken],
+  }));
   return {
     httpStatus: response.httpStatus,
     brokerStatus: response.payload?.status,
@@ -124,14 +156,16 @@ async function brokerDetail(uniqueOrderId, apiKey, jwtToken, localAddress) {
   };
 }
 
-async function allConditionalRules(apiKey, jwtToken, localAddress) {
+async function allConditionalRules(apiKey, jwtToken, localAddress, diagnostics) {
   const rules = [];
   for (let page = 1; page <= 100; page += 1) {
     const batch = await brokerRequest(
+      "conditional_gtt_inventory",
       "/rest/secure/angelbroking/gtt/v1/ruleList",
       apiKey,
       jwtToken,
       localAddress,
+      diagnostics,
       "POST",
       { status: ["NEW", "CANCELLED", "ACTIVE", "SENTTOEXCHANGE", "FORALL"], page, count: 100 },
     );
@@ -150,16 +184,6 @@ let activeOrders = 0;
 let unknownOrders = 0;
 let syntheticOrders = 0;
 let activeConditionalRules = 0;
-const exposureTotals = {
-  positions: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
-  orders: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
-  conditionals: { [ownership.rulenix]: 0, [ownership.manual]: 0, [ownership.ambiguous]: 0 },
-};
-
-const safeReference = (value) => {
-  const raw = String(value ?? "");
-  return raw.length <= 4 ? raw : `...${raw.slice(-4)}`;
-};
 
 for (let index = 0; index < accounts.length; index += 1) {
   const account = accounts[index];
@@ -169,9 +193,10 @@ for (let index = 0; index < accounts.length; index += 1) {
   let brokerSafe = false;
   let brokerExposureObserved = false;
   let brokerCounts = null;
-  let ownershipCounts = { rulenix_owned: 0, manual_external: 0, ambiguous: 0 };
-  let evidence = [];
   let diagnostic = "";
+  const requestDiagnostics = [];
+  let apiKeyFingerprint = "missing";
+  let jwtTokenFingerprint = "missing";
   try {
     if (account.egress_ip && (account.egress_configuration_status !== "CONFIGURED"
       || account.egress_verification_status !== "VERIFIED")) {
@@ -180,11 +205,13 @@ for (let index = 0; index < accounts.length; index += 1) {
     const localAddress = bindingAddress(account.egress_ip);
     apiKey = decrypt(account.user_id, "api_key", account.secrets?.api_key);
     jwtToken = decrypt(account.user_id, "jwt_token", account.secrets?.jwt_token);
+    apiKeyFingerprint = credentialFingerprint(apiKey);
+    jwtTokenFingerprint = credentialFingerprint(jwtToken);
     const reads = await Promise.allSettled([
-      brokerRequest("/rest/secure/angelbroking/order/v1/getOrderBook", apiKey, jwtToken, localAddress),
-      brokerRequest("/rest/secure/angelbroking/order/v1/getPosition", apiKey, jwtToken, localAddress),
-      brokerRequest("/rest/secure/angelbroking/order/v1/getTradeBook", apiKey, jwtToken, localAddress),
-      allConditionalRules(apiKey, jwtToken, localAddress),
+      brokerRequest("order_book", "/rest/secure/angelbroking/order/v1/getOrderBook", apiKey, jwtToken, localAddress, requestDiagnostics),
+      brokerRequest("positions", "/rest/secure/angelbroking/order/v1/getPosition", apiKey, jwtToken, localAddress, requestDiagnostics),
+      brokerRequest("trade_book", "/rest/secure/angelbroking/order/v1/getTradeBook", apiKey, jwtToken, localAddress, requestDiagnostics),
+      allConditionalRules(apiKey, jwtToken, localAddress, requestDiagnostics),
     ]);
     const [ordersRead, positionsRead, tradesRead, conditionalRead] = reads;
     const orders = ordersRead.status === "fulfilled" ? ordersRead.value : [];
@@ -205,7 +232,13 @@ for (let index = 0; index < accounts.length; index += 1) {
       let detail;
       if (missingState && identity.uniqueOrderId) {
         try {
-          detail = await brokerDetail(identity.uniqueOrderId, apiKey, jwtToken, localAddress);
+          detail = await brokerDetail(
+            identity.uniqueOrderId,
+            apiKey,
+            jwtToken,
+            localAddress,
+            requestDiagnostics,
+          );
         } catch (error) {
           detailsReadable = false;
           diagnostic = String(error?.message ?? "order detail read failed");
@@ -219,57 +252,11 @@ for (let index = 0; index < accounts.length; index += 1) {
         conditionalReadSucceeded: conditionalRead.status === "fulfilled",
         detail,
       });
-      if (classification === "active" || classification === "unknown") {
-        const attribution = classification === "unknown"
-          ? { ownership: ownership.ambiguous, evidence: "unknown_broker_order_state" }
-          : classifyOrderOwnership(order, account.known_orders);
-        exposureTotals.orders[attribution.ownership] += 1;
-        ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
-          : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
-        evidence.push({
-          kind: "order", ownership: attribution.ownership, exchange: identity.exchange,
-          token: identity.symbolToken, symbol: identity.symbol,
-          reference: safeReference(identity.orderId || identity.uniqueOrderId),
-          reason: attribution.evidence,
-        });
-      }
       if (classification === "active") accountActiveOrders += 1;
       if (classification === "unknown") accountUnknownOrders += 1;
       if (classification === "synthetic") accountSyntheticOrders += 1;
     }
-    for (const position of positions) {
-      const quantity = Number.parseInt(String(position.netqty ?? position.netQty ?? "0"), 10);
-      if (Number.isFinite(quantity) && quantity === 0) continue;
-      const identity = orderIdentity(position);
-      const attribution = classifyPositionOwnership(position, {
-        orders, trades, knownOrders: account.known_orders,
-        openLocalPositions: account.open_local_positions,
-        rulenixContractHistory: account.rulenix_contract_history,
-        allowDurableNegativeProof: true,
-      });
-      exposureTotals.positions[attribution.ownership] += 1;
-      ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
-        : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
-      evidence.push({
-        kind: "position", ownership: attribution.ownership, exchange: identity.exchange,
-        token: identity.symbolToken, symbol: identity.symbol, quantity,
-        reason: attribution.evidence,
-        fill_attribution: attribution.details,
-      });
-    }
-    const activeRules = conditionalRules.filter(conditionalRuleIsActive);
-    for (const rule of activeRules) {
-      const identity = orderIdentity(rule);
-      const attribution = classifyConditionalOwnership(rule);
-      exposureTotals.conditionals[attribution.ownership] += 1;
-      ownershipCounts[attribution.ownership === ownership.rulenix ? "rulenix_owned"
-        : attribution.ownership === ownership.manual ? "manual_external" : "ambiguous"] += 1;
-      evidence.push({
-        kind: "conditional", ownership: attribution.ownership, exchange: identity.exchange,
-        token: identity.symbolToken, symbol: identity.symbol, reason: attribution.evidence,
-      });
-    }
-    const accountActiveConditionalRules = activeRules.length;
+    const accountActiveConditionalRules = conditionalRules.filter(conditionalRuleIsActive).length;
     brokerCounts = {
       open_positions: accountOpenPositions,
       active_orders: accountActiveOrders,
@@ -281,8 +268,7 @@ for (let index = 0; index < accounts.length; index += 1) {
     const noObservedExposure = accountOpenPositions === 0 && accountActiveOrders === 0
       && accountUnknownOrders === 0 && accountActiveConditionalRules === 0;
     brokerExposureObserved = !noObservedExposure;
-    brokerSafe = brokerReadable && ownershipCounts.rulenix_owned === 0
-      && ownershipCounts.ambiguous === 0;
+    brokerSafe = brokerReadable && noObservedExposure;
     if (brokerReadable) {
       readableAccounts += 1;
     } else {
@@ -309,8 +295,6 @@ for (let index = 0; index < accounts.length; index += 1) {
     brokerReadable,
     brokerSafe,
     brokerExposureObserved,
-    rulenixOwnedExposure: ownershipCounts.rulenix_owned,
-    ambiguousExposure: ownershipCounts.ambiguous,
     local: account.local,
   });
   decisions.push(decision);
@@ -320,19 +304,40 @@ for (let index = 0; index < accounts.length; index += 1) {
     username: account.username,
     broker_readable: brokerReadable,
     broker_safe: brokerSafe,
+    broker_account_ref: brokerAccountRef(account.broker_account_id),
+    broker_credential_revision: account.broker_credential_revision,
+    token_state: account.token_state,
+    last_token_status: account.last_token_status,
+    last_token_check_at: account.last_token_check_at,
+    api_key_fingerprint: apiKeyFingerprint,
+    api_key_storage_version: account.secrets?.api_key?.version ?? null,
+    api_key_updated_at: account.secrets?.api_key?.updated_at ?? null,
+    jwt_token_fingerprint: jwtTokenFingerprint,
+    jwt_token_storage_version: account.secrets?.jwt_token?.version ?? null,
+    jwt_token_updated_at: account.secrets?.jwt_token?.updated_at ?? null,
+    assigned_egress_ip: account.egress_ip ?? "default",
+    egress_configuration_status: account.egress_configuration_status ?? "default",
+    egress_verification_status: account.egress_verification_status ?? "default",
+    egress_last_verified_at: account.egress_last_verified_at ?? null,
+    expected_local_address: bindingAddress(account.egress_ip) ?? "default",
+    request_diagnostics: requestDiagnostics,
     local_unresolved: decision.localUnresolved,
     deployment_allowed: decision.allow,
     live_ready: decision.liveReady,
     classification: decision.classification,
     broker: brokerCounts,
-    ownership: ownershipCounts,
-    evidence,
     read_diagnostic: diagnostic,
   })}`);
 }
 
 for (const key of keys.values()) key.fill(0);
-const allowed = accounts.length > 0 && platformDeploymentAllowed(decisions);
+const authoritativeReadsRequired = process.env.PHASE11_REQUIRE_AUTHORITATIVE_BROKER_READS === "true";
+const allowed = accounts.length > 0 && strictAuthoritativeGate({
+  platformAllowed: platformDeploymentAllowed(decisions),
+  unreadableAccounts,
+  required: authoritativeReadsRequired,
+});
+console.log(`AUTHORITATIVE_BROKER_READS_REQUIRED=${authoritativeReadsRequired}`);
 console.log(`BROKER_ACCOUNTS_CHECKED=${accounts.length}`);
 console.log(`BROKER_READABLE_ACCOUNTS=${readableAccounts}`);
 console.log(`BROKER_UNREADABLE_ACCOUNTS=${unreadableAccounts}`);
@@ -341,14 +346,6 @@ console.log(`BROKER_EXPOSURE_CAPABLE_ORDERS=${activeOrders}`);
 console.log(`BROKER_UNKNOWN_ORDERS=${unknownOrders}`);
 console.log(`BROKER_PROVEN_SYNTHETIC_RECORDS=${syntheticOrders}`);
 console.log(`ACTIVE_BROKER_CONDITIONAL_RULES=${activeConditionalRules}`);
-console.log(`RULENIX_OWNED_POSITIONS=${exposureTotals.positions[ownership.rulenix]}`);
-console.log(`RULENIX_OWNED_ACTIVE_ORDERS=${exposureTotals.orders[ownership.rulenix]}`);
-console.log(`MANUAL_EXTERNAL_POSITIONS=${exposureTotals.positions[ownership.manual]}`);
-console.log(`MANUAL_EXTERNAL_ACTIVE_ORDERS=${exposureTotals.orders[ownership.manual]}`);
-console.log(`AMBIGUOUS_POSITIONS=${exposureTotals.positions[ownership.ambiguous]}`);
-console.log(`AMBIGUOUS_ACTIVE_ORDERS=${exposureTotals.orders[ownership.ambiguous]}`);
-console.log(`MANUAL_EXTERNAL_CONDITIONAL_RULES=${exposureTotals.conditionals[ownership.manual]}`);
-console.log(`AMBIGUOUS_CONDITIONAL_RULES=${exposureTotals.conditionals[ownership.ambiguous]}`);
 console.log(`OFFLINE_SAFE_USER_IDS=${offlineSafeUserIds.join(",")}`);
 console.log(`DEPLOYMENT_GATE=${allowed ? "PASS" : "BLOCK"}`);
 if (!allowed) process.exit(2);

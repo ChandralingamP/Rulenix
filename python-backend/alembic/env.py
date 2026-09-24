@@ -1,6 +1,7 @@
 """Adoption-only Alembic environment: the Rust migrations remain authoritative in Phase 2."""
-from alembic import context
 from sqlalchemy import create_engine
+
+from alembic import context
 from app.config import get_settings
 
 config = context.config

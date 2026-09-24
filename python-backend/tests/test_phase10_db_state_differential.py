@@ -37,7 +37,10 @@ async def test_rust_python_postgres_state_before_after_differential() -> None:
     database_url = _database_url()
     if not RUST_BINARY.exists():
         raise AssertionError("build the phase10 adapter before running database differential tests")
-    engine = create_async_engine(database_url, pool_size=2, max_overflow=0)
+    async_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1).replace(
+        "postgres://", "postgresql+asyncpg://", 1
+    )
+    engine = create_async_engine(async_url, pool_size=2, max_overflow=0)
     try:
         for case in CASES:
             envelope = {"fixture_id": case, "category": "Database state", "operation": "db_state", "request": {"case": case}}

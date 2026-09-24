@@ -45,7 +45,7 @@ async def test_postgres_claims_are_skip_locked_and_intent_is_idempotent():
 
         async def worker() -> list:
             async with AsyncSession(engine) as session, session.begin():
-                return await TradingRepository(session).claim_execution_intents(limit=1)
+                return await TradingRepository(session).claim_execution_intents(limit=1, signal_id=signal_id)
 
         first_result, second_result = await asyncio.gather(worker(), worker())
         assert len(first_result) + len(second_result) == 1

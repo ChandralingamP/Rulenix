@@ -152,12 +152,53 @@ class ExecutionOrchestrator:
             intent, exchange=exchange, symbol=symbol, token=token, product_type=product_type
         )
         if mode == "demo":
+            order_id = await self.trading.reserve_order_for_intent(
+                intent_id=UUID(str(intent.id)), user_id=UUID(str(intent.user_id))
+            )
+            order = (
+                (
+                    await self.session.execute(
+                        text("""
+                        SELECT order_type,quantity,price FROM strategy_orders
+                         WHERE id=:order AND user_id=:user FOR UPDATE
+                        """),
+                        {"order": order_id, "user": intent.user_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            await self.session.execute(
+                text("""
+                UPDATE strategy_orders SET status='submitted',broker_order_id=:broker,
+                  broker_status='Demo order accepted locally',updated_at=NOW()
+                 WHERE id=:order AND status='pending'
+                """),
+                {"order": order_id, "broker": f"DEMO-{order_id}"},
+            )
+            if str(order["order_type"]).upper() == "MARKET":
+                await self.session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='filled',filled_quantity=quantity,
+                      average_fill_price=price,filled_price=price,filled_at=NOW(),
+                      broker_status='Demo market order filled locally',updated_at=NOW()
+                     WHERE id=:order AND status='submitted'
+                    """),
+                    {"order": order_id},
+                )
             await self.trading.complete_intent(
-                UUID(str(intent.id)), UUID(str(intent.user_id)), IntentStatus.COMPLETED
+                UUID(str(intent.id)),
+                UUID(str(intent.user_id)),
+                IntentStatus.SUBMITTED,
+                strategy_order_id=order_id,
             )
             await self.session.commit()
             return ExecutionResult(
-                ExecutionOutcome.DEMO_SIMULATED, decision, action_request, UUID(str(intent.id))
+                ExecutionOutcome.DEMO_SIMULATED,
+                decision,
+                action_request,
+                UUID(str(intent.id)),
+                f"DEMO-{order_id}",
             )
         if self.live is not None:
             order_id = await self.trading.reserve_order_for_intent(
@@ -203,9 +244,9 @@ class ExecutionOrchestrator:
             UUID(str(intent.id)),
         )
 
-    async def process_due(self, *, limit: int = 100) -> list[ExecutionResult]:
+    async def process_due(self, *, limit: int = 100, signal_id: UUID | None = None) -> list[ExecutionResult]:
         """Claim durable ENTRY work and process each claim exactly once."""
-        claimed = await self.trading.claim_execution_intents(limit=limit)
+        claimed = await self.trading.claim_execution_intents(limit=limit, signal_id=signal_id)
         results: list[ExecutionResult] = []
         for item in claimed:
             row = (

@@ -26,8 +26,16 @@ from app.risk import ActionKind
 from app.strategy.common import Candle, supertrend_entry_allowed
 from app.strategy.execution import ExecutionOrchestrator
 from app.strategy.persistence import PreparedIntent, SignalRepository, prepare_square_off_intent
-from app.strategy.supertrend import CONFIGS, current_signal, signal_is_fresh, supertrend_points
+from app.strategy.supertrend import (
+    CONFIGS,
+    OptionSide,
+    current_signal,
+    signal_is_fresh,
+    supertrend_points,
+)
 from app.trading.domain import futures_pnl_units, sl2_reversal, trade_pnl
+
+from .market import SuperTrendMarketProvider
 
 IST = ZoneInfo("Asia/Kolkata")
 FUTURES = "futures_breakout_v3"
@@ -103,6 +111,7 @@ class DurableOrderFactory:
         trigger_price: Decimal | None,
         order_type: str,
         idempotency_key: str,
+        execution_mode: str = "live",
     ) -> UUID:
         if quantity <= 0 or lots <= 0:
             raise ValueError("Durable broker order quantity and lots must be positive.")
@@ -127,7 +136,7 @@ class DurableOrderFactory:
                 id,user_id,snapshot_id,trade_id,session_key,role,side,execution_mode,
                 lots,quantity,price,trigger_price,status,idempotency_key,client_order_id,
                 order_type,exchange_segment,product_type)
-            VALUES(:id,:user,:snapshot,:trade,:session,:role,:side,'live',:lots,:quantity,
+            VALUES(:id,:user,:snapshot,:trade,:session,:role,:side,:mode,:lots,:quantity,
                    :price,:trigger,'pending',:key,:client,:order_type,:exchange,:product)
             ON CONFLICT(idempotency_key) DO NOTHING
             """),
@@ -139,6 +148,7 @@ class DurableOrderFactory:
                 "session": _session(session_key),
                 "role": role,
                 "side": side,
+                "mode": execution_mode,
                 "lots": lots,
                 "quantity": quantity,
                 "price": price,
@@ -166,9 +176,11 @@ class AuthoritativeExecutionWorker:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         coordinator: LiveMutationCoordinator,
+        market_provider: SuperTrendMarketProvider | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.coordinator = coordinator
+        self.market_provider = market_provider
 
     async def run_once(self) -> dict[str, object]:
         async with self.session_factory() as session:
@@ -373,66 +385,90 @@ class AuthoritativeExecutionWorker:
                 (
                     await session.execute(
                         text("""
-                    SELECT c.user_id,c.lots FROM user_strategy_configs c
+                    SELECT c.user_id,c.lots,
+                           CASE WHEN c.target_points>0 THEN c.target_points ELSE :target END AS target_points,
+                           CASE WHEN c.stop_loss_points>0 THEN c.stop_loss_points ELSE :stop END AS stop_loss_points
+                      FROM user_strategy_configs c
                     JOIN user_strategy_activations a ON a.user_id=c.user_id AND a.strategy_key=c.strategy_key
                     JOIN users u ON u.id=c.user_id JOIN user_profiles p ON p.user_id=c.user_id
                      WHERE c.strategy_key=:strategy AND c.instrument=:instrument
                        AND c.enabled=TRUE AND a.is_active=TRUE AND u.is_active=TRUE
                        AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))
                     """),
-                        {"strategy": SUPERTREND, "instrument": underlying},
+                        {
+                            "strategy": SUPERTREND,
+                            "instrument": underlying,
+                            "target": config.default_target_points,
+                            "stop": config.default_stop_loss_points,
+                        },
                     )
                 )
                 .mappings()
                 .all()
             )
-            intents: list[PreparedIntent] = []
-            option_instrument = f"{underlying}_{signal.side.value}"
+            session_key = f"st-{underlying}-{signal.signal_at:%Y%m%d-%H%M}-{signal.side.value}"
+            pending = []
             for runner in runners:
-                snapshot = (
-                    (
-                        await session.execute(
-                            text("""
-                        SELECT s.*,p.price FROM strategy_market_snapshots s
-                        JOIN LATERAL (
-                          SELECT price FROM market_price_ticks
-                           WHERE exchange_segment=s.exchange_segment AND contract_token=s.contract_token
-                             AND received_at>=NOW()-INTERVAL '5 seconds' AND price>0
-                           ORDER BY received_at DESC LIMIT 1) p ON TRUE
-                         WHERE s.strategy_key=:strategy AND s.instrument=:instrument
-                           AND s.trade_date=:date AND s.status='ready'
-                           AND s.execution_key LIKE :owner
-                         ORDER BY s.fetched_at DESC LIMIT 1
+                processed = bool(
+                    await session.scalar(
+                        text("""
+                        SELECT EXISTS(SELECT 1 FROM strategy_execution_intents
+                         WHERE user_id=:user AND strategy_key=:strategy
+                           AND session_key=:session AND action='ENTRY'
+                           AND status<>'failed')
                         """),
-                            {
-                                "strategy": SUPERTREND,
-                                "instrument": option_instrument,
-                                "date": now.date(),
-                                "owner": f"%{UUID(str(runner['user_id'])).hex}",
-                            },
-                        )
+                        {
+                            "user": runner["user_id"],
+                            "strategy": SUPERTREND,
+                            "session": session_key,
+                        },
                     )
-                    .mappings()
-                    .first()
                 )
-                if snapshot is None:
-                    continue
-                price = Decimal(str(snapshot["price"]))
+                if not processed:
+                    pending.append(runner)
+            if not pending or self.market_provider is None:
+                continue
+            selection = await self.market_provider.select(
+                user_id=UUID(str(pending[0]["user_id"])),
+                config=config,
+                side=signal.side,
+                trade_date=signal.signal_at.date(),
+            )
+            if not signal_is_fresh(signal, datetime.now(IST)):
+                continue
+            await session.execute(
+                text("""
+                INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at)
+                VALUES(:exchange,:token,:price,NOW())
+                ON CONFLICT(exchange_segment,contract_token) DO UPDATE
+                  SET price=EXCLUDED.price,received_at=EXCLUDED.received_at
+                """),
+                {
+                    "exchange": config.option_exchange,
+                    "token": selection.contract.token,
+                    "price": selection.contract.premium,
+                },
+            )
+            intents: list[PreparedIntent] = []
+            for runner in pending:
+                snapshot_id = await self._supertrend_snapshot(
+                    session, config, signal, runner, selection
+                )
                 intents.append(
                     PreparedIntent(
                         UUID(str(runner["user_id"])),
-                        UUID(str(snapshot["id"])),
+                        snapshot_id,
                         None,
                         SUPERTREND,
                         underlying,
-                        f"st-{underlying}-{signal.signal_at:%Y%m%d-%H%M}-{signal.side.value}",
+                        session_key,
                         "ENTRY",
                         "BUY_ENTRY",
                         "BUY",
                         "MARKET",
                         int(runner["lots"]),
-                        int(runner["lots"]) * max(int(snapshot["lot_size"] or 1), 1),
-                        price,
+                        int(runner["lots"]) * selection.contract.lot_size,
+                        selection.contract.premium,
                         None,
                         signal.signal_at + timedelta(minutes=6, seconds=30),
                     )
@@ -442,7 +478,7 @@ class AuthoritativeExecutionWorker:
             _, inserted = await SignalRepository(session).materialize(
                 strategy_key=SUPERTREND,
                 instrument=underlying,
-                session_key=f"st-{underlying}-{signal.signal_at:%Y%m%d-%H%M}-{signal.side.value}",
+                session_key=session_key,
                 signal_at=signal.signal_at,
                 signal_type="ENTRY",
                 snapshot_id=None,
@@ -450,18 +486,89 @@ class AuthoritativeExecutionWorker:
                     "side": signal.side.value,
                     "index_close": str(signal.index_close),
                     "supertrend": str(signal.supertrend),
+                    "option_execution_price": str(selection.contract.premium),
+                    "contract_symbol": selection.contract.symbol,
                 },
                 intents=intents,
             )
             generated += int(inserted > 0)
         return generated
 
+    async def _supertrend_snapshot(self, session, config, signal, runner, selection) -> UUID:
+        snapshot_id = _order_uuid(
+            "supertrend-snapshot",
+            f"{signal.signal_at.isoformat()}:{selection.contract.token}:{runner['user_id']}",
+        )
+        execution_key = (
+            f"{signal.signal_at:%Y%m%d%H%M}-{selection.contract.symbol}-"
+            f"{UUID(str(runner['user_id'])).hex}"
+        )
+        call = signal.side is OptionSide.CALL
+        await session.execute(
+            text("""
+            INSERT INTO strategy_market_snapshots(
+              id,strategy_key,instrument,trade_date,status,error,contract_token,
+              contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,
+              execution_key,underlying_token,buy_target,buy_sl1,sell_target,sell_sl1,
+              previous_close,fetched_at)
+            VALUES(:id,:strategy,:instrument,:date,'ready','',:token,:symbol,:expiry,:lot_size,
+              :exchange,'INTRADAY',:key,:underlying,:buy_target,:buy_sl1,:sell_target,:sell_sl1,
+              :underlying_ltp,NOW())
+            ON CONFLICT(strategy_key,instrument,trade_date,execution_key) DO UPDATE SET
+              status='ready',error='',contract_token=EXCLUDED.contract_token,
+              contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,
+              lot_size=EXCLUDED.lot_size,exchange_segment=EXCLUDED.exchange_segment,
+              product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,
+              buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,
+              sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,
+              previous_close=EXCLUDED.previous_close,fetched_at=NOW()
+            """),
+            {
+                "id": snapshot_id,
+                "strategy": SUPERTREND,
+                "instrument": f"{config.instrument}_{signal.side.value}",
+                "date": signal.signal_at.date(),
+                "token": selection.contract.token,
+                "symbol": selection.contract.symbol,
+                "expiry": selection.contract.expiry,
+                "lot_size": selection.contract.lot_size,
+                "exchange": config.option_exchange,
+                "key": execution_key,
+                "underlying": config.index_token,
+                "buy_target": runner["target_points"] if call else None,
+                "buy_sl1": runner["stop_loss_points"] if call else None,
+                "sell_target": None if call else runner["target_points"],
+                "sell_sl1": None if call else runner["stop_loss_points"],
+                "underlying_ltp": selection.underlying_ltp,
+            },
+        )
+        value = await session.scalar(
+            text("""
+            SELECT id FROM strategy_market_snapshots
+             WHERE strategy_key=:strategy AND instrument=:instrument
+               AND trade_date=:date AND execution_key=:key
+            """),
+            {
+                "strategy": SUPERTREND,
+                "instrument": f"{config.instrument}_{signal.side.value}",
+                "date": signal.signal_at.date(),
+                "key": execution_key,
+            },
+        )
+        return UUID(str(value))
+
 
 class FillLifecycleWorker:
     """Apply reconciled cumulative fills exactly once to local trade state."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        protection_ack_timeout_seconds: int = 30,
+    ) -> None:
         self.session_factory = session_factory
+        self.protection_ack_timeout_seconds = protection_ack_timeout_seconds
 
     async def run_once(self) -> dict[str, object]:
         processed = 0
@@ -473,12 +580,12 @@ class FillLifecycleWorker:
                             text("""
                         SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,
                                o.execution_mode,o.lots,o.quantity,o.filled_quantity,
-                               o.processed_quantity,o.average_fill_price,
+                               o.processed_quantity,o.average_fill_price,o.broker_status,
                                s.strategy_key,s.instrument,s.contract_symbol,s.lot_size,
                                s.buy_target,s.buy_sl1,s.buy_sl2,s.sell_target,s.sell_sl1,s.sell_sl2
                           FROM strategy_orders o
                           JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
-                         WHERE o.execution_mode='live' AND o.filled_quantity>o.processed_quantity
+                         WHERE o.filled_quantity>o.processed_quantity
                            AND o.status IN ('submitted','partially_filled','processing','filled')
                          ORDER BY o.updated_at,o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1
                         """)
@@ -503,7 +610,12 @@ class FillLifecycleWorker:
         order_id = UUID(str(order["id"]))
         user_id = UUID(str(order["user_id"]))
         role = str(order["role"])
-        terminal = cumulative >= int(order["quantity"])
+        broker_terminal = str(order["broker_status"] or "").strip().lower() in {
+            "complete",
+            "completed",
+            "filled",
+        }
+        terminal = cumulative >= int(order["quantity"]) or broker_terminal
         if role in {"BUY_ENTRY", "SELL_ENTRY"}:
             await self._entry_fill(session, order, delta, fill)
         elif order["trade_id"] is not None:
@@ -518,6 +630,15 @@ class FillLifecycleWorker:
             """),
             {"processed": cumulative, "terminal": terminal, "order": order_id, "user": user_id},
         )
+        if terminal and role in {"BUY_ENTRY", "SELL_ENTRY"}:
+            await session.execute(
+                text("""
+                UPDATE strategy_execution_intents SET status='completed',completed_at=NOW(),
+                  last_error='',updated_at=NOW()
+                 WHERE strategy_order_id=:order AND user_id=:user AND status='submitted'
+                """),
+                {"order": order_id, "user": user_id},
+            )
 
     async def _entry_fill(self, session: AsyncSession, order, delta: int, fill: Decimal) -> None:
         order_id = UUID(str(order["id"]))
@@ -546,7 +667,9 @@ class FillLifecycleWorker:
                 text("""
                 UPDATE trades SET quantity=:quantity,entry_price=:entry,last_price=:fill,
                        total_lots=total_lots+:lots,remaining_lots=remaining_lots+:lots,
-                       safety_status='PROTECTION_REQUIRED',protection_deadline_at=NOW()+INTERVAL '30 seconds',
+                       safety_status=CASE WHEN CAST(:mode AS varchar(8))='demo' THEN 'DEMO' ELSE 'PROTECTION_REQUIRED' END,
+                       protection_deadline_at=CASE WHEN CAST(:mode AS varchar(8))='demo' THEN NULL
+                         ELSE NOW()+(:ack_timeout * INTERVAL '1 second') END,
                        updated_at=NOW() WHERE id=:trade
                 """),
                 {
@@ -555,6 +678,8 @@ class FillLifecycleWorker:
                     "fill": fill,
                     "lots": delta_lots,
                     "trade": trade["id"],
+                    "mode": order["execution_mode"],
+                    "ack_timeout": self.protection_ack_timeout_seconds,
                 },
             )
             return
@@ -589,14 +714,18 @@ class FillLifecycleWorker:
                 entry_datetime,instrument_label,contract_symbol,external_entry_id,notes,
                 strategy_key,strategy_snapshot_id,total_lots,remaining_lots,target_price,sl1_price,
                 sl2_price,reversal_of_trade_id,safety_status,protection_deadline_at)
-            VALUES(:id,:user,'live','open',:direction,:quantity,:entry,:entry,0,NOW(),
+            VALUES(:id,:user,CAST(:mode AS varchar(8)),'open',:direction,:quantity,:entry,:entry,0,NOW(),
                    :instrument,:symbol,:external,:notes,:strategy,:snapshot,:lots,:lots,
-                   :target,:sl1,:sl2,:reversal,'PROTECTION_REQUIRED',NOW()+INTERVAL '30 seconds')
+                   :target,:sl1,:sl2,:reversal,
+                   CASE WHEN CAST(:mode AS varchar(8))='demo' THEN 'DEMO' ELSE 'PROTECTION_REQUIRED' END,
+                   CASE WHEN CAST(:mode AS varchar(8))='demo' THEN NULL
+                     ELSE NOW()+(:ack_timeout * INTERVAL '1 second') END)
             ON CONFLICT(id) DO NOTHING
             """),
             {
                 "id": trade_id,
                 "user": order["user_id"],
+                "mode": order["execution_mode"],
                 "direction": direction,
                 "quantity": delta,
                 "entry": fill,
@@ -611,6 +740,7 @@ class FillLifecycleWorker:
                 "sl1": sl1,
                 "sl2": sl2,
                 "reversal": reversal_source,
+                "ack_timeout": self.protection_ack_timeout_seconds,
             },
         )
         await session.execute(
@@ -666,12 +796,16 @@ class FillLifecycleWorker:
         await session.execute(
             text("""
             UPDATE trades SET status=CASE WHEN :remaining=0 THEN 'closed' ELSE 'open' END,
-                   safety_status=CASE WHEN :remaining=0 THEN 'CLOSED' ELSE 'PROTECTION_REQUIRED' END,
+                   safety_status=CASE WHEN :remaining=0 THEN 'CLOSED'
+                     WHEN CAST(:mode AS varchar(8))='demo' THEN 'DEMO'
+                     WHEN :role='EMERGENCY_CLOSE' THEN 'EMERGENCY_CLOSING'
+                     ELSE 'PROTECTION_REQUIRED' END,
                    quantity=:remaining,remaining_lots=:lots,last_price=:fill,pnl=:pnl,
                    exit_price=CASE WHEN :remaining=0 THEN :fill ELSE exit_price END,
                    exit_datetime=CASE WHEN :remaining=0 THEN NOW() ELSE exit_datetime END,
                    exit_reason=CASE WHEN :remaining=0 THEN :reason ELSE exit_reason END,
-                   protection_deadline_at=CASE WHEN :remaining>0 THEN NOW()+INTERVAL '30 seconds' ELSE NULL END,
+                   protection_deadline_at=CASE WHEN :remaining>0 AND CAST(:mode AS varchar(8))='live'
+                     THEN NOW()+(:ack_timeout * INTERVAL '1 second') ELSE NULL END,
                    updated_at=NOW() WHERE id=:trade
             """),
             {
@@ -680,6 +814,9 @@ class FillLifecycleWorker:
                 "fill": fill,
                 "pnl": pnl,
                 "reason": reason,
+                "role": role,
+                "mode": order["execution_mode"],
+                "ack_timeout": self.protection_ack_timeout_seconds,
                 "trade": trade["id"],
             },
         )
@@ -732,6 +869,244 @@ class FillLifecycleWorker:
                 )
 
 
+class DemoLifecycleWorker:
+    """Advance durable DEMO orders from stored ticks without broker I/O."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+
+    async def run_once(self) -> dict[str, object]:
+        protected = await self._ensure_protection()
+        filled = await self._process_ticks()
+        return {"protected": protected, "filled": filled, "broker_mutations": 0}
+
+    async def _ensure_protection(self) -> int:
+        async with self.session_factory() as session:
+            ids = (
+                (
+                    await session.execute(
+                        text("""
+                    SELECT id FROM trades
+                     WHERE execution_mode='demo' AND status='open' AND quantity>0
+                     ORDER BY entry_datetime,id LIMIT 100
+                    """)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        changed = 0
+        for value in ids:
+            async with self.session_factory() as session, session.begin():
+                trade = (
+                    (
+                        await session.execute(
+                            text("""
+                        SELECT t.*,s.lot_size FROM trades t
+                        JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+                         WHERE t.id=:trade AND t.execution_mode='demo' AND t.status='open'
+                         FOR UPDATE OF t
+                        """),
+                            {"trade": value},
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if trade is None:
+                    continue
+                target_done = bool(
+                    await session.scalar(
+                        text("""
+                        SELECT EXISTS(SELECT 1 FROM strategy_orders
+                         WHERE trade_id=:trade AND role='TARGET' AND processed_quantity>0)
+                        """),
+                        {"trade": value},
+                    )
+                )
+                stop_role = "SL2" if target_done and trade["sl2_price"] is not None else "SL1"
+                await session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='cancelled',
+                      broker_status='Demo protection replaced locally',updated_at=NOW()
+                     WHERE trade_id=:trade AND execution_mode='demo'
+                       AND role IN ('SL1','SL2') AND role<>:role
+                       AND status IN ('pending','submitted','partially_filled')
+                    """),
+                    {"trade": value, "role": stop_role},
+                )
+                active_stop = bool(
+                    await session.scalar(
+                        text("""
+                        SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=:trade
+                         AND execution_mode='demo' AND role=:role
+                         AND status IN ('pending','submitted','partially_filled'))
+                        """),
+                        {"trade": value, "role": stop_role},
+                    )
+                )
+                factory = DurableOrderFactory(session)
+                lot_size = max(int(trade["lot_size"] or 1), 1)
+                quantity = int(trade["quantity"])
+                if not active_stop:
+                    stop_price = trade["sl2_price"] if stop_role == "SL2" else trade["sl1_price"]
+                    if stop_price is not None:
+                        order_id = _order_uuid(f"demo-{stop_role.lower()}", value, quantity)
+                        await factory.create(
+                            order_id=order_id,
+                            user_id=UUID(str(trade["user_id"])),
+                            snapshot_id=UUID(str(trade["strategy_snapshot_id"])),
+                            trade_id=UUID(str(value)),
+                            session_key=f"dpx-{UUID(str(value)).hex[:14]}-{stop_role.lower()}",
+                            role=stop_role,
+                            side=_exit_side(str(trade["direction"])),
+                            lots=max(1, (quantity + lot_size - 1) // lot_size),
+                            quantity=quantity,
+                            price=Decimal(str(stop_price)),
+                            trigger_price=Decimal(str(stop_price)),
+                            order_type="STOPLOSS_MARKET",
+                            idempotency_key=f"python:demo-protection:{value}:{stop_role}:{quantity}",
+                            execution_mode="demo",
+                        )
+                        await self._submit_local(session, order_id)
+                        changed += 1
+                active_target = bool(
+                    await session.scalar(
+                        text("""
+                        SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=:trade
+                         AND execution_mode='demo' AND role='TARGET'
+                         AND status IN ('pending','submitted','partially_filled'))
+                        """),
+                        {"trade": value},
+                    )
+                )
+                if not target_done and not active_target and trade["target_price"] is not None:
+                    target_quantity = quantity
+                    if trade["strategy_key"] == FUTURES:
+                        target_lots = max(1, int(trade["total_lots"]) // 2)
+                        target_quantity = min(quantity, target_lots * lot_size)
+                    else:
+                        target_lots = max(1, int(trade["remaining_lots"]))
+                    order_id = _order_uuid("demo-target", value)
+                    await factory.create(
+                        order_id=order_id,
+                        user_id=UUID(str(trade["user_id"])),
+                        snapshot_id=UUID(str(trade["strategy_snapshot_id"])),
+                        trade_id=UUID(str(value)),
+                        session_key=f"dpt-{UUID(str(value)).hex[:16]}",
+                        role="TARGET",
+                        side=_exit_side(str(trade["direction"])),
+                        lots=target_lots,
+                        quantity=target_quantity,
+                        price=Decimal(str(trade["target_price"])),
+                        trigger_price=None,
+                        order_type="LIMIT",
+                        idempotency_key=f"python:demo-target:{value}",
+                        execution_mode="demo",
+                    )
+                    await self._submit_local(session, order_id)
+                    changed += 1
+        return changed
+
+    @staticmethod
+    async def _submit_local(session: AsyncSession, order_id: UUID) -> None:
+        await session.execute(
+            text("""
+            UPDATE strategy_orders SET status='submitted',broker_order_id=:broker,
+              broker_status='Demo order accepted locally',last_reconciled_at=NOW(),updated_at=NOW()
+             WHERE id=:order AND status='pending'
+            """),
+            {"order": order_id, "broker": f"DEMO-{order_id}"},
+        )
+
+    async def _process_ticks(self) -> int:
+        async with self.session_factory() as session:
+            ids = (
+                (
+                    await session.execute(
+                        text("""
+                    SELECT o.id FROM strategy_orders o
+                    JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+                    JOIN market_price_ticks p ON UPPER(p.exchange_segment)=UPPER(s.exchange_segment)
+                      AND p.contract_token=s.contract_token
+                     WHERE o.execution_mode='demo' AND o.status='submitted'
+                       AND p.received_at>=NOW()-INTERVAL '60 seconds' AND p.price>0
+                     ORDER BY CASE WHEN o.role='TARGET' THEN 0
+                                   WHEN o.role IN ('SL1','SL2') THEN 1 ELSE 2 END,
+                              o.created_at,o.id LIMIT 200
+                    """)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        filled = 0
+        for value in ids:
+            async with self.session_factory() as session, session.begin():
+                row = (
+                    (
+                        await session.execute(
+                            text("""
+                        SELECT o.id,o.trade_id,o.role,o.side,o.price,o.quantity,p.price AS ltp
+                          FROM strategy_orders o
+                          JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+                          JOIN market_price_ticks p
+                            ON UPPER(p.exchange_segment)=UPPER(s.exchange_segment)
+                           AND p.contract_token=s.contract_token
+                         WHERE o.id=:order AND o.execution_mode='demo' AND o.status='submitted'
+                           AND p.received_at>=NOW()-INTERVAL '60 seconds' AND p.price>0
+                         FOR UPDATE OF o
+                        """),
+                            {"order": value},
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if row is None:
+                    continue
+                ltp = Decimal(str(row["ltp"]))
+                price = Decimal(str(row["price"]))
+                role, side = str(row["role"]), str(row["side"])
+                triggered = (
+                    (role == "BUY_ENTRY" and ltp >= price)
+                    or (role == "SELL_ENTRY" and ltp <= price)
+                    or (role == "TARGET" and side == "SELL" and ltp >= price)
+                    or (role == "TARGET" and side == "BUY" and ltp <= price)
+                    or (role in {"SL1", "SL2"} and side == "SELL" and ltp <= price)
+                    or (role in {"SL1", "SL2"} and side == "BUY" and ltp >= price)
+                )
+                if not triggered:
+                    continue
+                if row["trade_id"] is not None and role in {"TARGET", "SL1", "SL2"}:
+                    await session.execute(
+                        text("""
+                        UPDATE strategy_orders SET status='cancelled',
+                          broker_status='Demo sibling exit cancelled locally',updated_at=NOW()
+                         WHERE trade_id=:trade AND id<>:order AND execution_mode='demo'
+                           AND role IN ('TARGET','SL1','SL2')
+                           AND status IN ('pending','submitted','partially_filled')
+                        """),
+                        {"trade": row["trade_id"], "order": value},
+                    )
+                await session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='filled',filled_quantity=quantity,
+                      average_fill_price=:ltp,filled_price=:ltp,filled_at=NOW(),
+                      broker_status='Demo order filled from fresh market tick',updated_at=NOW()
+                     WHERE id=:order AND status='submitted'
+                    """),
+                    {"order": value, "ltp": ltp},
+                )
+                if row["trade_id"] is not None:
+                    await session.execute(
+                        text("UPDATE trades SET last_price=:ltp,updated_at=NOW() WHERE id=:trade"),
+                        {"trade": row["trade_id"], "ltp": ltp},
+                    )
+                filled += 1
+        return filled
+
+
 class ProtectionLifecycleWorker:
     """Recover missing LIVE protection and targets from reconciled durable truth."""
 
@@ -739,9 +1114,12 @@ class ProtectionLifecycleWorker:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         coordinator: LiveMutationCoordinator,
+        *,
+        max_attempts: int = 3,
     ) -> None:
         self.session_factory = session_factory
         self.coordinator = coordinator
+        self.max_attempts = max_attempts
 
     async def run_once(self) -> dict[str, object]:
         cleaned = await self._cleanup_terminal_siblings()
@@ -753,7 +1131,8 @@ class ProtectionLifecycleWorker:
                     SELECT t.id FROM trades t
                      WHERE t.execution_mode='live' AND t.status='open'
                        AND t.safety_status IN ('PROTECTION_REQUIRED','PROTECTION_SUBMITTING',
-                           'PROTECTION_UNCERTAIN','PROTECTION_FAILED','RECONCILIATION_REQUIRED')
+                           'PROTECTION_UNCERTAIN','PROTECTION_FAILED','RECONCILIATION_REQUIRED',
+                           'CLOSING','EMERGENCY_CLOSING')
                      ORDER BY t.entry_datetime LIMIT 100
                     """)
                     )
@@ -887,6 +1266,7 @@ class ProtectionLifecycleWorker:
                 return "completed"
             exact = bool(
                 trade["last_position_reconciled_at"]
+                and trade["last_position_reconciled_at"] >= datetime.now(UTC) - timedelta(minutes=5)
                 and int(trade["broker_net_quantity"] or 0)
                 == (
                     int(trade["quantity"])
@@ -927,6 +1307,16 @@ class ProtectionLifecycleWorker:
                     {"trade": trade_id},
                 )
                 return "waiting"
+            deadline_elapsed = bool(
+                trade["protection_deadline_at"]
+                and trade["protection_deadline_at"] <= datetime.now(UTC)
+            )
+            if (
+                trade["safety_status"] in {"CLOSING", "EMERGENCY_CLOSING"}
+                or deadline_elapsed
+                or int(trade["protection_attempts"] or 0) >= self.max_attempts
+            ):
+                return await self._emergency_close(session, trade)
             target_done = bool(
                 await session.scalar(
                     text(
@@ -981,7 +1371,8 @@ class ProtectionLifecycleWorker:
             lot_size = max(int(trade["lot_size"] or 1), 1)
             lots = max(1, (quantity + lot_size - 1) // lot_size)
             watermark = int(trade["quantity"]) - quantity
-            order_id = _order_uuid(f"protection-{stop_role}", trade_id, watermark)
+            attempt = int(trade["protection_attempts"] or 0) + 1
+            order_id = _order_uuid(f"protection-{stop_role}-{attempt}", trade_id, watermark)
             price = Decimal(str(trade["sl2_price"] if stop_role == "SL2" else trade["sl1_price"]))
             await DurableOrderFactory(session).create(
                 order_id=order_id,
@@ -996,7 +1387,9 @@ class ProtectionLifecycleWorker:
                 price=price,
                 trigger_price=price,
                 order_type="STOPLOSS_MARKET",
-                idempotency_key=f"python:protection:{trade_id}:{stop_role}:{watermark}",
+                idempotency_key=(
+                    f"python:protection:{trade_id}:{stop_role}:{watermark}:attempt:{attempt}"
+                ),
             )
             await session.execute(
                 text("""
@@ -1007,6 +1400,114 @@ class ProtectionLifecycleWorker:
                 {"trade": trade_id},
             )
         return await self._submit(order_id, ActionKind.PROTECTION_RECOVERY, trade_id)
+
+    async def _emergency_close(self, session: AsyncSession, trade) -> str:
+        trade_id = UUID(str(trade["id"]))
+        await session.execute(
+            text("""
+            UPDATE trades SET safety_status='EMERGENCY_CLOSING',
+              last_protection_error='Protection deadline or retry budget exhausted.',updated_at=NOW()
+             WHERE id=:trade
+            """),
+            {"trade": trade_id},
+        )
+        active = (
+            (
+                await session.execute(
+                    text("""
+                    SELECT id,order_type,status,broker_order_id FROM strategy_orders
+                     WHERE trade_id=:trade AND role IN ('TARGET','SL1','SL2')
+                       AND status IN ('ambiguous','submitted','partially_filled','processing','cancelling')
+                     ORDER BY created_at FOR UPDATE
+                    """),
+                    {"trade": trade_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        candidate = next(
+            (row for row in active if row["status"] != "cancelling" and row["broker_order_id"]),
+            None,
+        )
+        if active:
+            if candidate is None:
+                return "waiting"
+            order_id = UUID(str(candidate["id"]))
+            variety = (
+                "STOPLOSS" if str(candidate["order_type"]).startswith("STOPLOSS") else "NORMAL"
+            )
+            await session.commit()
+            try:
+                outcome = await self.coordinator.cancel_order(order_id, variety=variety)
+            except MutationPendingError:
+                return "ambiguous"
+            return "waiting" if outcome.state is MutationState.ACKNOWLEDGED else "ambiguous"
+        existing = bool(
+            await session.scalar(
+                text("""
+                SELECT EXISTS(SELECT 1 FROM strategy_orders WHERE trade_id=:trade
+                 AND role='EMERGENCY_CLOSE' AND status NOT IN ('failed','rejected','cancelled'))
+                """),
+                {"trade": trade_id},
+            )
+        )
+        if existing:
+            return "waiting"
+        price = await session.scalar(
+            text("""
+            SELECT p.price FROM market_price_ticks p JOIN strategy_market_snapshots s
+              ON UPPER(p.exchange_segment)=UPPER(s.exchange_segment)
+             AND p.contract_token=s.contract_token
+             WHERE s.id=:snapshot AND p.received_at>=NOW()-INTERVAL '60 seconds'
+               AND p.price>0 ORDER BY p.received_at DESC LIMIT 1
+            """),
+            {"snapshot": trade["strategy_snapshot_id"]},
+        )
+        if price is None:
+            await session.execute(
+                text("""
+                UPDATE trades SET last_protection_error=
+                  'Emergency close paused because no fresh contract price is available.',updated_at=NOW()
+                 WHERE id=:trade
+                """),
+                {"trade": trade_id},
+            )
+            return "waiting"
+        terminal_attempts = int(
+            await session.scalar(
+                text("""
+                SELECT COUNT(*) FROM strategy_orders WHERE trade_id=:trade
+                 AND role='EMERGENCY_CLOSE' AND status IN ('failed','rejected','cancelled')
+                """),
+                {"trade": trade_id},
+            )
+            or 0
+        )
+        close_id = _order_uuid("emergency-close", trade_id, terminal_attempts + 1)
+        lot_size = max(int(trade["lot_size"] or 1), 1)
+        quantity = int(trade["quantity"])
+        await DurableOrderFactory(session).create(
+            order_id=close_id,
+            user_id=UUID(str(trade["user_id"])),
+            snapshot_id=UUID(str(trade["strategy_snapshot_id"])),
+            trade_id=trade_id,
+            session_key=(
+                f"ec-{trade_id.hex[:16]}"
+                if terminal_attempts == 0
+                else f"ec-{trade_id.hex[:13]}a{terminal_attempts + 1}"
+            ),
+            role="EMERGENCY_CLOSE",
+            side=_exit_side(str(trade["direction"])),
+            lots=max(1, (quantity + lot_size - 1) // lot_size),
+            quantity=quantity,
+            price=Decimal(str(price)),
+            trigger_price=None,
+            order_type="MARKET",
+            idempotency_key=f"python:emergency-close:{trade_id}:{terminal_attempts + 1}",
+        )
+        await session.commit()
+        return await self._submit(close_id, ActionKind.EMERGENCY_CLOSE, trade_id)
 
     async def _reserve_target(self, session: AsyncSession, trade) -> None:
         if trade["target_price"] is None:
@@ -1045,21 +1546,37 @@ class ProtectionLifecycleWorker:
             async with self.session_factory() as session, session.begin():
                 await session.execute(
                     text("""
-                    UPDATE trades SET safety_status='PROTECTION_UNCERTAIN',
-                     last_protection_error='Protection broker acknowledgement is ambiguous.',updated_at=NOW()
+                    UPDATE trades SET safety_status=:status,
+                     last_protection_error=:error,updated_at=NOW()
                      WHERE id=:trade
                     """),
-                    {"trade": trade_id},
+                    {
+                        "trade": trade_id,
+                        "status": "EMERGENCY_CLOSING"
+                        if action is ActionKind.EMERGENCY_CLOSE
+                        else "PROTECTION_UNCERTAIN",
+                        "error": "Emergency-close broker acknowledgement is ambiguous."
+                        if action is ActionKind.EMERGENCY_CLOSE
+                        else "Protection broker acknowledgement is ambiguous.",
+                    },
                 )
             return "ambiguous"
         async with self.session_factory() as session, session.begin():
             await session.execute(
                 text("""
-                UPDATE trades SET safety_status='PROTECTION_FAILED',
-                 last_protection_error='Protection submission failed closed.',updated_at=NOW()
+                UPDATE trades SET safety_status=:status,
+                 last_protection_error=:error,updated_at=NOW()
                  WHERE id=:trade
                 """),
-                {"trade": trade_id},
+                {
+                    "trade": trade_id,
+                    "status": "EMERGENCY_CLOSING"
+                    if action is ActionKind.EMERGENCY_CLOSE
+                    else "PROTECTION_FAILED",
+                    "error": "Emergency close submission failed closed."
+                    if action is ActionKind.EMERGENCY_CLOSE
+                    else "Protection submission failed closed.",
+                },
             )
         return "waiting"
 
@@ -1107,7 +1624,7 @@ class ReversalLifecycleWorker:
                 (
                     await session.execute(
                         text("""
-                SELECT t.status,t.exit_reason,t.broker_net_quantity,t.exit_datetime,
+                SELECT t.status,t.exit_reason,t.broker_net_quantity,t.exit_datetime,t.execution_mode,
                        t.last_position_reconciled_at,t.strategy_key,s.lot_size
                   FROM trades t JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
                  WHERE t.id=:trade
@@ -1132,7 +1649,8 @@ class ReversalLifecycleWorker:
                     "Source is not a confirmed SL2 close.",
                 )
                 return LifecycleProgress(claimed=1).json()
-            flat = (
+            demo = source["execution_mode"] == "demo"
+            flat = demo or (
                 int(source["broker_net_quantity"] or 0) == 0
                 and source["last_position_reconciled_at"] is not None
                 and source["last_position_reconciled_at"] >= source["exit_datetime"]
@@ -1202,7 +1720,29 @@ class ReversalLifecycleWorker:
                 trigger_price=None,
                 order_type="MARKET",
                 idempotency_key=f"python:sl2-reversal:{row['source_trade_id']}",
+                execution_mode=str(source["execution_mode"]),
             )
+            if demo:
+                await session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='submitted',broker_order_id=:broker,
+                      broker_status='Demo reversal accepted locally',updated_at=NOW()
+                     WHERE id=:order AND status='pending'
+                    """),
+                    {"order": order_id, "broker": f"DEMO-{order_id}"},
+                )
+                await session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='filled',filled_quantity=quantity,
+                      average_fill_price=price,filled_price=price,filled_at=NOW(),
+                      broker_status='Demo reversal market order filled locally',updated_at=NOW()
+                     WHERE id=:order AND status='submitted'
+                    """),
+                    {"order": order_id},
+                )
+                await self._state(session, row["source_trade_id"], "submitted", "")
+        if demo:
+            return LifecycleProgress(claimed=1, submitted=1).json()
         try:
             outcome = await self.coordinator.place_order(order_id, action=ActionKind.SL2_REVERSAL)
         except MutationPendingError:
@@ -1493,8 +2033,8 @@ class EodLifecycleWorker:
                     await session.execute(
                         text("""
                 SELECT t.id,t.user_id,t.strategy_snapshot_id,t.strategy_key,t.instrument_label,
-                       t.direction,t.quantity,t.last_price,t.entry_price
-                  FROM trades t WHERE t.execution_mode='live' AND t.status='open'
+                       t.direction,t.quantity,t.last_price,t.entry_price,t.execution_mode
+                  FROM trades t WHERE t.status='open'
                    AND t.strategy_key=:strategy ORDER BY t.user_id,t.id
             """),
                         {"strategy": SUPERTREND},
@@ -1531,7 +2071,11 @@ class EodLifecycleWorker:
                 )
         progress = LifecycleProgress()
         for trade in trades:
-            outcome = await self.close_worker._close(UUID(str(trade["id"])), manual=False)
+            outcome = (
+                await self._close_demo(UUID(str(trade["id"])))
+                if trade["execution_mode"] == "demo"
+                else await self.close_worker._close(UUID(str(trade["id"])), manual=False)
+            )
             progress = LifecycleProgress(
                 progress.claimed + 1,
                 progress.submitted + (outcome == "submitted"),
@@ -1541,9 +2085,84 @@ class EodLifecycleWorker:
             )
         return {"due": True, **progress.json()}
 
+    async def _close_demo(self, trade_id: UUID) -> str:
+        async with self.session_factory() as session, session.begin():
+            trade = (
+                (
+                    await session.execute(
+                        text("""
+                    SELECT t.*,s.lot_size FROM trades t
+                    JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
+                     WHERE t.id=:trade AND t.execution_mode='demo' FOR UPDATE OF t
+                    """),
+                        {"trade": trade_id},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if trade is None or trade["status"] == "closed":
+                return "completed"
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status='cancelled',
+                  broker_status='Demo protection cancelled for 15:10 square-off',updated_at=NOW()
+                 WHERE trade_id=:trade AND execution_mode='demo'
+                   AND role IN ('TARGET','SL1','SL2')
+                   AND status IN ('pending','submitted','partially_filled')
+                """),
+                {"trade": trade_id},
+            )
+            order_id = _order_uuid("demo-eod", trade_id)
+            quantity = int(trade["quantity"])
+            lot_size = max(int(trade["lot_size"] or 1), 1)
+            await DurableOrderFactory(session).create(
+                order_id=order_id,
+                user_id=UUID(str(trade["user_id"])),
+                snapshot_id=UUID(str(trade["strategy_snapshot_id"])),
+                trade_id=trade_id,
+                session_key=f"stsq-{trade_id.hex[:16]}",
+                role="EMERGENCY_CLOSE",
+                side=_exit_side(str(trade["direction"])),
+                lots=max(1, (quantity + lot_size - 1) // lot_size),
+                quantity=quantity,
+                price=Decimal(str(trade["last_price"] or trade["entry_price"])),
+                trigger_price=None,
+                order_type="MARKET",
+                idempotency_key=f"python:demo-eod:{trade_id}",
+                execution_mode="demo",
+            )
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status='submitted',broker_order_id=:broker,
+                  broker_status='Demo EOD order accepted locally',last_reconciled_at=NOW(),
+                  updated_at=NOW() WHERE id=:order AND status='pending'
+                """),
+                {"order": order_id, "broker": f"DEMO-{order_id}"},
+            )
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status='filled',filled_quantity=quantity,
+                  average_fill_price=price,filled_price=price,filled_at=NOW(),
+                  broker_status='Demo EOD market order filled locally',updated_at=NOW()
+                 WHERE id=:order AND status='submitted'
+                """),
+                {"order": order_id},
+            )
+            await session.execute(
+                text("""
+                UPDATE strategy_execution_intents SET status='submitted',strategy_order_id=:order,
+                  updated_at=NOW() WHERE trade_id=:trade AND action='SQUARE_OFF'
+                  AND status IN ('pending','retry_wait','claimed')
+                """),
+                {"trade": trade_id, "order": order_id},
+            )
+            return "submitted"
+
 
 __all__ = [
     "AuthoritativeExecutionWorker",
+    "DemoLifecycleWorker",
     "DurableOrderFactory",
     "EodLifecycleWorker",
     "FillLifecycleWorker",

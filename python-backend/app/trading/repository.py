@@ -123,8 +123,8 @@ class TradingRepository:
         validate_intent_transition(IntentStatus.CLAIMED, final)
         result = await self.session.execute(text("""
             UPDATE strategy_execution_intents
-               SET status=:status,strategy_order_id=COALESCE(:order_id,strategy_order_id),last_error=:error,
-                   completed_at=CASE WHEN :status IN ('completed','skipped','failed','expired') THEN NOW() ELSE completed_at END,
+               SET status=CAST(:status AS varchar(16)),strategy_order_id=COALESCE(:order_id,strategy_order_id),last_error=:error,
+                   completed_at=CASE WHEN CAST(:status AS varchar(16)) IN ('completed','skipped','failed','expired') THEN NOW() ELSE completed_at END,
                    updated_at=NOW()
              WHERE id=:id AND user_id=:user AND status='claimed'
         """), {"id": intent_id, "user": user_id, "status": final.value, "error": error[:2000], "order_id": strategy_order_id})
@@ -139,7 +139,7 @@ class TradingRepository:
               FROM strategy_execution_intents i
               JOIN strategy_market_snapshots s ON s.id=i.snapshot_id
               LEFT JOIN user_profiles p ON p.user_id=i.user_id
-             WHERE i.id=:intent FOR UPDATE
+             WHERE i.id=:intent FOR UPDATE OF i
         """), {"intent": intent_id})).mappings().first()
         if row is None or row["user_id"] != user_id:
             raise OwnershipError("Execution intent is not owned by this user.")

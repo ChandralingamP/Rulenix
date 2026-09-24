@@ -23,12 +23,14 @@ from .authority import AuthorityLeaseLifecycle
 from .broker import RuntimeBrokerClientFactory
 from .lifecycle import (
     AuthoritativeExecutionWorker,
+    DemoLifecycleWorker,
     EodLifecycleWorker,
     FillLifecycleWorker,
     ProtectionLifecycleWorker,
     ReversalLifecycleWorker,
     RiskReducingCloseWorker,
 )
+from .market import AngelSuperTrendMarketProvider
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
 
@@ -47,7 +49,11 @@ class ProductionRuntime:
         self.session_factory = session_factory
         self.settings = settings
         self.mode = RuntimeMode(settings.runtime_mode.strip().lower())
-        owner = UUID(settings.live_authority_lease_owner) if settings.live_authority_lease_owner else None
+        owner = (
+            UUID(settings.live_authority_lease_owner)
+            if settings.live_authority_lease_owner
+            else None
+        )
         self.authority = AuthorityLeaseLifecycle(
             LiveMutationAuthority(session_factory),
             self.mode,
@@ -64,6 +70,7 @@ class ProductionRuntime:
         )
         self.reconciliation: AccountReconciliationWorker | None = None
         self.execution: AuthoritativeExecutionWorker | None = None
+        self.demo: DemoLifecycleWorker | None = None
         self.fills: FillLifecycleWorker | None = None
         self.protection: ProtectionLifecycleWorker | None = None
         self.reversal: ReversalLifecycleWorker | None = None
@@ -116,14 +123,27 @@ class ProductionRuntime:
                     lease_owner=self.authority.lease_owner,
                     enabled=self.authority.mutation_allowed,
                 )
-                self.execution = AuthoritativeExecutionWorker(self.session_factory, coordinator)
-                self.fills = FillLifecycleWorker(self.session_factory)
-                self.protection = ProtectionLifecycleWorker(self.session_factory, coordinator)
+                self.execution = AuthoritativeExecutionWorker(
+                    self.session_factory,
+                    coordinator,
+                    AngelSuperTrendMarketProvider(clients),
+                )
+                self.demo = DemoLifecycleWorker(self.session_factory)
+                self.fills = FillLifecycleWorker(
+                    self.session_factory,
+                    protection_ack_timeout_seconds=self.settings.protection_ack_timeout_seconds,
+                )
+                self.protection = ProtectionLifecycleWorker(
+                    self.session_factory,
+                    coordinator,
+                    max_attempts=self.settings.protection_max_attempts,
+                )
                 self.reversal = ReversalLifecycleWorker(self.session_factory, coordinator)
                 self.close = RiskReducingCloseWorker(self.session_factory, coordinator)
                 self.eod = EodLifecycleWorker(self.session_factory, self.close)
                 authoritative_workers = {
                     "strategy_dispatch": self._authoritative_dispatch,
+                    "demo_lifecycle": self.demo.run_once,
                     "fill_lifecycle": self.fills.run_once,
                     "protection_lifecycle": self.protection.run_once,
                     "sl2_reversal_lifecycle": self.reversal.run_once,
@@ -197,10 +217,7 @@ class ProductionRuntime:
             else authority.mutation_allowed
         )
         return bool(
-            scheduler.leader
-            and not scheduler.stale
-            and self.supervisor.ready()
-            and authority_ready
+            scheduler.leader and not scheduler.stale and self.supervisor.ready() and authority_ready
         )
 
     def status(self) -> dict[str, object]:

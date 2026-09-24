@@ -324,7 +324,7 @@ class SafetyRepository:
     async def final_pre_mutation_check(self, request: SafetyRequest) -> SafetyDecision:
         """Fresh final gate; no caller-supplied approval can bypass it."""
         try:
-            async with self.session.begin():
+            if self.session.in_transaction():
                 await self.session.execute(
                     text("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
                 )
@@ -336,6 +336,19 @@ class SafetyRepository:
                 decision = evaluate(request, state)
                 await self._record(request, decision)
                 return decision
+            else:
+                async with self.session.begin():
+                    await self.session.execute(
+                        text("SELECT pg_advisory_xact_lock_shared(hashtext('rulenix:risk:global'))")
+                    )
+                    await self.session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtextextended(:user,0))"),
+                        {"user": str(request.user_id)},
+                    )
+                    state = await self._state(request)
+                    decision = evaluate(request, state)
+                    await self._record(request, decision)
+                    return decision
         except SQLAlchemyError as exc:
             return SafetyDecision.block(
                 ActionClass.INCREASE_EXPOSURE,

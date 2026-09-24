@@ -17,12 +17,15 @@ from app.reconciliation.domain import (
 )
 from app.reconciliation.service import ReconciliationService
 from app.runtime.lifecycle import (
+    DemoLifecycleWorker,
     EodLifecycleWorker,
     FillLifecycleWorker,
     ProtectionLifecycleWorker,
     ReversalLifecycleWorker,
     RiskReducingCloseWorker,
 )
+from app.strategy.execution import ExecutionOrchestrator, ExecutionOutcome
+from app.strategy.persistence import PreparedIntent, SignalRepository
 from app.trading.repository import TradingRepository
 
 
@@ -63,6 +66,42 @@ class FakeCoordinator:
                 {"order": order_id},
             )
         return MutationOutcome(uuid4(), MutationState.ACKNOWLEDGED)
+
+
+class OutcomeCoordinator(FakeCoordinator):
+    def __init__(self, factory, outcomes):
+        super().__init__(factory)
+        self.outcomes = list(outcomes)
+
+    async def place_order(self, order_id, *, action=None):
+        self.places.append((order_id, action))
+        state = self.outcomes.pop(0)
+        status = {
+            MutationState.ACKNOWLEDGED: "submitted",
+            MutationState.AMBIGUOUS: "ambiguous",
+            MutationState.REJECTED: "rejected",
+            MutationState.FAILED: "failed",
+            MutationState.BLOCKED: "failed",
+        }[state]
+        async with self.factory() as session, session.begin():
+            if status == "ambiguous":
+                await session.execute(
+                    text("""
+                    UPDATE strategy_orders SET status='submitting',updated_at=NOW()
+                    WHERE id=:order
+                    """),
+                    {"order": order_id},
+                )
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status=CAST(:status AS varchar(16)),
+                  broker_order_id=CASE WHEN CAST(:status AS varchar(16))='submitted' THEN CAST(:broker AS varchar(96)) ELSE broker_order_id END,
+                  last_reconciled_at=CASE WHEN CAST(:status AS varchar(16))='submitted' THEN NOW() ELSE last_reconciled_at END,
+                  updated_at=NOW() WHERE id=:order
+                """),
+                {"status": status, "order": order_id, "broker": f"fake-{order_id}"},
+            )
+        return MutationOutcome(uuid4(), state, f"fake-{order_id}" if status == "submitted" else "")
 
 
 @pytest.fixture
@@ -503,3 +542,244 @@ async def test_eod_boundary_materializes_one_close_and_repeated_cycle_is_idempot
             )
         ).one()
         assert tuple(counts) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_protection_retry_exhaustion_submits_one_emergency_close(lifecycle_db):
+    factory, user, _, entry_order = lifecycle_db
+    trade_id = await open_trade(factory, user, entry_order)
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("""
+            INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at)
+            VALUES('MCX','p13c-token',99,NOW())
+            ON CONFLICT(exchange_segment,contract_token) DO UPDATE
+              SET price=EXCLUDED.price,received_at=EXCLUDED.received_at
+            """)
+        )
+    coordinator = OutcomeCoordinator(
+        factory,
+        [
+            MutationState.REJECTED,
+            MutationState.REJECTED,
+            MutationState.REJECTED,
+            MutationState.ACKNOWLEDGED,
+        ],
+    )
+    worker = ProtectionLifecycleWorker(factory, coordinator, max_attempts=3)
+    await worker.run_once()
+    await worker.run_once()
+    await worker.run_once()
+    result = await worker.run_once()
+    assert result["submitted"] == 1
+    assert len(coordinator.places) == 4
+    assert coordinator.places[-1][1].value == "emergency_close"
+    async with factory() as session:
+        state = (
+            await session.execute(
+                text("""
+                SELECT t.safety_status,t.protection_attempts,
+                  COUNT(o.id) FILTER(WHERE o.role IN ('SL1','SL2')) AS stops,
+                  COUNT(o.id) FILTER(WHERE o.role='EMERGENCY_CLOSE') AS closes
+                 FROM trades t LEFT JOIN strategy_orders o ON o.trade_id=t.id
+                 WHERE t.id=:trade GROUP BY t.id
+                """),
+                {"trade": trade_id},
+            )
+        ).one()
+    assert tuple(state) == ("EMERGENCY_CLOSING", 3, 3, 1)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_emergency_close_is_not_blindly_retried(lifecycle_db):
+    factory, user, _, entry_order = lifecycle_db
+    trade_id = await open_trade(factory, user, entry_order)
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("""
+            UPDATE trades SET protection_attempts=3,
+              protection_deadline_at=NOW()-INTERVAL '1 second' WHERE id=:trade
+            """),
+            {"trade": trade_id},
+        )
+        await session.execute(
+            text("""
+            INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at)
+            VALUES('MCX','p13c-token',99,NOW())
+            ON CONFLICT(exchange_segment,contract_token) DO UPDATE
+              SET price=EXCLUDED.price,received_at=EXCLUDED.received_at
+            """)
+        )
+    coordinator = OutcomeCoordinator(factory, [MutationState.AMBIGUOUS])
+    worker = ProtectionLifecycleWorker(factory, coordinator, max_attempts=3)
+    first = await worker.run_once()
+    second = await worker.run_once()
+    assert first["ambiguous"] == 1
+    assert second["submitted"] == 0
+    assert len(coordinator.places) == 1
+    async with factory() as session:
+        state = await session.scalar(
+            text("SELECT safety_status FROM trades WHERE id=:trade"), {"trade": trade_id}
+        )
+    assert state == "EMERGENCY_CLOSING"
+
+
+@pytest.mark.asyncio
+async def test_supertrend_demo_market_entry_protection_and_target_are_broker_free(lifecycle_db):
+    factory, user, snapshot, _ = lifecycle_db
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=:user"),
+            {"user": user},
+        )
+        await session.execute(
+            text("""
+            UPDATE strategy_market_snapshots SET strategy_key='supertrend_index_options_v1',
+              instrument='NIFTY_CALL',contract_symbol='NIFTY-DEMO-CE',lot_size=10,
+              exchange_segment='NFO',product_type='INTRADAY',
+              buy_target=25,buy_sl1=15,buy_sl2=NULL WHERE id=:snapshot
+            """),
+            {"snapshot": snapshot},
+        )
+        signal_id, _ = await SignalRepository(session).materialize(
+            strategy_key="supertrend_index_options_v1",
+            instrument="NIFTY",
+            session_key="demo-supertrend",
+            signal_at=datetime.now(UTC),
+            signal_type="ENTRY",
+            snapshot_id=snapshot,
+            payload={"side": "CALL"},
+            intents=[
+                PreparedIntent(
+                    user,
+                    snapshot,
+                    None,
+                    "supertrend_index_options_v1",
+                    "NIFTY",
+                    "demo-supertrend",
+                    "ENTRY",
+                    "BUY_ENTRY",
+                    "BUY",
+                    "MARKET",
+                    1,
+                    10,
+                    Decimal(100),
+                )
+            ],
+        )
+    async with factory() as session:
+        results = await ExecutionOrchestrator(session).process_due(signal_id=signal_id)
+    assert [item.outcome for item in results] == [ExecutionOutcome.DEMO_SIMULATED]
+    fills = FillLifecycleWorker(factory)
+    assert (await fills.run_once())["processed_fills"] == 1
+    demo = DemoLifecycleWorker(factory)
+    assert (await demo.run_once())["protected"] == 2
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("""
+            INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at)
+            VALUES('NFO','p13c-token',125,NOW())
+            ON CONFLICT(exchange_segment,contract_token) DO UPDATE
+              SET price=EXCLUDED.price,received_at=EXCLUDED.received_at
+            """)
+        )
+    result = await demo.run_once()
+    assert result == {"protected": 0, "filled": 1, "broker_mutations": 0}
+    assert (await fills.run_once())["processed_fills"] == 1
+    async with factory() as session:
+        trade = (
+            await session.execute(
+                text("""
+                SELECT status,safety_status,exit_reason,pnl FROM trades
+                 WHERE user_id=:user AND execution_mode='demo'
+                """),
+                {"user": user},
+            )
+        ).one()
+        broker_ids = (
+            (
+                await session.execute(
+                    text("SELECT broker_order_id FROM strategy_orders WHERE execution_mode='demo'")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert tuple(trade[:3]) == ("closed", "CLOSED", "TP")
+    assert Decimal(str(trade.pnl)) == Decimal(250)
+    assert broker_ids and all(value.startswith("DEMO-") for value in broker_ids)
+
+
+@pytest.mark.asyncio
+async def test_futures_demo_stop_entry_and_sl1_are_driven_by_fresh_ticks(lifecycle_db):
+    factory, user, snapshot, _ = lifecycle_db
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("UPDATE user_profiles SET trading_mode='demo' WHERE user_id=:user"),
+            {"user": user},
+        )
+        signal_id, _ = await SignalRepository(session).materialize(
+            strategy_key="futures_breakout_v3",
+            instrument="GOLDTEN",
+            session_key="demo-futures",
+            signal_at=datetime.now(UTC),
+            signal_type="ENTRY",
+            snapshot_id=snapshot,
+            payload={"entry_direction": "BUY"},
+            intents=[
+                PreparedIntent(
+                    user,
+                    snapshot,
+                    None,
+                    "futures_breakout_v3",
+                    "GOLDTEN",
+                    "demo-futures",
+                    "ENTRY",
+                    "BUY_ENTRY",
+                    "BUY",
+                    "STOPLOSS_LIMIT",
+                    1,
+                    10,
+                    Decimal(100),
+                    Decimal(100),
+                )
+            ],
+        )
+    async with factory() as session:
+        results = await ExecutionOrchestrator(session).process_due(signal_id=signal_id)
+    assert [item.outcome for item in results] == [ExecutionOutcome.DEMO_SIMULATED]
+    demo = DemoLifecycleWorker(factory)
+    fills = FillLifecycleWorker(factory)
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("""
+            INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at)
+            VALUES('MCX','p13c-token',100,NOW())
+            ON CONFLICT(exchange_segment,contract_token) DO UPDATE
+              SET price=EXCLUDED.price,received_at=EXCLUDED.received_at
+            """)
+        )
+    assert (await demo.run_once())["filled"] == 1
+    assert (await fills.run_once())["processed_fills"] == 1
+    assert (await demo.run_once())["protected"] == 2
+    async with factory() as session, session.begin():
+        await session.execute(
+            text("""
+            UPDATE market_price_ticks SET price=98,received_at=NOW()
+             WHERE exchange_segment='MCX' AND contract_token='p13c-token'
+            """)
+        )
+    assert (await demo.run_once())["filled"] == 1
+    assert (await fills.run_once())["processed_fills"] == 1
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text("""
+                SELECT status,exit_reason,pnl FROM trades
+                 WHERE user_id=:user AND execution_mode='demo'
+                """),
+                {"user": user},
+            )
+        ).one()
+    assert tuple(row[:2]) == ("closed", "SL1")
+    assert Decimal(str(row.pnl)) == Decimal(-2)

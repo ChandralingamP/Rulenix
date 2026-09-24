@@ -38,7 +38,10 @@ async def test_eod_and_crash_restart_durable_state_match_across_runtimes() -> No
     database_url = _database_url()
     if not RUST_BINARY.exists():
         raise AssertionError("build the phase10 adapter before running replay differential tests")
-    engine = create_async_engine(database_url, pool_size=4, max_overflow=0)
+    async_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1).replace(
+        "postgres://", "postgresql+asyncpg://", 1
+    )
+    engine = create_async_engine(async_url, pool_size=4, max_overflow=0)
     try:
         for index, (case, at) in enumerate(CASES):
             request = {"case": case}
