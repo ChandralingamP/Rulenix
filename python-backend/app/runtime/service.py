@@ -2,7 +2,7 @@
 
 Shadow mode exercises leadership, broker reads, egress and lifecycle discovery
 without claiming LIVE authority or writing broker state. Authoritative startup
-is intentionally refused until every lifecycle callback is installed.
+remains refused until the complete lifecycle certification is satisfied.
 """
 
 from __future__ import annotations
@@ -15,13 +15,24 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.broker.authority import LiveMutationAuthority
+from app.broker.mutations import LiveMutationCoordinator
 from app.config import Settings
 from app.strategy.runtime import SchedulerHealth
 
 from .authority import AuthorityLeaseLifecycle
 from .broker import RuntimeBrokerClientFactory
+from .lifecycle import (
+    AuthoritativeExecutionWorker,
+    EodLifecycleWorker,
+    FillLifecycleWorker,
+    ProtectionLifecycleWorker,
+    ReversalLifecycleWorker,
+    RiskReducingCloseWorker,
+)
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
+
+AUTHORITATIVE_LIFECYCLE_CERTIFIED = False
 
 
 class ProductionRuntime:
@@ -52,14 +63,21 @@ class ProductionRuntime:
             interval_seconds=settings.worker_interval_seconds,
         )
         self.reconciliation: AccountReconciliationWorker | None = None
+        self.execution: AuthoritativeExecutionWorker | None = None
+        self.fills: FillLifecycleWorker | None = None
+        self.protection: ProtectionLifecycleWorker | None = None
+        self.reversal: ReversalLifecycleWorker | None = None
+        self.close: RiskReducingCloseWorker | None = None
+        self.eod: EodLifecycleWorker | None = None
 
     async def start(self) -> None:
         if self.mode is RuntimeMode.OFF:
             return
-        if self.mode is RuntimeMode.AUTHORITATIVE:
+        if self.mode is RuntimeMode.AUTHORITATIVE and not AUTHORITATIVE_LIFECYCLE_CERTIFIED:
             raise RuntimeError(
-                "Authoritative Python runtime remains disabled until protection, reversal, "
-                "manual-close and EOD lifecycle workers are installed and certified."
+                "Authoritative Python runtime remains disabled until strategy snapshot creation, "
+                "DEMO lifecycle, emergency protection, Rust-oracle, broker-fault and Linux "
+                "authoritative certification are complete."
             )
         try:
             await self.authority.start()
@@ -88,6 +106,37 @@ class ProductionRuntime:
                     interval_seconds=interval,
                     timeout_seconds=max(5, interval * 2),
                 )
+            if self.mode is RuntimeMode.AUTHORITATIVE:
+                if self.authority.lease_owner is None:
+                    raise RuntimeError("Authoritative lifecycle requires an explicit lease owner.")
+                coordinator = LiveMutationCoordinator(
+                    self.session_factory,
+                    self.authority.authority,
+                    clients,
+                    lease_owner=self.authority.lease_owner,
+                    enabled=self.authority.mutation_allowed,
+                )
+                self.execution = AuthoritativeExecutionWorker(self.session_factory, coordinator)
+                self.fills = FillLifecycleWorker(self.session_factory)
+                self.protection = ProtectionLifecycleWorker(self.session_factory, coordinator)
+                self.reversal = ReversalLifecycleWorker(self.session_factory, coordinator)
+                self.close = RiskReducingCloseWorker(self.session_factory, coordinator)
+                self.eod = EodLifecycleWorker(self.session_factory, self.close)
+                authoritative_workers = {
+                    "strategy_dispatch": self._authoritative_dispatch,
+                    "fill_lifecycle": self.fills.run_once,
+                    "protection_lifecycle": self.protection.run_once,
+                    "sl2_reversal_lifecycle": self.reversal.run_once,
+                    "manual_close_lifecycle": self.close.run_manual_once,
+                    "eod_lifecycle": self.eod.run_once,
+                }
+                for role, callback in authoritative_workers.items():
+                    self.supervisor.start(
+                        role,
+                        callback,
+                        interval_seconds=interval,
+                        timeout_seconds=max(15, interval * 4),
+                    )
             self.scheduler.start()
         except Exception:
             await self.stop()
@@ -123,7 +172,19 @@ class ProductionRuntime:
                 )
                 or 0
             )
-        return {"due_scheduler_runs": due, "due_execution_intents": intents, "shadow": True}
+        return {
+            "due_scheduler_runs": due,
+            "due_execution_intents": intents,
+            "shadow": self.mode is RuntimeMode.SHADOW,
+            "authoritative": self.mode is RuntimeMode.AUTHORITATIVE,
+        }
+
+    async def _authoritative_dispatch(self) -> dict[str, object]:
+        if self.execution is None:
+            raise RuntimeError("Authoritative execution worker is not installed.")
+        if not self.scheduler.health.snapshot().leader:
+            return {"standby": True, "processed": 0}
+        return await self.execution.run_once()
 
     def ready(self) -> bool:
         if self.mode is RuntimeMode.OFF:

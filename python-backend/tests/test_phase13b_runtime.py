@@ -9,7 +9,9 @@ from app.broker.angel.models import BrokerReadFailure, BrokerReadSuccess, Positi
 from app.config import Settings
 from app.reconciliation.domain import EvidenceStatus, ReadEvidence, ReconciliationSnapshot
 from app.runtime.reconciliation import _evidence, _position, _time
+from app.runtime.service import ProductionRuntime
 from app.runtime.supervisor import WorkerSupervisor
+from app.strategy.runtime import SchedulerHealth
 
 
 @pytest.mark.asyncio
@@ -135,6 +137,18 @@ def test_runtime_configuration_separates_shadow_and_authoritative_modes() -> Non
             PYTHON_RUNTIME_MODE="authoritative",
             PYTHON_LIVE_TRADING_ENABLED=False,
         ).validate_production()
+
+
+@pytest.mark.asyncio
+async def test_uncertified_authoritative_runtime_remains_fail_closed() -> None:
+    settings = Settings(
+        PYTHON_RUNTIME_MODE="authoritative",
+        PYTHON_LIVE_TRADING_ENABLED=True,
+        PYTHON_LIVE_AUTHORITY_LEASE_OWNER="00000000-0000-0000-0000-000000000001",
+    )
+    runtime = ProductionRuntime(None, None, settings, SchedulerHealth())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="remains disabled"):
+        await runtime.start()
 
 
 def test_worker_health_stale_window_is_bounded() -> None:

@@ -147,12 +147,22 @@ async def close_trade(trade_id: UUID, user: Principal = Depends(current_user), d
         }
     if row["execution_mode"] != "live":
         raise DomainError(400, "Close Trade is available only for running DEMO or LIVE trades.")
-    # Preserve the durable intent, but stop before any Angel mutation.  The
-    # frontend receives an explicit migration-safe error, never fake success.
-    await TradingRepository(db).request_manual_close(
+    inserted = await TradingRepository(db).request_manual_close(
         trade_id=trade_id,
         user_id=UUID(str(user.id)),
         requested_quantity=int(row["quantity"]),
     )
     await db.commit()
-    raise DomainError(503, "LIVE manual close is queued for broker reconciliation; Python Angel mutation transport is disabled.", code="python_live_mutation_disabled")
+    intent = (await db.execute(text("""
+        SELECT status,requested_quantity,close_side FROM manual_trade_close_intents
+         WHERE trade_id=:trade AND user_id=:user
+    """), {"trade": trade_id, "user": user.id})).mappings().one()
+    return {
+        "trade_id": str(trade_id),
+        "status": intent["status"],
+        "execution_mode": "live",
+        "requested_quantity": int(intent["requested_quantity"]),
+        "close_side": intent["close_side"],
+        "duplicate": not inserted,
+        "message": "LIVE close is durably queued for authority-fenced broker execution.",
+    }
