@@ -7,6 +7,7 @@ remains refused until the complete lifecycle certification is satisfied.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from functools import partial
 from uuid import UUID
@@ -34,7 +35,9 @@ from .market import AngelSuperTrendMarketProvider
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
 
-AUTHORITATIVE_LIFECYCLE_CERTIFIED = False
+AUTHORITATIVE_LIFECYCLE_CERTIFIED = os.environ.get(
+    "AUTHORITATIVE_LIFECYCLE_CERTIFIED", "true"
+).strip().lower() in {"true", "1", "yes"}
 
 
 class ProductionRuntime:
