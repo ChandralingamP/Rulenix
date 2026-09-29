@@ -35,6 +35,9 @@ def make_engine(url: str) -> AsyncEngine | None:
             elif sslmode in ("verify-ca", "require"):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_REQUIRED
+            strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+            if strict_flag:
+                ctx.verify_flags &= ~strict_flag
             connect_args["ssl"] = ctx
         u = u.set(query=query)
     return create_async_engine(
