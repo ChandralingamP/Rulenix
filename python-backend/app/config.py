@@ -6,12 +6,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(".env", "../.env", "../backend/.env", "../../backend/.env", "backend/.env"),
+        extra="ignore",
+    )
 
     app_env: str = Field(default="development", validation_alias="APP_ENV")
     database_url: str = Field(default="", validation_alias="DATABASE_URL")
     frontend_origin: str = Field(
-        default="http://localhost:5173", validation_alias="FRONTEND_ORIGIN"
+        default="http://localhost:5173",
+        validation_alias=AliasChoices("FRONTEND_ORIGIN", "FRONTEND_ORIGINS"),
     )
     session_idle_minutes: int = Field(default=30, validation_alias="SESSION_IDLE_MINUTES")
     session_absolute_hours: int = Field(default=24, validation_alias="SESSION_ABSOLUTE_HOURS")
@@ -43,15 +47,24 @@ class Settings(BaseSettings):
     protection_max_attempts: int = Field(default=3, validation_alias="PROTECTION_MAX_ATTEMPTS")
     angel_base_url: str = Field(
         default="https://apiconnect.angelone.in",
-        validation_alias="ANGEL_BASE_URL",
+        validation_alias=AliasChoices("ANGEL_BASE_URL", "ANGEL_API_BASE"),
     )
     angel_websocket_url: str = Field(
         default="wss://smartapisocket.angelone.in/smart-stream",
-        validation_alias="ANGEL_WEBSOCKET_URL",
+        validation_alias=AliasChoices("ANGEL_WEBSOCKET_URL", "ANGEL_WS_URL"),
     )
-    angel_client_local_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_LOCAL_IP")
-    angel_client_public_ip: str = Field(default="", validation_alias="ANGEL_CLIENT_PUBLIC_IP")
-    angel_client_mac_address: str = Field(default="", validation_alias="ANGEL_CLIENT_MAC_ADDRESS")
+    angel_client_local_ip: str = Field(
+        default="",
+        validation_alias=AliasChoices("ANGEL_CLIENT_LOCAL_IP", "CLIENT_LOCAL_IP"),
+    )
+    angel_client_public_ip: str = Field(
+        default="",
+        validation_alias=AliasChoices("ANGEL_CLIENT_PUBLIC_IP", "CLIENT_PUBLIC_IP"),
+    )
+    angel_client_mac_address: str = Field(
+        default="",
+        validation_alias=AliasChoices("ANGEL_CLIENT_MAC_ADDRESS", "CLIENT_MAC_ADDRESS"),
+    )
     egress_helper_socket: str = Field(
         default="/run/rulenix-egress/helper.sock", validation_alias="EGRESS_HELPER_SOCKET"
     )
@@ -96,7 +109,11 @@ class Settings(BaseSettings):
                 raise ValueError("DATABASE_URL is required outside development")
             if len(self.otp_hash_key.encode()) < 32:
                 raise ValueError("OTP_HASH_KEY must contain at least 32 bytes")
-            if not self.frontend_origin.startswith("https://"):
+            if not all(
+                origin.strip().startswith("https://")
+                for origin in self.frontend_origin.split(",")
+                if origin.strip()
+            ):
                 raise ValueError("FRONTEND_ORIGIN must use HTTPS outside development")
             if mode != "off" and not self.credential_keys:
                 raise ValueError("CREDENTIAL_ENCRYPTION_KEYS is required for runtime broker reads")
