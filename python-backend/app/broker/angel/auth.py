@@ -42,13 +42,19 @@ class AngelAuthenticator:
 
     async def login(self, account: AccountContext, mpin: str, totp: str) -> BrokerSession:
         request = LoginRequest(clientcode=account.client_code, password=SecretStr(mpin), totp=SecretStr(totp))
+        payload = {
+            "clientcode": request.clientcode,
+            "password": request.password.get_secret_value(),
+            "totp": request.totp.get_secret_value(),
+            "state": request.state,
+        }
         response = None
         for attempt in range(2):
             try:
                 response = await self.transport.post(
                     f"{self.base_url}/rest/auth/angelbroking/user/v1/loginByPassword",
                     headers=_base_headers(account),
-                    json=request.model_dump(mode="json"),
+                    json=payload,
                     timeout=8.0,
                 )
                 break

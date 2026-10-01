@@ -353,6 +353,13 @@ async def test_connect_success_and_token_persistence(
         assert request.url.path.endswith("/loginByPassword")
         assert request.headers["x-privatekey"] == test_user["api_key_plain"]
         assert request.headers["x-usertype"] == "USER"
+        import json
+        req_body = json.loads(request.read())
+        assert req_body["clientcode"] == test_user["client_id"]
+        assert req_body["password"] == "1234"
+        assert req_body["totp"] == "123456"
+        assert req_body["password"] != "**********"
+        assert req_body["totp"] != "**********"
         return httpx.Response(
             200,
             json={
