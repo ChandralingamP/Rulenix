@@ -66,11 +66,17 @@ async def _details(db: AsyncSession, user_id: str) -> dict:
     elif not row["has_all_session_tokens"]:
         connection_state = "idle"
     else:
-        connection_state = "connected"
+        connection_state = "expired"
     if connection_state in {"connected", "idle"}:
         message = None
     elif connection_state == "unavailable":
-        message = "Angel One is temporarily unavailable. Rulenix will retry automatically."
+        message = (
+            "Today's broker session was preserved. Rulenix will retry automatically; no new login is required."
+            if connected_today
+            else "Angel One is temporarily unavailable. Rulenix will retry automatically."
+        )
+    elif connection_state == "expired":
+        message = "Daily brokerage session expired. Connect with your MPIN and TOTP for today's session."
     else:
         message = row["last_token_message"]
     return {

@@ -555,3 +555,55 @@ async def test_connect_guarantees_no_broker_mutations_and_preserves_mode(
             assert mode == "demo"
     finally:
         app.state.broker_transport_factory = None
+
+
+@pytest.mark.asyncio
+async def test_status_expired_when_token_from_previous_day(
+    app_client: httpx.AsyncClient, test_user: dict[str, Any]
+):
+    session_factory: async_sessionmaker[AsyncSession] = app.state.session_factory
+    settings = app.state.settings
+    user_id = test_user["user_id"]
+
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    async with session_factory() as db:
+        for kind in ("jwt_token", "refresh_token", "feed_token"):
+            version, nonce, ciphertext = encrypt_broker_secret(
+                f"token_{kind}",
+                user_id,
+                kind,
+                settings.credential_keys,
+                settings.credential_primary_version,
+            )
+            await db.execute(
+                text("""
+                INSERT INTO broker_secrets (user_id, secret_kind, key_version, nonce, ciphertext)
+                VALUES (:user_id, :kind, :version, :nonce, :ciphertext)
+                ON CONFLICT (user_id, secret_kind) DO UPDATE
+                  SET key_version = EXCLUDED.key_version, nonce = EXCLUDED.nonce, ciphertext = EXCLUDED.ciphertext
+                """),
+                {"user_id": user_id, "kind": kind, "version": version, "nonce": nonce, "ciphertext": ciphertext},
+            )
+        await db.execute(
+            text("""
+            UPDATE user_profiles
+               SET token_state = 'connected',
+                   last_token_status = 'success',
+                   token_received_at = :yesterday,
+                   last_token_check_at = :yesterday
+             WHERE user_id = :user_id
+            """),
+            {"yesterday": yesterday, "user_id": user_id},
+        )
+        await db.commit()
+
+    response = await app_client.get(
+        "/api/home/status/",
+        headers=test_user["auth_headers"],
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["connected_for_today"] is False
+    assert data["connection_state"] == "expired"
+    assert "Daily brokerage session expired" in data["connection_message"]
+
