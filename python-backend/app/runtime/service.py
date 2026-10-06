@@ -32,6 +32,7 @@ from .lifecycle import (
     RiskReducingCloseWorker,
 )
 from .market import AngelSuperTrendMarketProvider
+from .market_data import MarketDataIngestionService
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
 
@@ -79,6 +80,7 @@ class ProductionRuntime:
         self.reversal: ReversalLifecycleWorker | None = None
         self.close: RiskReducingCloseWorker | None = None
         self.eod: EodLifecycleWorker | None = None
+        self.market_data: MarketDataIngestionService | None = None
 
     async def start(self) -> None:
         if self.mode is RuntimeMode.OFF:
@@ -160,6 +162,15 @@ class ProductionRuntime:
                         interval_seconds=interval,
                         timeout_seconds=max(15, interval * 4),
                     )
+                self.market_data = MarketDataIngestionService(
+                    self.session_factory, clients, self.settings
+                )
+                self.supervisor.start(
+                    "market_data_ingestion",
+                    self.market_data.run_cycle,
+                    interval_seconds=60.0,
+                    timeout_seconds=45.0,
+                )
             self.scheduler.start()
         except Exception:
             await self.stop()

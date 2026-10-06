@@ -5,7 +5,7 @@ from datetime import datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -157,3 +157,16 @@ async def retry_execution(payload: dict, _: Principal = Depends(admin_only), db:
     if not getattr(result, "rowcount", 0):
         raise DomainError(400, "Only failed or waiting entry intents inside their safe execution window can be retried.")
     return {"detail": "Execution intent queued for safe retry.", "intent_id": str(intent_id)}
+
+
+@router.post("/strategies/admin/sync-market-data")
+async def sync_market_data(
+    request: Request,
+    _: Principal = Depends(admin_only),
+):
+    runtime = getattr(request.app.state, "production_runtime", None)
+    if not runtime or not runtime.market_data:
+        raise DomainError(503, "Market data ingestion service is not running.")
+    result = await runtime.market_data.run_cycle()
+    return {"status": "success", "result": result}
+
