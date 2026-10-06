@@ -59,17 +59,47 @@ async def update_profile(request: Request, payload: dict, user: Principal = Depe
     return {"detail": "Account settings updated.", "profile": dict(row)}
 
 @router.put("/trading-mode")
-async def trading_mode(payload: dict, user: Principal = Depends(current_user), db: AsyncSession = Depends(get_db)):
+async def trading_mode(payload: dict, request: Request, user: Principal = Depends(current_user), db: AsyncSession = Depends(get_db)):
     mode = str(payload.get("mode", "")).strip().lower()
     if mode not in {"demo", "live"}:
         raise DomainError(400, "Trading mode must be either demo or live.")
     if mode == "live":
         if not user.can_live_trade:
             raise DomainError(403, "Live-trading permission is required.")
-        raise DomainError(503, "LIVE mode is disabled in the Python migration shadow.", code="python_live_mutation_disabled")
-    await db.execute(text("INSERT INTO user_profiles(user_id,brokerage_user_id,api_key,trading_mode) VALUES(:user,'','',:mode) ON CONFLICT(user_id) DO UPDATE SET trading_mode='demo',updated_at=NOW()"), {"user": user.id, "mode": mode})
+        settings = getattr(request.app.state, "settings", None)
+        if not settings or not settings.live_trading_enabled:
+            raise DomainError(503, "Live trading is disabled in this environment.", code="python_live_mutation_disabled")
+        profile_row = (await db.execute(text("""
+            SELECT p.brokerage_user_id, p.last_token_status,
+                   EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=:user AND s.secret_kind='api_key') AS has_api_key,
+                   EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=:user AND s.secret_kind='jwt_token') AS has_jwt,
+                   EXISTS(SELECT 1 FROM broker_secrets s WHERE s.user_id=:user AND s.secret_kind='feed_token') AS has_feed
+            FROM user_profiles p WHERE p.user_id=:user
+        """), {"user": user.id})).mappings().first()
+        if (
+            not profile_row
+            or not profile_row["brokerage_user_id"]
+            or not profile_row["has_api_key"]
+            or not profile_row["has_jwt"]
+            or not profile_row["has_feed"]
+            or profile_row["last_token_status"] not in ("success", "refreshed")
+        ):
+            raise DomainError(400, "A connected and valid broker profile is required for live trading.")
+
+    in_flight = bool(await db.scalar(text("""
+        SELECT EXISTS(SELECT 1 FROM trades WHERE user_id=:user AND status='open')
+            OR EXISTS(SELECT 1 FROM strategy_orders WHERE user_id=:user AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling'))
+    """), {"user": user.id}))
+    if in_flight:
+        raise DomainError(400, "Trading mode cannot change while a position or broker order is still active. Close or reconcile it first.")
+
+    await db.execute(text("""
+        INSERT INTO user_profiles(user_id,brokerage_user_id,api_key,trading_mode)
+        VALUES(:user,'','',:mode)
+        ON CONFLICT(user_id) DO UPDATE SET trading_mode=:mode,updated_at=NOW()
+    """), {"user": user.id, "mode": mode})
     await db.commit()
-    return {"detail": "Trading mode changed to demo.", "profile": await profile(user, db), "trading_mode": mode}
+    return {"detail": f"Trading mode changed to {mode}.", "profile": await profile(user, db), "trading_mode": mode}
 
 
 @router.post("/profile/request-otp")

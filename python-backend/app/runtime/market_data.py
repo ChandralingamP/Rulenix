@@ -176,6 +176,7 @@ class MarketDataIngestionService:
                 continue
 
             async with self.session_factory() as session:
+                last_close_price: float | None = None
                 for item in raw_candles:
                     if not isinstance(item, list) or len(item) < 5:
                         continue
@@ -187,6 +188,7 @@ class MarketDataIngestionService:
                         low_p = float(item[3])
                         close_p = float(item[4])
                         vol = float(item[5]) if len(item) > 5 else 0.0
+                        last_close_price = close_p
                     except (ValueError, TypeError):
                         continue
 
@@ -223,6 +225,17 @@ class MarketDataIngestionService:
                         },
                     )
                     total_inserted += 1
+
+                if last_close_price is not None and last_close_price > 0:
+                    await session.execute(
+                        text("""
+                        INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
+                        VALUES (:exchange, :token, :price, NOW())
+                        ON CONFLICT (exchange_segment, contract_token) DO UPDATE
+                          SET price = EXCLUDED.price, received_at = NOW()
+                        """),
+                        {"exchange": exchange, "token": token, "price": last_close_price},
+                    )
                 await session.commit()
         return total_inserted
 
@@ -304,14 +317,28 @@ class MarketDataIngestionService:
                         logger.debug("Could not fetch MCX quote for token %s: %s", token, exc)
 
                     market_open: float | None = None
+                    ltp: float | None = None
                     if isinstance(quote, dict):
                         data = quote.get("data")
                         if isinstance(data, dict):
                             market_open = float(data.get("open") or data.get("opn") or 0.0) or None
+                            ltp = float(data.get("ltp") or data.get("lastPrice") or 0.0) or None
                         elif isinstance(data, list) and data:
                             first_item = data[0]
                             if isinstance(first_item, dict):
                                 market_open = float(first_item.get("open") or first_item.get("opn") or 0.0) or None
+                                ltp = float(first_item.get("ltp") or first_item.get("lastPrice") or 0.0) or None
+
+                    if ltp is not None and ltp > 0:
+                        await session.execute(
+                            text("""
+                            INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
+                            VALUES ('MCX', :token, :price, NOW())
+                            ON CONFLICT (exchange_segment, contract_token) DO UPDATE
+                              SET price = EXCLUDED.price, received_at = NOW()
+                            """),
+                            {"token": token, "price": ltp},
+                        )
 
                     buy_entry = float(levels.buy_entry)
                     sell_entry = float(levels.sell_entry)

@@ -112,7 +112,18 @@ async def close_trade(trade_id: UUID, user: Principal = Depends(current_user), d
             "age": max(int(max_age or 1), 1),
         })
         if exit_price is None or Decimal(str(exit_price)) <= 0:
-            raise DomainError(400, "DEMO close stopped because no fresh valid market price is available.")
+            exit_price = await db.scalar(
+                text("""
+                SELECT price FROM market_price_ticks
+                 WHERE UPPER(exchange_segment)=UPPER(:exchange) AND contract_token=:token AND price>0
+                 ORDER BY received_at DESC LIMIT 1
+            """),
+                {"exchange": row["exchange_segment"], "token": row["contract_token"]},
+            )
+        if exit_price is None or Decimal(str(exit_price)) <= 0:
+            exit_price = row.get("last_price") or row.get("entry_price")
+        if exit_price is None or Decimal(str(exit_price)) <= 0:
+            raise DomainError(400, "DEMO close stopped because no valid market price is available.")
         quantity = int(row["quantity"])
         realized = Decimal(str(row["pnl"] or 0)) + trade_pnl(
             row["direction"], row["entry_price"], exit_price,
