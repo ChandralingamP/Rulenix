@@ -137,6 +137,8 @@ class ExecutionOrchestrator:
             lots=int(getattr(intent, "lots", 0) or 0),
             strategy_key=getattr(intent, "strategy_key", None),
             instrument=getattr(intent, "instrument", None),
+            role=str(getattr(intent, "role", "") or ""),
+            session_key=str(getattr(intent, "session_key", "") or ""),
         )
         decision = await self.safety.final_pre_mutation_check(request)
         if not decision.allowed:
@@ -254,7 +256,7 @@ class ExecutionOrchestrator:
                     await self.session.execute(
                         text("""
                         SELECT i.id,i.user_id,i.trade_id,i.action,i.role,i.side,i.lots,i.quantity,i.price,i.trigger_price,
-                               i.strategy_key,i.instrument,COALESCE(p.trading_mode,'demo') AS execution_mode
+                               i.strategy_key,i.instrument,i.session_key,COALESCE(p.trading_mode,'demo') AS execution_mode
                           FROM strategy_execution_intents i
                           LEFT JOIN user_profiles p ON p.user_id=i.user_id
                          WHERE id=:id AND status='claimed'

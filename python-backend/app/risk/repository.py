@@ -135,26 +135,50 @@ class SafetyRepository:
             if int(safety["protection"] or 0):
                 blockers.append("protection_incident")
 
-        pending = bool(
-            await self.session.scalar(
-                text("""
-            SELECT EXISTS(
-                SELECT 1 FROM strategy_execution_intents
-                 WHERE user_id=:user AND status IN ('pending','claimed','retry_wait','submitted')
-                   AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
-            ) OR EXISTS(
-                SELECT 1 FROM strategy_reversal_intents
-                 WHERE user_id=:user AND status IN ('pending','processing','waiting','submitted','failed')
-                   AND (CAST(:trade AS uuid) IS NULL OR source_trade_id<>CAST(:trade AS uuid))
-            ) OR EXISTS(
-                SELECT 1 FROM manual_trade_close_intents
-                 WHERE user_id=:user AND status <> 'completed'
-                   AND (CAST(:trade AS uuid) IS NULL OR trade_id<>CAST(:trade AS uuid))
+        pending = False
+        if request.trade_id is not None:
+            pending = bool(
+                await self.session.scalar(
+                    text("""
+                SELECT EXISTS(
+                    SELECT 1 FROM strategy_execution_intents
+                     WHERE user_id=:user AND trade_id=:trade
+                       AND status IN ('pending','claimed','retry_wait','submitted')
+                       AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
+                ) OR EXISTS(
+                    SELECT 1 FROM strategy_reversal_intents
+                     WHERE user_id=:user AND source_trade_id=:trade
+                       AND status IN ('pending','processing','waiting','submitted','failed')
+                ) OR EXISTS(
+                    SELECT 1 FROM manual_trade_close_intents
+                     WHERE user_id=:user AND trade_id=:trade
+                       AND status <> 'completed'
+                )
+            """),
+                    {"user": request.user_id, "intent": request.intent_id, "trade": request.trade_id},
+                )
             )
-        """),
-                {"user": request.user_id, "intent": request.intent_id, "trade": request.trade_id},
+        elif request.strategy_key and request.instrument:
+            pending = bool(
+                await self.session.scalar(
+                    text("""
+                SELECT EXISTS(
+                    SELECT 1 FROM strategy_execution_intents
+                     WHERE user_id=:user AND strategy_key=:strategy AND instrument=:instrument
+                       AND (CAST(:role AS varchar) IS NULL OR role=:role)
+                       AND status IN ('pending','claimed','retry_wait','submitted')
+                       AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
+                )
+            """),
+                    {
+                        "user": request.user_id,
+                        "strategy": request.strategy_key,
+                        "instrument": request.instrument,
+                        "role": getattr(request, "role", None),
+                        "intent": request.intent_id,
+                    },
+                )
             )
-        )
         ambiguous = bool(
             await self.session.scalar(
                 text("""
@@ -180,7 +204,16 @@ class SafetyRepository:
                        AND t.strategy_key=:strategy AND t.instrument_label=:instrument
                 ) OR EXISTS(
                     SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
-                     WHERE o.user_id=:user AND o.execution_mode=:mode AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                     WHERE o.user_id=:user AND o.execution_mode=:mode
+                       AND (
+                           CASE
+                               WHEN CAST(:role AS varchar) IS NOT NULL OR CAST(:session_key AS varchar) IS NOT NULL THEN (
+                                   (CAST(:role AS varchar) IS NOT NULL AND o.role=:role)
+                                   OR (CAST(:session_key AS varchar) IS NOT NULL AND o.session_key<>:session_key)
+                               )
+                               ELSE o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                           END
+                       )
                        AND (CAST(:order AS uuid) IS NULL OR o.id<>CAST(:order AS uuid))
                        AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
                        AND s.strategy_key=:strategy AND s.instrument=:instrument
@@ -192,6 +225,8 @@ class SafetyRepository:
                         "strategy": request.strategy_key,
                         "instrument": request.instrument,
                         "order": request.order_id,
+                        "role": getattr(request, "role", None),
+                        "session_key": getattr(request, "session_key", None),
                     },
                 )
             )

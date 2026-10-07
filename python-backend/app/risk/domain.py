@@ -160,6 +160,8 @@ class SafetyRequest:
     snapshot_ready: bool = True
     snapshot_current: bool = True
     idempotency_key: str | None = None
+    role: str | None = None
+    session_key: str | None = None
 
     @property
     def kind(self) -> ActionKind:
