@@ -109,7 +109,14 @@ def _decode_envelope(response: httpx.Response, operation: str) -> Any:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise BrokerError(BrokerErrorCategory.MALFORMED_RESPONSE, f"Angel One {operation} returned malformed JSON.", operation, status_code=response.status_code, retryable=False) from exc
+        sample = response.text[:200].replace("\n", " ").strip()
+        raise BrokerError(
+            BrokerErrorCategory.MALFORMED_RESPONSE,
+            f"Angel One {operation} returned malformed JSON (HTTP {response.status_code}): {sample!r}",
+            operation,
+            status_code=response.status_code,
+            retryable=False,
+        ) from exc
     return _validate_envelope(payload, response.status_code, operation)
 
 

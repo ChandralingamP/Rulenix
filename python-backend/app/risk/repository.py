@@ -166,6 +166,7 @@ class SafetyRepository:
                     SELECT 1 FROM strategy_execution_intents
                      WHERE user_id=:user AND strategy_key=:strategy AND instrument=:instrument
                        AND (CAST(:role AS varchar) IS NULL OR role=:role)
+                       AND (CAST(:session_key AS varchar) IS NULL OR session_key=:session_key)
                        AND status IN ('pending','claimed','retry_wait','submitted')
                        AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
                 )
@@ -174,7 +175,8 @@ class SafetyRepository:
                         "user": request.user_id,
                         "strategy": request.strategy_key,
                         "instrument": request.instrument,
-                        "role": getattr(request, "role", None),
+                        "role": (getattr(request, "role", None) or "").strip() or None,
+                        "session_key": (getattr(request, "session_key", None) or "").strip() or None,
                         "intent": request.intent_id,
                     },
                 )
@@ -207,9 +209,8 @@ class SafetyRepository:
                      WHERE o.user_id=:user AND o.execution_mode=:mode
                        AND (
                            CASE
-                               WHEN CAST(:role AS varchar) IS NOT NULL OR CAST(:session_key AS varchar) IS NOT NULL THEN (
-                                   (CAST(:role AS varchar) IS NOT NULL AND o.role=:role)
-                                   OR (CAST(:session_key AS varchar) IS NOT NULL AND o.session_key<>:session_key)
+                               WHEN CAST(:role AS varchar) IS NOT NULL THEN (
+                                   o.role=:role AND (CAST(:session_key AS varchar) IS NULL OR o.session_key=:session_key)
                                )
                                ELSE o.role IN ('BUY_ENTRY','SELL_ENTRY')
                            END
@@ -225,8 +226,8 @@ class SafetyRepository:
                         "strategy": request.strategy_key,
                         "instrument": request.instrument,
                         "order": request.order_id,
-                        "role": getattr(request, "role", None),
-                        "session_key": getattr(request, "session_key", None),
+                        "role": (getattr(request, "role", None) or "").strip() or None,
+                        "session_key": (getattr(request, "session_key", None) or "").strip() or None,
                     },
                 )
             )

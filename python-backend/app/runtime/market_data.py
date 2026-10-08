@@ -134,9 +134,11 @@ class MarketDataIngestionService:
                      WHERE u.is_active = TRUE
                        AND p.token_state = 'connected'
                        AND p.last_token_status IN ('success', 'refreshed')
+                       AND (p.token_received_at AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                        AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id = p.user_id AND s.secret_kind = 'api_key')
                        AND EXISTS (SELECT 1 FROM broker_secrets s WHERE s.user_id = p.user_id AND s.secret_kind = 'jwt_token')
-                     ORDER BY CASE WHEN EXISTS (SELECT 1 FROM user_strategy_activations a WHERE a.user_id = p.user_id AND a.is_active = TRUE) THEN 0 ELSE 1 END,
+                     ORDER BY CASE WHEN p.broker_egress_ip_id IS NOT NULL THEN 0 ELSE 1 END,
+                              CASE WHEN EXISTS (SELECT 1 FROM user_strategy_activations a WHERE a.user_id = p.user_id AND a.is_active = TRUE) THEN 0 ELSE 1 END,
                               p.token_received_at DESC NULLS LAST
                      LIMIT 1
                     """)
