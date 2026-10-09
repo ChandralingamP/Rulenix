@@ -876,9 +876,45 @@ class DemoLifecycleWorker:
         self.session_factory = session_factory
 
     async def run_once(self) -> dict[str, object]:
+        expired = await self._expire_stale_orders()
         protected = await self._ensure_protection()
         filled = await self._process_ticks()
-        return {"protected": protected, "filled": filled, "broker_mutations": 0}
+        return {"expired": expired, "protected": protected, "filled": filled, "broker_mutations": 0}
+
+    async def _expire_stale_orders(self) -> int:
+        async with self.session_factory() as session, session.begin():
+            now_ist = datetime.now(IST)
+            minute = now_ist.hour * 60 + now_ist.minute
+            result = await session.execute(
+                text("""
+                UPDATE strategy_orders o
+                   SET status='cancelled',
+                       broker_status='Demo order expired at session close',
+                       updated_at=NOW()
+                 WHERE o.execution_mode='demo'
+                   AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                   AND o.status IN ('pending','submitted')
+                   AND (
+                       o.created_at < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                       OR (o.session_key = 'day' AND :minute >= 920)
+                       OR (o.session_key = 'evening' AND :minute >= 1405)
+                   )
+                RETURNING o.id
+                """),
+                {"minute": minute},
+            )
+            cancelled_ids = result.scalars().all()
+            if cancelled_ids:
+                await session.execute(
+                    text("""
+                    UPDATE strategy_execution_intents
+                       SET status='expired', completed_at=NOW(), updated_at=NOW(),
+                           last_error='Demo entry order cancelled at session close'
+                     WHERE strategy_order_id = ANY(:ids) AND status='submitted'
+                    """),
+                    {"ids": list(cancelled_ids)},
+                )
+            return len(cancelled_ids)
 
     async def _ensure_protection(self) -> int:
         async with self.session_factory() as session:

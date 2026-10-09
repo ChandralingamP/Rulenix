@@ -99,12 +99,24 @@ class TradingRepository:
     async def claim_execution_intents(self, *, limit: int = 100, signal_id: UUID | None = None) -> list[ClaimedIntent]:
         if not 1 <= limit <= 100:
             raise ValueError("Claim limit must be between 1 and 100.")
+        await self.session.execute(text("""
+            UPDATE strategy_execution_intents
+               SET status='expired', completed_at=NOW(), updated_at=NOW(),
+                   last_error=CASE WHEN last_error='' THEN 'Intent expired by deadline' ELSE last_error END
+             WHERE status IN ('pending','retry_wait')
+               AND (
+                   (expires_at IS NOT NULL AND expires_at <= NOW())
+                   OR created_at < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+               )
+        """))
         rows = (await self.session.execute(text("""
             UPDATE strategy_execution_intents
                SET status='claimed', attempts=attempts+1, claimed_at=NOW(), updated_at=NOW()
              WHERE id IN (
                SELECT id FROM strategy_execution_intents
                 WHERE action='ENTRY' AND status IN ('pending','retry_wait') AND next_attempt_at<=NOW()
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                  AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                   AND (CAST(:signal_id AS uuid) IS NULL OR signal_id=CAST(:signal_id AS uuid))
                 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT :limit
              )

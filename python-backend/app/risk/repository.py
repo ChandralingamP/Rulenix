@@ -144,6 +144,8 @@ class SafetyRepository:
                     SELECT 1 FROM strategy_execution_intents
                      WHERE user_id=:user AND trade_id=:trade
                        AND status IN ('pending','claimed','retry_wait','submitted')
+                       AND (expires_at IS NULL OR expires_at > NOW())
+                       AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                        AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
                 ) OR EXISTS(
                     SELECT 1 FROM strategy_reversal_intents
@@ -168,6 +170,8 @@ class SafetyRepository:
                        AND (CAST(:role AS varchar) IS NULL OR role=:role)
                        AND (CAST(:session_key AS varchar) IS NULL OR session_key=:session_key)
                        AND status IN ('pending','claimed','retry_wait','submitted')
+                       AND (expires_at IS NULL OR expires_at > NOW())
+                       AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                        AND (CAST(:intent AS uuid) IS NULL OR id<>CAST(:intent AS uuid))
                 )
             """),
@@ -207,6 +211,7 @@ class SafetyRepository:
                 ) OR EXISTS(
                     SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
                      WHERE o.user_id=:user AND o.execution_mode=:mode
+                       AND o.created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                        AND (
                            CASE
                                WHEN CAST(:role AS varchar) IS NOT NULL THEN (
@@ -277,13 +282,13 @@ class SafetyRepository:
                     await self.session.execute(
                         text("""
                 SELECT COALESCE(SUM(CASE WHEN status='open' THEN total_lots ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(lots) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) lots,
+                       COALESCE((SELECT SUM(lots) FROM strategy_orders WHERE user_id=:user AND execution_mode=:mode AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) lots,
                        COALESCE(SUM(CASE WHEN status='open' THEN quantity ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(quantity) FROM strategy_orders WHERE user_id=:user AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) quantity,
+                       COALESCE((SELECT SUM(quantity) FROM strategy_orders WHERE user_id=:user AND execution_mode=:mode AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) quantity,
                        COUNT(*) FILTER (WHERE status='open') positions
-                  FROM trades WHERE user_id=:user
+                  FROM trades WHERE user_id=:user AND execution_mode=:mode
             """),
-                        {"user": request.user_id, "order": request.order_id},
+                        {"user": request.user_id, "mode": request.execution_mode, "order": request.order_id},
                     )
                 )
                 .mappings()
