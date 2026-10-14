@@ -535,10 +535,10 @@ class AuthoritativeExecutionWorker:
                 "exchange": config.option_exchange,
                 "key": execution_key,
                 "underlying": config.index_token,
-                "buy_target": runner["target_points"] if call else None,
-                "buy_sl1": runner["stop_loss_points"] if call else None,
-                "sell_target": None if call else runner["target_points"],
-                "sell_sl1": None if call else runner["stop_loss_points"],
+                "buy_target": runner["target_points"],
+                "buy_sl1": runner["stop_loss_points"],
+                "sell_target": runner["target_points"],
+                "sell_sl1": runner["stop_loss_points"],
                 "underlying_ltp": selection.underlying_ltp,
             },
         )
@@ -686,12 +686,10 @@ class FillLifecycleWorker:
         trade_id = _order_uuid("trade", order_id)
         strategy = str(order["strategy_key"])
         if strategy == SUPERTREND:
-            if direction == "BUY":
-                target = fill + Decimal(str(order["buy_target"] or 0))
-                sl1 = max(Decimal("0.05"), fill - Decimal(str(order["buy_sl1"] or 0)))
-            else:
-                target = fill - Decimal(str(order["sell_target"] or 0))
-                sl1 = fill + Decimal(str(order["sell_sl1"] or 0))
+            target_pts = Decimal(str(order["buy_target"] or order["sell_target"] or 0))
+            sl_pts = Decimal(str(order["buy_sl1"] or order["sell_sl1"] or 0))
+            target = fill + target_pts
+            sl1 = max(Decimal("0.05"), fill - sl_pts)
             sl2 = None
         else:
             target = Decimal(

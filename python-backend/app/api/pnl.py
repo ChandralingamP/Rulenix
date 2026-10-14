@@ -29,9 +29,50 @@ def _validate(page: int, page_size: int, mode: str) -> None:
 async def _rows(db: AsyncSession, user_id: str, mode: str, limit: int, offset: int) -> list[dict]:
     mode_clause = "" if mode == "all" else "AND t.execution_mode=:mode"
     result = await db.execute(text(f"""
-        SELECT t.id,t.status,t.execution_mode,t.direction,t.quantity,t.entry_price,t.exit_price,t.last_price,t.pnl,
+        SELECT t.id,t.status,t.execution_mode,t.direction,t.quantity,
+               t.entry_price::float8 AS entry_price,
+               t.exit_price::float8 AS exit_price,
+               t.last_price::float8 AS last_price,
+               t.pnl::float8 AS pnl,
+               CASE
+                   WHEN t.status='open' AND t.entry_price IS NOT NULL THEN
+                       t.pnl::float8
+                       + (
+                           CASE
+                               WHEN t.direction='BUY'
+                                   THEN COALESCE(t.last_price,t.entry_price)-t.entry_price
+                               ELSE t.entry_price-COALESCE(t.last_price,t.entry_price)
+                           END
+                       ) * (
+                           CASE
+                               WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='GOLDM'
+                                   THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*10.0,t.quantity::float8/10.0)
+                               WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='GOLDTEN'
+                                   THEN COALESCE(NULLIF(t.remaining_lots,0)::float8,t.quantity::float8/10.0)
+                               WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='SILVERM'
+                                   THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*5.0,t.quantity::float8)
+                               WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='SILVERMIC'
+                                   THEN COALESCE(NULLIF(t.remaining_lots,0)::float8,t.quantity::float8)
+                               WHEN t.strategy_key='futures_breakout_v3' AND t.instrument_label='NATGASMINI'
+                                   THEN COALESCE(NULLIF(t.remaining_lots,0)::float8*250.0,t.quantity::float8)
+                               ELSE t.quantity::float8
+                           END
+                       )
+                   ELSE t.pnl::float8
+               END AS pnl_realtime,
+               CASE t.strategy_key
+                   WHEN 'futures_breakout_v3' THEN 'Futures Breakout v3'
+                   WHEN 'supertrend_index_options_v1' THEN 'SuperTrend Index Options v1'
+                   ELSE COALESCE(NULLIF(t.strategy_key,''),'Manual')
+               END AS strategy_name,
                t.entry_datetime,t.exit_datetime,t.instrument_label,t.contract_symbol,t.notes,t.exit_reason,
-               t.strategy_key,t.total_lots,t.remaining_lots,t.target_price,t.sl1_price,t.sl2_price,
+               t.tp1_exit_price::float8 AS tp1_exit_price,
+               t.tp1_exit_datetime,
+               t.tp1_exit_quantity,
+               t.strategy_key,t.total_lots,t.remaining_lots,
+               t.target_price::float8 AS target_price,
+               t.sl1_price::float8 AS sl1_price,
+               t.sl2_price::float8 AS sl2_price,
                t.safety_status,m.status AS manual_close_status
           FROM trades t LEFT JOIN manual_trade_close_intents m ON m.trade_id=t.id
          WHERE t.user_id=:user {mode_clause}
@@ -46,7 +87,39 @@ async def list_pnl(page: int = Query(1), page_size: int = Query(20), mode: str =
     _validate(page, page_size, mode)
     clause = "" if mode == "all" else "AND execution_mode=:mode"
     params = {"user": user.id, "mode": mode}
-    summary = (await db.execute(text(f"SELECT COUNT(*) AS total,COALESCE(SUM(pnl),0) AS profit FROM trades WHERE user_id=:user {clause}"), params)).mappings().one()
+    summary = (await db.execute(text(f"""
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(
+                   CASE
+                       WHEN status='open' AND entry_price IS NOT NULL THEN
+                           pnl::float8
+                           + (
+                               CASE
+                                   WHEN direction='BUY'
+                                       THEN COALESCE(last_price,entry_price)-entry_price
+                                   ELSE entry_price-COALESCE(last_price,entry_price)
+                               END
+                           ) * (
+                               CASE
+                                   WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDM'
+                                       THEN COALESCE(NULLIF(remaining_lots,0)::float8*10.0,quantity::float8/10.0)
+                                   WHEN strategy_key='futures_breakout_v3' AND instrument_label='GOLDTEN'
+                                       THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8/10.0)
+                                   WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERM'
+                                       THEN COALESCE(NULLIF(remaining_lots,0)::float8*5.0,quantity::float8)
+                                   WHEN strategy_key='futures_breakout_v3' AND instrument_label='SILVERMIC'
+                                       THEN COALESCE(NULLIF(remaining_lots,0)::float8,quantity::float8)
+                                   WHEN strategy_key='futures_breakout_v3' AND instrument_label='NATGASMINI'
+                                       THEN COALESCE(NULLIF(remaining_lots,0)::float8*250.0,quantity::float8)
+                                   ELSE quantity::float8
+                               END
+                           )
+                       ELSE pnl::float8
+                   END
+               ),0)::float8 AS profit
+          FROM trades
+         WHERE user_id=:user {clause}
+    """), params)).mappings().one()
     total = int(summary["total"] or 0)
     profit = summary["profit"] or 0
     total_pages = max(1, (total + page_size - 1) // page_size)

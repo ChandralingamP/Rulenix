@@ -36,9 +36,12 @@ from .market_data import MarketDataIngestionService
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
 
-AUTHORITATIVE_LIFECYCLE_CERTIFIED = os.environ.get(
-    "AUTHORITATIVE_LIFECYCLE_CERTIFIED", "true"
-).strip().lower() in {"true", "1", "yes"}
+def _authoritative_certified() -> bool:
+    return os.environ.get("AUTHORITATIVE_LIFECYCLE_CERTIFIED", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+    }
 
 
 class ProductionRuntime:
@@ -85,7 +88,7 @@ class ProductionRuntime:
     async def start(self) -> None:
         if self.mode is RuntimeMode.OFF:
             return
-        if self.mode is RuntimeMode.AUTHORITATIVE and not AUTHORITATIVE_LIFECYCLE_CERTIFIED:
+        if self.mode is RuntimeMode.AUTHORITATIVE and not _authoritative_certified():
             raise RuntimeError(
                 "Authoritative Python runtime remains disabled until strategy snapshot creation, "
                 "DEMO lifecycle, emergency protection, Rust-oracle, broker-fault and Linux "
@@ -170,6 +173,12 @@ class ProductionRuntime:
                     self.market_data.run_cycle,
                     interval_seconds=60.0,
                     timeout_seconds=45.0,
+                )
+                self.supervisor.start(
+                    "active_contract_ticks",
+                    self.market_data.sync_active_contract_ticks,
+                    interval_seconds=3.0,
+                    timeout_seconds=10.0,
                 )
             self.scheduler.start()
         except Exception:

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.broker.angel.client import AngelClient
 from app.config import Settings
+from app.runtime.market import quote_ltps
 from app.strategy.common import IST
 from app.strategy.futures_breakout import calculate_levels
 from app.strategy.supertrend import parse_expiry
@@ -79,6 +80,19 @@ def select_futures_contract(
         return None
     candidates.sort(key=lambda pair: pair[0])
     return candidates[0][1]
+
+
+def exchange_feed_expected(exchange: str, now: datetime | None = None) -> bool:
+    now_ist = (now or datetime.now(UTC)).astimezone(IST)
+    if now_ist.weekday() >= 5:
+        return False
+    minute = now_ist.hour * 60 + now_ist.minute
+    exch = exchange.upper().strip()
+    if exch in {"NSE", "NFO", "BSE", "BFO"}:
+        return (9 * 60 + 15) <= minute <= (15 * 60 + 30)
+    elif exch == "MCX":
+        return (9 * 60) <= minute <= (23 * 60 + 30)
+    return True
 
 
 class MarketDataIngestionService:
@@ -510,11 +524,102 @@ class MarketDataIngestionService:
             "candles_synced": candles_synced,
         }
 
+    async def sync_active_contract_ticks(self) -> int:
+        """Continuously update market_price_ticks and trades.last_price for active contracts."""
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    text("""
+                    SELECT DISTINCT UPPER(s.exchange_segment) AS exchange_segment, s.contract_token
+                      FROM trades t
+                      JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
+                     WHERE t.status = 'open'
+                       AND s.contract_token IS NOT NULL
+                       AND TRIM(s.contract_token) <> ''
+                    UNION
+                    SELECT DISTINCT UPPER(s.exchange_segment) AS exchange_segment, s.contract_token
+                      FROM strategy_orders o
+                      JOIN strategy_market_snapshots s ON s.id = o.snapshot_id
+                     WHERE o.status IN ('pending', 'submitting', 'ambiguous', 'submitted', 'partially_filled')
+                       AND s.contract_token IS NOT NULL
+                       AND TRIM(s.contract_token) <> ''
+                    """)
+                )
+            ).all()
+
+        if not rows:
+            return 0
+
+        exchange_tokens: dict[str, list[str]] = {}
+        for exch, token in rows:
+            if not exch or not token:
+                continue
+            if not exchange_feed_expected(str(exch)):
+                continue
+            exchange_tokens.setdefault(str(exch).strip(), []).append(str(token).strip())
+
+        if not exchange_tokens:
+            return 0
+
+        active = await self.get_active_broker_client()
+        if not active:
+            logger.debug("No active connected broker session found for tick sync.")
+            return 0
+        _, client = active
+
+        updated_count = 0
+        try:
+            for exchange, tokens in exchange_tokens.items():
+                for i in range(0, len(tokens), 50):
+                    chunk = tokens[i : i + 50]
+                    try:
+                        payload = await client.rest.quote("LTP", {exchange: chunk})
+                    except Exception as exc:
+                        logger.warning("Failed fetching LTP quote for %s tokens: %s", exchange, exc)
+                        continue
+
+                    prices = quote_ltps(payload)
+                    if not prices:
+                        continue
+
+                    async with self.session_factory() as session, session.begin():
+                        for token, price in prices.items():
+                            if price is None or price <= 0:
+                                continue
+                            p_float = float(price)
+                            await session.execute(
+                                text("""
+                                INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
+                                VALUES (:exchange, :token, :price, NOW())
+                                ON CONFLICT (exchange_segment, contract_token) DO UPDATE
+                                  SET price = EXCLUDED.price, received_at = NOW()
+                                """),
+                                {"exchange": exchange, "token": token, "price": p_float},
+                            )
+                            await session.execute(
+                                text("""
+                                UPDATE trades t
+                                   SET last_price = :price, updated_at = NOW()
+                                  FROM strategy_market_snapshots s
+                                 WHERE t.strategy_snapshot_id = s.id
+                                   AND t.status = 'open'
+                                   AND UPPER(s.exchange_segment) = :exchange
+                                   AND s.contract_token = :token
+                                """),
+                                {"exchange": exchange, "token": token, "price": p_float},
+                            )
+                            updated_count += 1
+        finally:
+            await client.close()
+
+        return updated_count
+
 
 __all__ = [
     "FUTURES_INSTRUMENTS",
     "INDEX_INSTRUMENTS",
     "MarketDataIngestionService",
+    "exchange_feed_expected",
     "select_futures_contract",
     "weekdays_until",
 ]

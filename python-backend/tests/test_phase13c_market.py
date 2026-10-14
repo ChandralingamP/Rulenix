@@ -139,3 +139,39 @@ async def test_supertrend_market_skips_unquoteable_nearest_candidate() -> None:
             trade_date=date(2026, 8, 19),
         )
     assert selected.contract.token == "fallback"
+
+
+def test_exchange_feed_expected_hours_and_weekdays() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.runtime.market_data import exchange_feed_expected
+
+    ist = ZoneInfo("Asia/Kolkata")
+    # Saturday 11:00 AM IST
+    saturday = datetime(2026, 10, 10, 11, 0, tzinfo=ist)
+    assert not exchange_feed_expected("NSE", saturday)
+    assert not exchange_feed_expected("MCX", saturday)
+
+    # Monday 08:30 AM IST (pre-market)
+    monday_pre = datetime(2026, 10, 12, 8, 30, tzinfo=ist)
+    assert not exchange_feed_expected("NSE", monday_pre)
+    assert not exchange_feed_expected("NFO", monday_pre)
+    assert not exchange_feed_expected("MCX", monday_pre)
+
+    # Monday 10:30 AM IST (market open)
+    monday_open = datetime(2026, 10, 12, 10, 30, tzinfo=ist)
+    assert exchange_feed_expected("NSE", monday_open)
+    assert exchange_feed_expected("NFO", monday_open)
+    assert exchange_feed_expected("BFO", monday_open)
+    assert exchange_feed_expected("MCX", monday_open)
+
+    # Monday 16:00 IST (equity closed, MCX open)
+    monday_eve = datetime(2026, 10, 12, 16, 0, tzinfo=ist)
+    assert not exchange_feed_expected("NSE", monday_eve)
+    assert not exchange_feed_expected("NFO", monday_eve)
+    assert exchange_feed_expected("MCX", monday_eve)
+
+    # Monday 23:45 IST (MCX closed)
+    monday_night = datetime(2026, 10, 12, 23, 45, tzinfo=ist)
+    assert not exchange_feed_expected("MCX", monday_night)
+

@@ -281,12 +281,27 @@ class SafetyRepository:
                 (
                     await self.session.execute(
                         text("""
-                SELECT COALESCE(SUM(CASE WHEN status='open' THEN total_lots ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(lots) FROM strategy_orders WHERE user_id=:user AND execution_mode=:mode AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) lots,
-                       COALESCE(SUM(CASE WHEN status='open' THEN quantity ELSE 0 END),0) +
-                       COALESCE((SELECT SUM(quantity) FROM strategy_orders WHERE user_id=:user AND execution_mode=:mode AND role IN ('BUY_ENTRY','SELL_ENTRY') AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling') AND created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND (CAST(:order AS uuid) IS NULL OR id<>CAST(:order AS uuid))),0) quantity,
-                       COUNT(*) FILTER (WHERE status='open') positions
-                  FROM trades WHERE user_id=:user AND execution_mode=:mode
+                WITH pending_by_session AS (
+                    SELECT o.snapshot_id, o.session_key,
+                           MAX(CASE WHEN o.role = 'BUY_ENTRY' THEN o.lots ELSE 0 END) AS buy_lots,
+                           MAX(CASE WHEN o.role = 'SELL_ENTRY' THEN o.lots ELSE 0 END) AS sell_lots,
+                           MAX(CASE WHEN o.role = 'BUY_ENTRY' THEN o.quantity ELSE 0 END) AS buy_qty,
+                           MAX(CASE WHEN o.role = 'SELL_ENTRY' THEN o.quantity ELSE 0 END) AS sell_qty
+                      FROM strategy_orders o
+                     WHERE o.user_id = :user AND o.execution_mode = :mode
+                       AND o.role IN ('BUY_ENTRY', 'SELL_ENTRY')
+                       AND o.status IN ('pending', 'submitting', 'ambiguous', 'submitted', 'partially_filled', 'processing', 'cancelling')
+                       AND o.created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                       AND (CAST(:order AS uuid) IS NULL OR o.id <> CAST(:order AS uuid))
+                     GROUP BY o.snapshot_id, o.session_key
+                )
+                SELECT COALESCE(SUM(CASE WHEN t.status = 'open' THEN t.total_lots ELSE 0 END), 0) +
+                       COALESCE((SELECT SUM(GREATEST(buy_lots, sell_lots)) FROM pending_by_session), 0) AS lots,
+                       COALESCE(SUM(CASE WHEN t.status = 'open' THEN t.quantity ELSE 0 END), 0) +
+                       COALESCE((SELECT SUM(GREATEST(buy_qty, sell_qty)) FROM pending_by_session), 0) AS quantity,
+                       COUNT(*) FILTER (WHERE t.status = 'open') AS positions
+                  FROM trades t
+                 WHERE t.user_id = :user AND t.execution_mode = :mode
             """),
                         {"user": request.user_id, "mode": request.execution_mode, "order": request.order_id},
                     )

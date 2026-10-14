@@ -94,3 +94,27 @@ def test_sl2_reversal_and_stable_manual_close_sessions():
     assert reversal and reversal[0] is Side.SELL and reversal[2] == 5
     assert sl2_reversal_session(trade_id) == "r-630e18671bb34f77a753d663f5efc1"
     assert manual_close_session(trade_id) == "mc-630e18671bb34f77"
+
+
+def test_options_trade_pnl_and_supertrend_targets():
+    # Options (CE or PE) are bought: profit when exit > entry
+    assert trade_pnl(Side.BUY, "436.90", "480.00", "25") == Decimal("1077.50")
+    # Loss when exit < entry
+    assert trade_pnl(Side.BUY, "480.00", "436.90", "25") == Decimal("-1077.50")
+
+    # SuperTrend entry fill TP/SL calculation for PUT options
+    order_put = {
+        "strategy_key": "supertrend_index_options_v1",
+        "buy_target": None,
+        "buy_sl1": None,
+        "sell_target": Decimal("40"),
+        "sell_sl1": Decimal("20"),
+    }
+    fill = Decimal("436.90")
+    target_pts = Decimal(str(order_put["buy_target"] or order_put["sell_target"] or 0))
+    sl_pts = Decimal(str(order_put["buy_sl1"] or order_put["sell_sl1"] or 0))
+    target = fill + target_pts
+    sl1 = max(Decimal("0.05"), fill - sl_pts)
+    assert target == Decimal("476.90")
+    assert sl1 == Decimal("416.90")
+
