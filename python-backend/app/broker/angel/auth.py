@@ -106,6 +106,22 @@ def _transport_error(operation: str, exc: Exception, retryable: bool) -> BrokerE
 
 
 def _decode_envelope(response: httpx.Response, operation: str) -> Any:
+    text_content = response.text or ""
+    text_lower = text_content.lower()
+    if response.status_code in {403, 429} and (
+        "access rate" in text_lower
+        or "rate limit" in text_lower
+        or "exceeding access rate" in text_lower
+    ):
+        raise BrokerError(
+            BrokerErrorCategory.RATE_LIMITED,
+            "Angel One rate limit is active.",
+            operation,
+            status_code=response.status_code,
+            retry_after_seconds=90,
+            retryable=False,
+            raw={"message": text_content},
+        )
     try:
         payload = response.json()
     except ValueError as exc:

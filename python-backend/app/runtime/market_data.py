@@ -185,6 +185,8 @@ class MarketDataIngestionService:
             except Exception as exc:
                 logger.warning("Failed fetching 5-min candles for %s: %s", instrument_name, exc)
                 continue
+            finally:
+                await asyncio.sleep(0.4)
 
             if not isinstance(raw_candles, list):
                 continue
@@ -281,11 +283,28 @@ class MarketDataIngestionService:
                 logger.warning("Invalid contract fields for %s: %s", instrument, exc)
                 continue
 
+            async with self.session_factory() as session:
+                existing_snap = (
+                    await session.execute(
+                        text("""
+                        SELECT 1 FROM strategy_market_snapshots
+                         WHERE strategy_key = 'futures_breakout_v3'
+                           AND instrument = :instrument
+                           AND trade_date = :trade_date
+                        """),
+                        {"instrument": instrument, "trade_date": trade_date},
+                    )
+                ).scalar()
+            if existing_snap:
+                continue
+
             try:
                 raw_candles = await client.rest.candles("MCX", token, "ONE_DAY", from_str, to_str)
             except Exception as exc:
                 logger.warning("Failed fetching daily candles for %s: %s", instrument, exc)
                 continue
+            finally:
+                await asyncio.sleep(0.4)
 
             daily_candles: list[tuple[date, float, float, float]] = []
             if isinstance(raw_candles, list):

@@ -90,3 +90,17 @@ async def test_login_uses_rust_contract_and_returns_scoped_tokens():
     assert session.user_id == "a"
     assert session.jwt_token.get_secret_value() == "new-jwt"
     assert session.credential_revision == 5
+
+
+@pytest.mark.asyncio
+async def test_plain_text_rate_limit_recognized_as_rate_limited():
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Access denied because of exceeding access rate")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = AngelRestClient("http://angel.test", account("a"), http)
+        with pytest.raises(BrokerError) as caught:
+            await client.candles("NSE", "1", "FIVE_MINUTE", "2026-01-01 09:15", "2026-01-01 09:20")
+    assert caught.value.category is BrokerErrorCategory.RATE_LIMITED
+    assert caught.value.retry_after_seconds == 90
+
