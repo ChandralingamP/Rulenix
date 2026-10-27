@@ -5,7 +5,22 @@ frontend/dist/
 # Rust
 backend/target/
 backend/.env
+backend/.env.local
+backend/.env.production
+backend/.env.staging
 backend/logs/*.log
+
+# Secrets & Keys
+secrets/
+*.dump.enc
+
+# Python Caches & Environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
 
 # Editors / OS
 .idea/
@@ -16,3 +31,21 @@ Thumbs.db
 Futures_Breakout_Strategy_Spec_v3.pdf
 Prompts.txt
 Expense.txt
+
+# Non-Production Migration Scratch & Experimental Scripts
+backend/NewPromt_Rust_to_python.txt
+backend/migration_rust_to_python.txt
+scripts/start-python-production.ps1
+PYTHON_MIGRATION_MASTER.md
+
+# Non-Production Local Operational & Blocker Reports
+ANGEL_EGRESS_DEPLOYMENT_BLOCKED_REPORT.md
+GLOBAL_KILL_SWITCH_DEPLOYMENT_BLOCKED_REPORT.md
+PRODUCTION_NO_TRADE_AUDIT_2026-09-18.md
+
+# Non-Production Master Audit Reports (October 2026)
+docs/audit/RULENIX_SYSTEM_DESIGN_AND_ARCHITECTURE_AUDIT.md
+docs/audit/RULENIX_CLEANUP_MANIFEST.md
+docs/audit/RULENIX_SYSTEM_DESIGN_CHECKLIST.md
+docs/audit/RULENIX_CAPACITY_AND_SCALABILITY_ASSESSMENT.md
+docs/audit/RULENIX_REMEDIATION_ROADMAP.md
