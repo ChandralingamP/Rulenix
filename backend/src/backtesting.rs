@@ -554,6 +554,7 @@ pub(crate) async fn fetch_and_cache(
         let chunk_to = (cursor + Duration::days(chunk_days)).min(to);
         let raw = angel::get_candles_with_exchange_interval(
             state,
+            user_id,
             &credentials.api_key,
             &credentials.jwt_token,
             &contract.exchange,

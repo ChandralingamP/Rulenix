@@ -6,6 +6,10 @@ COPY migrations ./migrations
 COPY src ./src
 RUN cargo build --release --locked
 
+FROM debian:bookworm-slim AS egress-helper-artifact
+COPY --from=builder /app/target/release/rulenix-egress-helper /usr/local/sbin/rulenix-egress-helper
+ENTRYPOINT ["/usr/local/sbin/rulenix-egress-helper"]
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \

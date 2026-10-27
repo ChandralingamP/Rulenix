@@ -24,9 +24,11 @@ services:
       - ./backend/.env.production
     environment:
       RULENIX_LOG_DIR: /var/log/rulenix
+      EGRESS_HELPER_SOCKET: /run/rulenix-egress/helper.sock
     volumes:
       - ./secrets/postgres_ca.crt:/run/secrets/postgres_ca.crt:ro
       - backend_logs:/var/log/rulenix
+      - /run/rulenix-egress:/run/rulenix-egress
     depends_on:
       postgres:
         condition: service_healthy

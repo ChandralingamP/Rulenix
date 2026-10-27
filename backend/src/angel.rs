@@ -354,6 +354,7 @@ fn authenticated_headers(state: &AppState, api_key: &str, jwt_token: &str) -> Ap
 
 pub async fn create_session(
     state: &AppState,
+    user_id: uuid::Uuid,
     client_code: &str,
     api_key: &str,
     mpin: &str,
@@ -364,10 +365,10 @@ pub async fn create_session(
         return Err(rate_limit_error(seconds));
     }
     let endpoint = format!("{}{path}", state.config.angel_api_base);
+    let http = crate::egress::http_client_for_user(state, user_id).await?;
     let mut response = None;
     for attempt in 0..2 {
-        match state
-            .http
+        match http
             .post(&endpoint)
             .timeout(std::time::Duration::from_secs(8))
             .headers(base_headers(state, api_key)?)
@@ -440,6 +441,7 @@ pub async fn create_session(
 
 pub async fn market_quote(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     mode: &str,
@@ -460,6 +462,7 @@ pub async fn market_quote(
     .await;
     secure_json(
         state,
+        user_id,
         reqwest::Method::POST,
         "/rest/secure/angelbroking/market/v1/quote",
         api_key,
@@ -471,6 +474,7 @@ pub async fn market_quote(
 
 async fn secure_json(
     state: &AppState,
+    user_id: uuid::Uuid,
     method: reqwest::Method,
     path: &str,
     api_key: &str,
@@ -480,8 +484,8 @@ async fn secure_json(
     if let Some(seconds) = cooldown_remaining(state, api_key, path).await {
         return Err(rate_limit_error(seconds));
     }
-    let mut request = state
-        .http
+    let http = crate::egress::http_client_for_user(state, user_id).await?;
+    let mut request = http
         .request(method, format!("{}{}", state.config.angel_api_base, path))
         .headers(authenticated_headers(state, api_key, jwt_token)?);
     if let Some(body) = body {
@@ -536,6 +540,7 @@ async fn secure_json(
 #[allow(clippy::too_many_arguments)]
 pub async fn get_candles_with_exchange_interval(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     exchange: &str,
@@ -565,6 +570,7 @@ pub async fn get_candles_with_exchange_interval(
     for attempt in 0..2 {
         match secure_json(
             state,
+            user_id,
             reqwest::Method::POST,
             "/rest/secure/angelbroking/historical/v1/getCandleData",
             api_key,
@@ -628,6 +634,7 @@ fn order_payload(order: &OrderRequest<'_>) -> Value {
 
 pub async fn place_order(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     order: &OrderRequest<'_>,
@@ -638,7 +645,8 @@ pub async fn place_order(
     }
     wait_for_order_capacity(state, api_key).await;
     let body = order_payload(order);
-    let response=state.http.post(format!("{}{path}",state.config.angel_api_base))
+    let http=crate::egress::http_client_for_user(state,user_id).await.map_err(|error|BrokerError{class:BrokerErrorClass::Rejected,status:None,code:"egress_unavailable".into(),message:error.to_string(),diagnostic:"Explicit Angel source binding could not be established; no default-route fallback was attempted.".into()})?;
+    let response=http.post(format!("{}{path}",state.config.angel_api_base))
         .headers(authenticated_headers(state,api_key,jwt_token).map_err(|e|BrokerError{class:BrokerErrorClass::Authentication,status:None,code:"invalid_headers".into(),message:e.to_string(),diagnostic:String::new()})?)
         .json(&body).send().await.map_err(|error|BrokerError{class:classify_transport(&error),status:error.status().map(|s|s.as_u16()),code:"transport".into(),message:if error.is_connect(){"Angel One could not be reached before submission.".into()}else{"Angel One submission outcome is unknown and will be reconciled; it will not be retried automatically.".into()},diagnostic:redact_sensitive(&error.to_string(),&[api_key,jwt_token])})?;
     let retry_after = retry_after_seconds(response.headers());
@@ -698,6 +706,7 @@ pub async fn place_order(
 
 pub async fn cancel_order(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     order_id: &str,
@@ -706,6 +715,7 @@ pub async fn cancel_order(
     wait_for_order_capacity(state, api_key).await;
     secure_json(
         state,
+        user_id,
         reqwest::Method::POST,
         "/rest/secure/angelbroking/order/v1/cancelOrder",
         api_key,
@@ -716,7 +726,12 @@ pub async fn cancel_order(
     Ok(())
 }
 
-pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+pub async fn order_book(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    api_key: &str,
+    jwt_token: &str,
+) -> AppResult<Value> {
     wait_for_request_capacity(
         state,
         api_key,
@@ -726,6 +741,7 @@ pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> App
     .await;
     secure_json(
         state,
+        user_id,
         reqwest::Method::GET,
         "/rest/secure/angelbroking/order/v1/getOrderBook",
         api_key,
@@ -735,7 +751,12 @@ pub async fn order_book(state: &AppState, api_key: &str, jwt_token: &str) -> App
     .await
 }
 
-pub async fn positions(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+pub async fn positions(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    api_key: &str,
+    jwt_token: &str,
+) -> AppResult<Value> {
     wait_for_request_capacity(
         state,
         api_key,
@@ -745,6 +766,7 @@ pub async fn positions(state: &AppState, api_key: &str, jwt_token: &str) -> AppR
     .await;
     secure_json(
         state,
+        user_id,
         reqwest::Method::GET,
         "/rest/secure/angelbroking/order/v1/getPosition",
         api_key,
@@ -754,7 +776,12 @@ pub async fn positions(state: &AppState, api_key: &str, jwt_token: &str) -> AppR
     .await
 }
 
-pub async fn rms_limits(state: &AppState, api_key: &str, jwt_token: &str) -> AppResult<Value> {
+pub async fn rms_limits(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    api_key: &str,
+    jwt_token: &str,
+) -> AppResult<Value> {
     wait_for_request_capacity(
         state,
         api_key,
@@ -764,6 +791,7 @@ pub async fn rms_limits(state: &AppState, api_key: &str, jwt_token: &str) -> App
     .await;
     secure_json(
         state,
+        user_id,
         reqwest::Method::GET,
         "/rest/secure/angelbroking/user/v1/getRMS",
         api_key,
@@ -775,6 +803,7 @@ pub async fn rms_limits(state: &AppState, api_key: &str, jwt_token: &str) -> App
 
 pub async fn margin_required(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     position: Value,
@@ -788,6 +817,7 @@ pub async fn margin_required(
     .await;
     let value = secure_json(
         state,
+        user_id,
         reqwest::Method::POST,
         "/rest/secure/angelbroking/margin/v1/batch",
         api_key,
@@ -904,6 +934,7 @@ pub fn is_invalid_api_key_error(message: &str) -> bool {
 
 pub async fn refresh_session(
     state: &AppState,
+    user_id: uuid::Uuid,
     api_key: &str,
     jwt_token: &str,
     refresh_token: &str,
@@ -922,9 +953,12 @@ pub async fn refresh_session(
         Err(error) => return RefreshCheck::Unavailable(error.to_string()),
     };
     let endpoint = format!("{}{path}", state.config.angel_api_base);
+    let http = match crate::egress::http_client_for_user(state, user_id).await {
+        Ok(client) => client,
+        Err(error) => return RefreshCheck::Unavailable(error.to_string()),
+    };
     for attempt in 0..2 {
-        let response = state
-            .http
+        let response = http
             .post(&endpoint)
             .headers(headers.clone())
             .json(&json!({"refreshToken":refresh_token}))

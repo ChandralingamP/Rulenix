@@ -8,7 +8,7 @@ function Test-Port([int]$Port) {
 }
 
 if (-not (Test-Port 8080)) {
-    $backend = Start-Process cargo.exe -ArgumentList @("run") `
+    $backend = Start-Process cargo.exe -ArgumentList @("run", "--bin", "rulenix-backend") `
         -WorkingDirectory (Join-Path $root "backend") -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logDirectory "backend.out.log") `
         -RedirectStandardError (Join-Path $logDirectory "backend.err.log") -PassThru

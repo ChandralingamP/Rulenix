@@ -1443,6 +1443,7 @@ async fn shared_market_quote(
     for (attempt, credential) in credentials.into_iter().enumerate() {
         match angel::market_quote(
             state,
+            credential.profile_id,
             &credential.credentials.api_key,
             &credential.credentials.jwt_token,
             mode,
@@ -1498,6 +1499,7 @@ async fn shared_market_candles(
     for (attempt, credential) in credentials.into_iter().enumerate() {
         match angel::get_candles_with_exchange_interval(
             state,
+            credential.profile_id,
             &credential.credentials.api_key,
             &credential.credentials.jwt_token,
             exchange,
@@ -2920,6 +2922,76 @@ fn entry_intent_retryable(message: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
+const FUTURES_PRICE_BAND_RETRY_SECONDS: i32 = 5 * 60;
+
+fn is_futures_breakout_entry(
+    strategy_key: &str,
+    action: &str,
+    role: &str,
+    order_type: &str,
+) -> bool {
+    strategy_key == STRATEGY_KEY
+        && action == "ENTRY"
+        && matches!(role, "BUY_ENTRY" | "SELL_ENTRY")
+        && order_type == "STOPLOSS_LIMIT"
+}
+
+fn futures_entry_waits_for_price_band(
+    strategy_key: &str,
+    action: &str,
+    role: &str,
+    order_type: &str,
+    message: &str,
+) -> bool {
+    is_futures_breakout_entry(strategy_key, action, role, order_type)
+        && (message.contains("outside Angel One circuit limits")
+            || message.contains("did not include authoritative circuit limits"))
+}
+
+fn futures_entry_waits_for_api_capacity(intent: &ExecutionIntent, message: &str) -> bool {
+    is_futures_breakout_entry(
+        &intent.strategy_key,
+        &intent.action,
+        &intent.role,
+        &intent.order_type,
+    ) && angel::is_rate_limit_error(message)
+}
+
+fn entry_intent_retry_delay(
+    intent: &ExecutionIntent,
+    message: &str,
+    now: DateTime<Utc>,
+) -> Option<i32> {
+    let waiting_for_price_band = futures_entry_waits_for_price_band(
+        &intent.strategy_key,
+        &intent.action,
+        &intent.role,
+        &intent.order_type,
+        message,
+    );
+    let waiting_for_api_capacity = futures_entry_waits_for_api_capacity(intent, message);
+    let waiting_until_expiry = waiting_for_price_band || waiting_for_api_capacity;
+    let expires_at = intent.expires_at;
+    if expires_at.is_some_and(|expires| expires <= now)
+        || (waiting_until_expiry && expires_at.is_none())
+    {
+        return None;
+    }
+    if !waiting_until_expiry && (!entry_intent_retryable(message) || intent.attempts >= 12) {
+        return None;
+    }
+    let mut delay = if waiting_for_price_band {
+        FUTURES_PRICE_BAND_RETRY_SECONDS
+    } else {
+        recoverable_retry_delay_seconds(message, intent.attempts)
+    };
+    if let Some(expires_at) = expires_at {
+        let remaining = (expires_at - now).num_seconds().max(15) as i32;
+        delay = delay.min((remaining / 3).max(15));
+    }
+    Some(delay)
+}
+
 async fn execute_entry_intent(state: &AppState, intent: ExecutionIntent) {
     let result: AppResult<Option<(Uuid, String, String)>> = async {
         if intent.action != "ENTRY" {
@@ -3038,17 +3110,22 @@ async fn execute_entry_intent(state: &AppState, intent: ExecutionIntent) {
         }
         Err(error) => {
             let message = error.to_string();
-            let retryable = entry_intent_retryable(&message)
-                && intent.attempts < 12
-                && intent.expires_at.is_none_or(|expires| expires > Utc::now());
-            let mut delay = recoverable_retry_delay_seconds(&message, intent.attempts);
-            if let Some(expires_at) = intent.expires_at {
-                let remaining = (expires_at - Utc::now()).num_seconds().max(15) as i32;
-                delay = delay.min((remaining / 3).max(15));
-            }
+            let waiting_for_price_band = futures_entry_waits_for_price_band(
+                &intent.strategy_key,
+                &intent.action,
+                &intent.role,
+                &intent.order_type,
+                &message,
+            );
+            let waiting_for_api_capacity = futures_entry_waits_for_api_capacity(&intent, &message);
+            let waiting_without_consuming_attempt =
+                waiting_for_price_band || waiting_for_api_capacity;
+            let delay = entry_intent_retry_delay(&intent, &message, Utc::now());
+            let retryable = delay.is_some();
+            let delay = delay.unwrap_or_default();
             let status = if retryable { "retry_wait" } else { "failed" };
-            if let Err(database_error) = sqlx::query("UPDATE strategy_execution_intents SET status=$2,next_attempt_at=CASE WHEN $2='retry_wait' THEN NOW()+($3::text || ' seconds')::interval ELSE next_attempt_at END,last_error=$4,completed_at=CASE WHEN $2='failed' THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=$1")
-                .bind(intent.id).bind(status).bind(delay).bind(&message).execute(&state.db).await {
+            if let Err(database_error) = sqlx::query("UPDATE strategy_execution_intents SET status=$2,next_attempt_at=CASE WHEN $2='retry_wait' THEN NOW()+($3::text || ' seconds')::interval ELSE next_attempt_at END,last_error=$4,attempts=CASE WHEN $5 THEN GREATEST(attempts-1,0) ELSE attempts END,completed_at=CASE WHEN $2='failed' THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=$1")
+                .bind(intent.id).bind(status).bind(delay).bind(&message).bind(waiting_without_consuming_attempt).execute(&state.db).await {
                 tracing::warn!(intent_id=%intent.id,%database_error,"could not persist execution intent failure");
             }
             operational_alert_for(
@@ -3250,6 +3327,7 @@ fn broker_available_funds(value: &Value) -> Option<f64> {
 
 async fn validate_live_order_price_band(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     order: &NewOrder,
@@ -3262,6 +3340,7 @@ async fn validate_live_order_price_band(
     token_map.insert(snapshot.exchange_segment.clone(), json!([token]));
     let quote = angel::market_quote(
         state,
+        user_id,
         &credentials.api_key,
         &credentials.jwt_token,
         "FULL",
@@ -3295,6 +3374,7 @@ async fn validate_live_order_price_band(
 
 async fn validate_live_entry_margin(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     order: &NewOrder,
@@ -3306,6 +3386,7 @@ async fn validate_live_entry_margin(
         .ok_or_else(|| AppError::BadRequest("Snapshot has no contract token.".into()))?;
     let required = angel::margin_required(
         state,
+        user_id,
         &credentials.api_key,
         &credentials.jwt_token,
         json!({
@@ -3319,7 +3400,8 @@ async fn validate_live_entry_margin(
         }),
     )
     .await?;
-    let rms = angel::rms_limits(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let rms =
+        angel::rms_limits(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let available = broker_available_funds(&rms).ok_or_else(|| {
         AppError::BadRequest("Angel One RMS response has no valid available-funds field.".into())
     })?;
@@ -3335,11 +3417,13 @@ async fn validate_live_entry_margin(
 
 async fn confirm_original_terminal_nonfill(
     state: &AppState,
+    user_id: Uuid,
     credentials: &crate::credentials::BrokerCredentials,
     snapshot: &Snapshot,
     client_order_id: &str,
 ) -> AppResult<bool> {
-    let orders = angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let orders =
+        angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let order_book_nonfill = if let Some(item) = orders
         .as_array()
         .into_iter()
@@ -3365,7 +3449,8 @@ async fn confirm_original_terminal_nonfill(
         // the order book is acceptable only when the position book is flat.
         true
     };
-    let positions = angel::positions(state, &credentials.api_key, &credentials.jwt_token).await?;
+    let positions =
+        angel::positions(state, user_id, &credentials.api_key, &credentials.jwt_token).await?;
     let exchange = snapshot.exchange_segment.to_uppercase();
     let token = snapshot.contract_token.as_deref().unwrap_or("");
     Ok(order_book_nonfill
@@ -3547,7 +3632,8 @@ async fn place_strategy_order_inner(
     if has_actionable_price
         && let Some(credentials) = entry_credentials.as_ref()
         && let Err(error) =
-            validate_live_order_price_band(state, credentials, snapshot, &order).await
+            validate_live_order_price_band(state, runner.user_id, credentials, snapshot, &order)
+                .await
     {
         let outside_band = error
             .to_string()
@@ -3576,8 +3662,15 @@ async fn place_strategy_order_inner(
     }
     if !protective
         && let Some(credentials) = entry_credentials.as_ref()
-        && let Err(error) =
-            validate_live_entry_margin(state, credentials, snapshot, &order, quantity).await
+        && let Err(error) = validate_live_entry_margin(
+            state,
+            runner.user_id,
+            credentials,
+            snapshot,
+            &order,
+            quantity,
+        )
+        .await
     {
         operational_alert_for(
             state,
@@ -3595,7 +3688,14 @@ async fn place_strategy_order_inner(
         let credentials = entry_credentials
             .as_ref()
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("entry credentials missing")))?;
-        match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await {
+        match angel::order_book(
+            state,
+            runner.user_id,
+            &credentials.api_key,
+            &credentials.jwt_token,
+        )
+        .await
+        {
             Ok(_) => {
                 live_reconciled = true;
                 risk::set_reconciliation_health(
@@ -3795,6 +3895,7 @@ async fn place_strategy_order_inner(
         } else {
             angel::place_order(
                 state,
+                runner.user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &angel::OrderRequest {
@@ -3901,6 +4002,7 @@ async fn place_strategy_order_inner(
                 match entry_credentials.as_ref() {
                     Some(credentials) => confirm_original_terminal_nonfill(
                         state,
+                        runner.user_id,
                         credentials,
                         snapshot,
                         &client_order_id,
@@ -4345,6 +4447,7 @@ async fn cancel_supertrend_active_entries_for_side(
             };
             match angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -7258,13 +7361,14 @@ fn reconciled_state(status: &str, filled: i32) -> &'static str {
 
 async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
     let credentials = state.credentials.load(user_id).await?;
-    let values = match angel::order_book(state, &credentials.api_key, &credentials.jwt_token).await
-    {
-        Ok(values) => values,
-        Err(error) => {
-            let _ =
-                risk::set_reconciliation_health(state, user_id, false, &error.to_string()).await;
-            operational_alert(
+    let values =
+        match angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token).await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                let _ = risk::set_reconciliation_health(state, user_id, false, &error.to_string())
+                    .await;
+                operational_alert(
                 state,
                 Some(user_id),
                 "",
@@ -7275,11 +7379,16 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
                 ),
             )
             .await;
-            return Ok(());
-        }
-    };
-    let positions = match angel::positions(state, &credentials.api_key, &credentials.jwt_token)
-        .await
+                return Ok(());
+            }
+        };
+    let positions = match angel::positions(
+        state,
+        user_id,
+        &credentials.api_key,
+        &credentials.jwt_token,
+    )
+    .await
     {
         Ok(values) => values,
         Err(error) => {
@@ -7403,6 +7512,7 @@ async fn reconcile_live_user(state: &AppState, user_id: Uuid) -> AppResult<()> {
             };
             match angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 broker_id,
@@ -7950,6 +8060,7 @@ async fn cancel_exit_orders(
             };
             if let Err(error) = angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -8192,6 +8303,7 @@ async fn clear_entry_orders_for_sl2_reversal(
         let credentials = state.credentials.load(intent.user_id).await?;
         angel::cancel_order(
             state,
+            intent.user_id,
             &credentials.api_key,
             &credentials.jwt_token,
             &broker_id,
@@ -8302,6 +8414,7 @@ async fn cancel_active_breakout_entry_orders(
             };
             angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -9808,6 +9921,7 @@ pub async fn finish_kill_cancellations(
             let credentials = state.credentials.load(user_id).await?;
             if let Err(error) = angel::cancel_order(
                 state,
+                user_id,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -10256,6 +10370,7 @@ async fn cancel_pending_entries(state: &AppState, user: Uuid, strategy_key: &str
             })?;
             if let Err(error) = angel::cancel_order(
                 state,
+                user,
                 &credentials.api_key,
                 &credentials.jwt_token,
                 &broker_id,
@@ -10649,6 +10764,7 @@ mod tests {
         place_modes: Arc<tokio::sync::Mutex<VecDeque<FakePlaceMode>>>,
         cancel_modes: Arc<tokio::sync::Mutex<VecDeque<FakeCancelMode>>>,
         quote_ltps: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
+        quote_price_bands: Arc<tokio::sync::Mutex<HashMap<String, (f64, f64)>>>,
         quote_unavailable: Arc<tokio::sync::Mutex<bool>>,
     }
 
@@ -10795,14 +10911,19 @@ mod tests {
             .map(str::to_owned)
             .collect();
         let configured = fake.quote_ltps.lock().await;
+        let price_bands = fake.quote_price_bands.lock().await;
         let fetched: Vec<Value> = requested
             .iter()
             .map(|token| {
+                let (lower_circuit, upper_circuit) = price_bands
+                    .get(token)
+                    .copied()
+                    .unwrap_or((0.05, 1_000_000.0));
                 json!({
                     "symbolToken":token,
                     "ltp":configured.get(token).copied().unwrap_or(100.0),
-                    "lowerCircuit":0.05,
-                    "upperCircuit":1_000_000.0
+                    "lowerCircuit":lower_circuit,
+                    "upperCircuit":upper_circuit
                 })
             })
             .collect();
@@ -13240,6 +13361,7 @@ mod tests {
         assert!(
             !confirm_original_terminal_nonfill(
                 &state,
+                user_id,
                 &credentials,
                 &snapshot,
                 "missing-client-tag"
@@ -13251,6 +13373,7 @@ mod tests {
         assert!(
             confirm_original_terminal_nonfill(
                 &state,
+                user_id,
                 &credentials,
                 &snapshot,
                 "missing-client-tag"
@@ -13627,6 +13750,166 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
+    async fn futures_entry_waits_for_live_circuit_relaxation_then_submits_original_price() {
+        let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
+        let state = isolated_test_state_with_broker(&broker_url).await;
+        let (sell, buy) = seed_concurrent_futures_fill(&state, 10_004).await;
+        sqlx::query("DELETE FROM strategy_orders WHERE user_id=$1")
+            .bind(sell.user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE strategy_market_snapshots SET trade_date=$2,fetched_at=NOW() WHERE id=$1",
+        )
+        .bind(sell.snapshot_id)
+        .bind(ist_now().date_naive())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE users SET can_live_trade=TRUE WHERE id=$1")
+            .bind(sell.user_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_profiles(user_id,trading_mode,last_token_status) VALUES($1,'live','success')")
+            .bind(sell.user_id).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session) VALUES($1,$2,'GOLDTEN',TRUE,1,TRUE,TRUE)")
+            .bind(sell.user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_strategy_activations(user_id,strategy_key,is_active) VALUES($1,$2,TRUE)")
+            .bind(sell.user_id).bind(STRATEGY_KEY).execute(&state.db).await.unwrap();
+        state
+            .credentials
+            .put(
+                sell.user_id,
+                &[("api_key", "fake-api"), ("jwt_token", "fake-jwt")],
+            )
+            .await
+            .unwrap();
+        let expiry: NaiveDate =
+            sqlx::query_scalar("SELECT contract_expiry FROM strategy_market_snapshots WHERE id=$1")
+                .bind(sell.snapshot_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        crate::contract_master::set_isolated_test_cache(vec![MasterContract {
+            token: "race-token".into(),
+            symbol: "GOLDTEN-RACE".into(),
+            name: "GOLDTEN".into(),
+            expiry: expiry.format("%d%b%Y").to_string().to_uppercase(),
+            strike: "0".into(),
+            lotsize: "10".into(),
+            tick_size: "5.000000".into(),
+            instrumenttype: "FUTCOM".into(),
+            exch_seg: "MCX".into(),
+        }])
+        .await;
+        sqlx::query("INSERT INTO market_price_ticks(exchange_segment,contract_token,price,received_at) VALUES('MCX','race-token',121,NOW())")
+            .execute(&state.db).await.unwrap();
+        fake.quote_ltps
+            .lock()
+            .await
+            .insert("race-token".into(), 121.0);
+        fake.quote_price_bands
+            .lock()
+            .await
+            .insert("race-token".into(), (100.0, 200.0));
+
+        let original_price = 79.0;
+        let unique = Uuid::new_v4().simple().to_string();
+        let session_key = format!("circuit-wait-{}", &unique[..8]);
+        let intents = [PreparedExecutionIntent {
+            user_id: sell.user_id,
+            snapshot_id: sell.snapshot_id,
+            strategy_key: STRATEGY_KEY.into(),
+            instrument: "GOLDTEN".into(),
+            session_key: session_key.clone(),
+            action: "ENTRY",
+            role: "SELL_ENTRY",
+            side: "SELL",
+            order_type: "STOPLOSS_LIMIT",
+            lots: 1,
+            quantity: Some(10),
+            price: original_price,
+            trigger_price: Some(original_price),
+            trade_id: None,
+            expires_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+        }];
+        let (signal_id, inserted) = materialize_signal_intents(
+            &state,
+            STRATEGY_KEY,
+            "GOLDTEN",
+            &session_key,
+            "ENTRY",
+            Utc::now(),
+            Some(sell.snapshot_id),
+            json!({"test":"circuit relaxation"}),
+            &intents,
+        )
+        .await
+        .unwrap();
+        assert!(inserted);
+
+        process_execution_intents(&state, Some(signal_id))
+            .await
+            .unwrap();
+        let waiting: (String, f64, Option<f64>, i32) = sqlx::query_as(
+            "SELECT status,price,trigger_price,attempts FROM strategy_execution_intents WHERE signal_id=$1",
+        )
+        .bind(signal_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(waiting.0, "retry_wait");
+        assert_eq!(waiting.1, original_price);
+        assert_eq!(waiting.2, Some(original_price));
+        assert_eq!(
+            waiting.3, 0,
+            "circuit polling must not consume the separate transient-error retry budget"
+        );
+        assert!(fake.placed_orders.lock().await.is_empty());
+
+        fake.quote_price_bands
+            .lock()
+            .await
+            .insert("race-token".into(), (70.0, 200.0));
+        sqlx::query(
+            "UPDATE strategy_execution_intents SET next_attempt_at=NOW() WHERE signal_id=$1",
+        )
+        .bind(signal_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        process_execution_intents(&state, Some(signal_id))
+            .await
+            .unwrap();
+
+        let submitted_intent: (String, f64, Option<f64>) = sqlx::query_as(
+            "SELECT status,price,trigger_price FROM strategy_execution_intents WHERE signal_id=$1",
+        )
+        .bind(signal_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(submitted_intent.0, "submitted");
+        assert_eq!(submitted_intent.1, original_price);
+        assert_eq!(submitted_intent.2, Some(original_price));
+        let placed = fake.placed_orders.lock().await.clone();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(
+            placed[0].get("price").and_then(Value::as_str),
+            Some("79.00")
+        );
+        assert_eq!(
+            placed[0].get("triggerprice").and_then(Value::as_str),
+            Some("79.00")
+        );
+        assert_eq!(buy.user_id, sell.user_id);
+        broker_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback TEST_DATABASE_URL named rulenix_test_*"]
     async fn fill_commit_crash_recovers_protection_on_restart() {
         let (broker_url, fake, broker_task) = spawn_deterministic_fake_broker().await;
         let state = isolated_test_state_with_broker(&broker_url).await;
@@ -13766,6 +14049,132 @@ mod tests {
         ));
         assert!(!entry_intent_retryable(
             "Order rejected by the user kill switch"
+        ));
+    }
+
+    #[test]
+    fn futures_entries_wait_for_circuit_relaxation_without_repricing() {
+        let original_price = 150_000.0;
+        let expires_at = Utc::now() + chrono::Duration::hours(6);
+        let intent = ExecutionIntent {
+            id: Uuid::new_v4(),
+            signal_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            snapshot_id: Some(Uuid::new_v4()),
+            trade_id: None,
+            strategy_key: STRATEGY_KEY.into(),
+            instrument: "GOLDTEN".into(),
+            session_key: "day".into(),
+            action: "ENTRY".into(),
+            role: "SELL_ENTRY".into(),
+            side: "SELL".into(),
+            order_type: "STOPLOSS_LIMIT".into(),
+            lots: 1,
+            quantity: None,
+            price: original_price,
+            trigger_price: Some(original_price),
+            attempts: 99,
+            expires_at: Some(expires_at),
+        };
+        let message = "Order limit price 150000.000000 is outside Angel One circuit limits 160050.000000..=169950.000000.";
+
+        assert_eq!(
+            entry_intent_retry_delay(&intent, message, Utc::now()),
+            Some(FUTURES_PRICE_BAND_RETRY_SECONDS),
+            "circuit waits continue beyond the ordinary 12-attempt transient limit"
+        );
+        assert_eq!(intent.price, original_price);
+        assert_eq!(intent.trigger_price, Some(original_price));
+
+        let mut expired = intent.clone();
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert_eq!(
+            entry_intent_retry_delay(&expired, message, Utc::now()),
+            None
+        );
+
+        let mut unrelated_strategy = intent.clone();
+        unrelated_strategy.strategy_key = SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY.into();
+        assert_eq!(
+            entry_intent_retry_delay(&unrelated_strategy, message, Utc::now()),
+            None,
+            "the circuit-wait exception is limited to Futures Breakout entries"
+        );
+
+        let mut unbounded = intent;
+        unbounded.expires_at = None;
+        assert_eq!(
+            entry_intent_retry_delay(&unbounded, message, Utc::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn futures_entries_wait_for_api_capacity_until_expiry_without_spending_attempt_budget() {
+        let expires_at = Utc::now() + chrono::Duration::hours(6);
+        let intent = ExecutionIntent {
+            id: Uuid::new_v4(),
+            signal_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            snapshot_id: Some(Uuid::new_v4()),
+            trade_id: None,
+            strategy_key: STRATEGY_KEY.into(),
+            instrument: "GOLDTEN".into(),
+            session_key: "day".into(),
+            action: "ENTRY".into(),
+            role: "BUY_ENTRY".into(),
+            side: "BUY".into(),
+            order_type: "STOPLOSS_LIMIT".into(),
+            lots: 1,
+            quantity: None,
+            price: 165_000.0,
+            trigger_price: Some(165_000.0),
+            attempts: 99,
+            expires_at: Some(expires_at),
+        };
+        let message = "Angel One API rate limit is active. Rulenix will retry automatically in about 300 seconds; the broker session remains connected.";
+
+        assert!(futures_entry_waits_for_api_capacity(&intent, message));
+        assert_eq!(
+            entry_intent_retry_delay(&intent, message, Utc::now()),
+            Some(5 * 60),
+            "Futures API-capacity waits continue until expiry even beyond the ordinary retry cap"
+        );
+
+        let mut unrelated_strategy = intent.clone();
+        unrelated_strategy.strategy_key = SUPERTREND_INDEX_OPTIONS_STRATEGY_KEY.into();
+        assert!(!futures_entry_waits_for_api_capacity(
+            &unrelated_strategy,
+            message
+        ));
+        assert_eq!(
+            entry_intent_retry_delay(&unrelated_strategy, message, Utc::now()),
+            None
+        );
+
+        let mut expired = intent;
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert_eq!(
+            entry_intent_retry_delay(&expired, message, Utc::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn futures_entries_wait_when_authoritative_circuit_data_is_temporarily_missing() {
+        assert!(futures_entry_waits_for_price_band(
+            STRATEGY_KEY,
+            "ENTRY",
+            "BUY_ENTRY",
+            "STOPLOSS_LIMIT",
+            "Angel One FULL quote for GOLDTEN did not include authoritative circuit limits."
+        ));
+        assert!(!futures_entry_waits_for_price_band(
+            STRATEGY_KEY,
+            "ENTRY",
+            "TARGET",
+            "STOPLOSS_LIMIT",
+            "Order limit price 150000.000000 is outside Angel One circuit limits 160050.000000..=169950.000000."
         ));
     }
 

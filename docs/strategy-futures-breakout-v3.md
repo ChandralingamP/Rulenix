@@ -109,7 +109,7 @@ For each configured runner, the backend places STOPLOSS_LIMIT entry orders:
 
 Before order creation, the risk engine checks permissions, kill switches, position/order limits, fresh ticks, and broker/session health.
 
-Normal entry quantity must equal configured lots multiplied by the current Angel One contract-master lot size. Limit and trigger prices are normalized to tick size and checked against the token's current Angel One FULL-quote lower/upper circuit limits. A missing authoritative price band blocks a new live entry.
+Normal entry quantity must equal configured lots multiplied by the current Angel One contract-master lot size. Limit and trigger prices are normalized to tick size and checked against the token's current Angel One FULL-quote lower/upper circuit limits. A missing authoritative price band blocks a new live submission. If the unchanged strategy entry is outside the current band, or the authoritative band is temporarily missing, its durable Futures entry intent remains in `retry_wait` and rechecks every five minutes until the existing signal expiry. Angel One API-capacity/rate-limit responses also remain retryable until that expiry and neither kind of wait consumes the separate transient-error attempt budget. The original limit and trigger are never clamped or repriced; an intent that is still invalid at expiry becomes `expired` without reaching the broker.
 
 One user failing risk or broker validation does not make successful users retry or roll back their already submitted orders.
 

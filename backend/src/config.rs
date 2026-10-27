@@ -33,6 +33,8 @@ pub struct Config {
     pub smtp_from: String,
     pub angel_api_base: String,
     pub angel_ws_url: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub egress_helper_socket: String,
     pub client_public_ip: String,
     pub client_local_ip: String,
     pub client_mac_address: String,
@@ -138,6 +140,8 @@ impl Config {
                 .unwrap_or_else(|| "https://apiconnect.angelone.in".into()),
             angel_ws_url: lookup("ANGEL_WS_URL")
                 .unwrap_or_else(|| "wss://smartapisocket.angelone.in/smart-stream".into()),
+            egress_helper_socket: lookup("EGRESS_HELPER_SOCKET")
+                .unwrap_or_else(|| "/run/rulenix-egress/helper.sock".into()),
             client_public_ip: lookup("CLIENT_PUBLIC_IP").unwrap_or_else(|| "127.0.0.1".into()),
             client_local_ip: lookup("CLIENT_LOCAL_IP").unwrap_or_else(|| "127.0.0.1".into()),
             client_mac_address: lookup("CLIENT_MAC_ADDRESS")

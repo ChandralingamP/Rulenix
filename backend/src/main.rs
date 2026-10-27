@@ -7,6 +7,7 @@ mod backtesting;
 mod config;
 mod contract_master;
 mod credentials;
+mod egress;
 mod error;
 mod home;
 mod instruments;
@@ -116,6 +117,10 @@ async fn main() -> Result<()> {
         .await;
     drop(migration_connection);
     migration_result.context("database migration failed")?;
+    if std::env::args().nth(1).as_deref() == Some("--migrate-only") {
+        println!("Rulenix database migrations completed successfully.");
+        return Ok(());
+    }
     let credential_store = credentials::CredentialStore::from_env(db.clone())
         .context("credential encryption configuration is invalid")?;
     let migrated = credential_store
@@ -205,6 +210,7 @@ async fn main() -> Result<()> {
         credentials: credential_store,
         abuse_prevention: Default::default(),
     };
+    egress::rehydrate_configured_ips(&state).await;
     if let Err(error) = alerts::deliver(
         &state,
         "service_started",
@@ -244,6 +250,12 @@ async fn main() -> Result<()> {
             axum::routing::delete(auth::clear_user_trade_logs),
         )
         .route("/auth/admin/trades/daily/", get(auth::daily_trade_report))
+        .route("/admin/egress-ips", get(egress::list).post(egress::add))
+        .route("/admin/egress-ips/{id}/verify", post(egress::verify))
+        .route(
+            "/admin/users/{user_id}/angel-egress",
+            axum::routing::put(egress::assign),
+        )
         .route("/home/status/", get(home::status))
         .route("/home/connect/", post(home::connect))
         .route("/home/profile/", patch(home::update_profile))

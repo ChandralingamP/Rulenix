@@ -921,7 +921,7 @@ pub async fn list_users(
     Extension(admin): Extension<AuthUser>,
 ) -> AppResult<Json<Vec<AdminUser>>> {
     require_admin_permission(&admin)?;
-    let users = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,u.can_backtest_on_trading_days,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id ORDER BY u.username").fetch_all(&state.db).await?;
+    let users = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,u.can_backtest_on_trading_days,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at,p.brokerage_user_id,p.broker_egress_ip_id,host(e.ip_address) AS broker_egress_ip,e.configuration_status AS broker_egress_configuration_status,e.verification_status AS broker_egress_verification_status FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN broker_egress_ips e ON e.id=p.broker_egress_ip_id ORDER BY u.username").fetch_all(&state.db).await?;
     Ok(Json(users))
 }
 
@@ -1060,7 +1060,7 @@ pub async fn update_user(
         .execute(&mut *tx)
         .await?;
     }
-    let user: AdminUser = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,u.can_backtest_on_trading_days,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=$1")
+    let user: AdminUser = sqlx::query_as("SELECT u.id,u.username,u.email,u.can_administer,u.can_live_trade,u.can_backtest,u.can_backtest_on_trading_days,COALESCE(p.trading_mode,'demo') AS trading_mode,u.is_active,u.created_at,p.brokerage_user_id,p.broker_egress_ip_id,host(e.ip_address) AS broker_egress_ip,e.configuration_status AS broker_egress_configuration_status,e.verification_status AS broker_egress_verification_status FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN broker_egress_ips e ON e.id=p.broker_egress_ip_id WHERE u.id=$1")
         .bind(changed_id).fetch_one(&mut *tx).await?;
     if input.can_administer.is_some() || input.can_live_trade.is_some() {
         sqlx::query(
@@ -1255,16 +1255,17 @@ async fn inspect_user_broker_state_for_clear(
                 .into(),
         ));
     }
-    let order_book = angel::order_book(state, &credentials.api_key, &credentials.jwt_token)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%user_id, %error, "Clear Trades broker order-book gate failed");
-            AppError::BadRequest(
-                "Clear Trades stopped because the user's Angel One order book could not be verified."
-                    .into(),
-            )
-        })?;
-    let positions = angel::positions(state, &credentials.api_key, &credentials.jwt_token)
+    let order_book =
+        angel::order_book(state, user_id, &credentials.api_key, &credentials.jwt_token)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%user_id, %error, "Clear Trades broker order-book gate failed");
+                AppError::BadRequest(
+            "Clear Trades stopped because the user's Angel One order book could not be verified."
+                .into(),
+        )
+            })?;
+    let positions = angel::positions(state, user_id, &credentials.api_key, &credentials.jwt_token)
         .await
         .map_err(|error| {
             tracing::warn!(%user_id, %error, "Clear Trades broker position-book gate failed");
