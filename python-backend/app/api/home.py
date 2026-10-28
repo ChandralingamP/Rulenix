@@ -224,6 +224,12 @@ async def connect(request: Request, payload: dict | None = None):
         try:
             session = await authenticator.login(account, mpin, totp)
         except BrokerError as exc:
+            broker_detail = str(getattr(exc, 'message', '') or '').strip()
+            err_msg = (
+                f"Broker connection failed. Verify the Client ID, API key, MPIN, and TOTP before retrying. ({broker_detail})"
+                if broker_detail
+                else "Broker connection failed. Verify the Client ID, API key, MPIN, and TOTP before retrying."
+            )
             await db.execute(
                 text("""
                 UPDATE user_profiles
@@ -236,13 +242,13 @@ async def connect(request: Request, payload: dict | None = None):
                 """),
                 {
                     "user_id": user_id,
-                    "msg": "Broker connection failed. Verify the Client ID, API key, MPIN, and TOTP before retrying.",
+                    "msg": err_msg,
                 },
             )
             await db.commit()
             raise DomainError(
                 400,
-                "Broker connection failed. Verify the Client ID, API key, MPIN, and TOTP before retrying.",
+                err_msg,
             ) from exc
         except Exception as exc:
             await db.execute(
