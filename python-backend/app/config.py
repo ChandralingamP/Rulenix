@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     )
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
-    smtp_user: str = Field(default="", validation_alias="SMTP_USER")
+    smtp_user: str = Field(default="", validation_alias=AliasChoices("SMTP_USER", "SMTP_USERNAME"))
     smtp_password: str = Field(default="", validation_alias="SMTP_PASSWORD")
     smtp_from: str = Field(default="", validation_alias="SMTP_FROM")
     initial_admin_username: str = Field(default="", validation_alias="INITIAL_ADMIN_USERNAME")
