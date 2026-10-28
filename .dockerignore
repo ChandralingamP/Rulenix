@@ -1,9 +1,0 @@
-.git
-.runlogs
-backend/target
-frontend/node_modules
-frontend/dist
-backend/.env
-backend/.env.*.local
-secrets
-*.log
