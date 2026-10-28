@@ -165,21 +165,23 @@ class ProductionRuntime:
                         interval_seconds=interval,
                         timeout_seconds=max(15, interval * 4),
                     )
-                self.market_data = MarketDataIngestionService(
-                    self.session_factory, clients, self.settings
-                )
-                self.supervisor.start(
-                    "market_data_ingestion",
-                    self.market_data.run_cycle,
-                    interval_seconds=60.0,
-                    timeout_seconds=45.0,
-                )
-                self.supervisor.start(
-                    "active_contract_ticks",
-                    self.market_data.sync_active_contract_ticks,
-                    interval_seconds=3.0,
-                    timeout_seconds=10.0,
-                )
+            self.market_data = MarketDataIngestionService(
+                self.session_factory, clients, self.settings
+            )
+            self.supervisor.start(
+                "market_data_ingestion",
+                self.market_data.run_cycle,
+                interval_seconds=60.0,
+                timeout_seconds=60.0,
+                critical=False,
+            )
+            self.supervisor.start(
+                "active_contract_ticks",
+                self.market_data.sync_active_contract_ticks,
+                interval_seconds=3.0,
+                timeout_seconds=10.0,
+                critical=False,
+            )
             self.scheduler.start()
         except Exception:
             await self.stop()

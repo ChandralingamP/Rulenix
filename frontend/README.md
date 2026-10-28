@@ -8,4 +8,4 @@ npm run dev
 ```
 
 The development server runs on `http://localhost:5173` and proxies `/api` to
-the Rust service at `http://localhost:8080`.
+the FastAPI backend at `http://localhost:8080`.

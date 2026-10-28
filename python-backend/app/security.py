@@ -73,3 +73,35 @@ def encrypt_broker_secret(value: str, user_id: str, kind: str, keys: str, primar
     nonce = secrets.token_bytes(12)
     aad = f"rulenix:broker-secret:{user_id}:{kind}:v{primary_version}".encode()
     return primary_version, nonce, AESGCM(key).encrypt(nonce, value.encode(), aad)
+
+
+def send_smtp_email(settings, recipient: str, subject: str, body: str) -> bool:
+    if not getattr(settings, "smtp_host", ""):
+        return False
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = (
+        getattr(settings, "smtp_from", "")
+        or getattr(settings, "smtp_user", "")
+        or "rulenix.algo@gmail.com"
+    )
+    msg["To"] = recipient
+    msg.set_content(body)
+    try:
+        port = int(getattr(settings, "smtp_port", 587))
+        with smtplib.SMTP(settings.smtp_host, port, timeout=10) as server:
+            server.starttls()
+            user = getattr(settings, "smtp_user", "")
+            pwd = getattr(settings, "smtp_password", "")
+            if user and pwd:
+                server.login(user, pwd)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        import logging
+
+        logging.getLogger("rulenix.email").error("Failed sending email to %s: %s", recipient, exc)
+        return False
