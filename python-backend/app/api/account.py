@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..dependencies import Principal, current_user, get_db
 from ..errors import DomainError
-from ..security import otp_digest
+from ..security import otp_digest, send_smtp_email
 
 router = APIRouter(prefix="/account", tags=["account"])
 
@@ -113,5 +113,12 @@ async def profile_otp(request: Request, user: Principal = Depends(current_user),
     await db.commit()
     if not request.app.state.settings.smtp_host and request.app.state.settings.app_env == "development":
         request.app.state.last_dev_otp = otp
+    elif request.app.state.settings.smtp_host:
+        send_smtp_email(
+            request.app.state.settings,
+            email,
+            "Rulenix Verification Code",
+            f"Your verification code is: {otp}\n\nIt expires in 10 minutes.",
+        )
     return {"detail": "OTP sent to the current account email.", "email": email}
 

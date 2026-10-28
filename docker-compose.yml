@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rulenix-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rulenix
+      POSTGRES_USER: rulenix
+      POSTGRES_PASSWORD: rulenix_dev_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - rulenix_postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rulenix -d rulenix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  backend:
+    build:
+      context: ./python-backend
+      dockerfile: Dockerfile.production
+    image: rulenix-backend:latest
+    container_name: rulenix-backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://rulenix:rulenix_dev_password@postgres:5432/rulenix
+      FRONTEND_ORIGIN: http://localhost:8088,http://localhost:5173,http://localhost:8080,http://127.0.0.1:8088,http://127.0.0.1:5173
+      PYTHON_RUNTIME_MODE: shadow
+      PYTHON_LIVE_TRADING_ENABLED: "false"
+      OTP_HASH_KEY: rulenix-development-otp-secret-key-32chars
+      CREDENTIAL_ENCRYPTION_KEYS: 1:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      CREDENTIAL_PRIMARY_VERSION: 1
+      RULENIX_LOG_DIRECTORY: /var/log/rulenix
+      EGRESS_HELPER_SOCKET: /tmp/helper.sock
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-rulenix.algo@gmail.com}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-ydnlifnbzwbeoxkj}
+      SMTP_FROM: ${SMTP_FROM:-Rulenix Algo <rulenix.algo@gmail.com>}
+      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME:-rulenix}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-rulenix.algo@gmail.com}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-#Admin26}
+    env_file:
+      - ./python-backend/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health/ready', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: rulenix-frontend:latest
+    container_name: rulenix-frontend
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  rulenix_postgres_data:
+

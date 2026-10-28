@@ -32,11 +32,70 @@ from .runtime.service import ProductionRuntime
 from .strategy.runtime import SchedulerHealth
 
 
+async def bootstrap_initial_admin(session_factory, settings):
+    from uuid import uuid4
+    from sqlalchemy import text
+    from .security import hash_password
+
+    username = settings.initial_admin_username.strip()
+    email = settings.initial_admin_email.strip().lower()
+    password = settings.initial_admin_password.strip()
+    if not username or not email or not password:
+        return
+    async with session_factory() as session:
+        existing = await session.execute(
+            text("SELECT id FROM users WHERE LOWER(username)=LOWER(:username)"),
+            {"username": username},
+        )
+        row = existing.mappings().first()
+        pwd_hash = hash_password(password)
+        if row:
+            await session.execute(
+                text("""
+                UPDATE users SET email=:email, password_hash=:pwd, can_administer=TRUE,
+                       is_active=TRUE, can_live_trade=TRUE, can_backtest=TRUE,
+                       can_backtest_on_trading_days=TRUE, updated_at=NOW()
+                 WHERE id=:id
+                """),
+                {"id": row["id"], "email": email, "pwd": pwd_hash},
+            )
+        else:
+            user_id = uuid4()
+            await session.execute(
+                text("""
+                INSERT INTO users (id, username, email, password_hash, is_active, is_staff, is_superuser, can_administer, can_live_trade, can_backtest, can_backtest_on_trading_days)
+                VALUES (:id, :username, :email, :pwd, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)
+                """),
+                {
+                    "id": user_id,
+                    "username": username.upper(),
+                    "email": email,
+                    "pwd": pwd_hash,
+                },
+            )
+            await session.execute(
+                text("""
+                INSERT INTO user_profiles (user_id, trading_mode, demo_balance)
+                VALUES (:id, 'demo', 100000.00)
+                ON CONFLICT (user_id) DO NOTHING
+                """),
+                {"id": user_id},
+            )
+        await session.commit()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.settings = get_settings()
     app.state.engine = make_engine(app.state.settings.async_database_url)
     app.state.session_factory = make_session_factory(app.state.engine)
+    if (
+        app.state.session_factory
+        and app.state.settings.initial_admin_username
+        and app.state.settings.initial_admin_email
+        and app.state.settings.initial_admin_password
+    ):
+        await bootstrap_initial_admin(app.state.session_factory, app.state.settings)
     app.state.last_dev_otp = None
     app.state.worker_manager = BackgroundWorkerManager()
     app.state.scheduler_health = SchedulerHealth()

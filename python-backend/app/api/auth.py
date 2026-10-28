@@ -20,6 +20,7 @@ from ..security import (
     valid_email,
     valid_username,
     verify_password,
+    send_smtp_email,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -134,6 +135,8 @@ async def request_otp(body: OtpRequest, request: Request, db: AsyncSession = __i
         await db.commit()
         if not settings.smtp_host and settings.app_env == "development":
             request.app.state.last_dev_otp = otp
+        elif settings.smtp_host:
+            send_smtp_email(settings, body.email, "Rulenix Verification Code", f"Your verification code is: {otp}\n\nIt expires in 10 minutes.")
     return {"detail": "If the supplied details can be used, a verification code has been sent."}
 
 
@@ -179,6 +182,8 @@ async def request_reset(body: ResetOtpRequest, request: Request, db: AsyncSessio
         await db.commit()
         if not settings.smtp_host and settings.app_env == "development":
             request.app.state.last_dev_otp = otp
+        elif settings.smtp_host:
+            send_smtp_email(settings, body.email, "Rulenix Verification Code", f"Your verification code is: {otp}\n\nIt expires in 10 minutes.")
     return {"detail": "If an account matches that email, a verification code has been sent."}
 
 
