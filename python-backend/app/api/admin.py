@@ -162,11 +162,11 @@ async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[s
 
     candidate_snapshot_ids = [str(r[0]) for r in (await db.execute(
         text("""
-        SELECT DISTINCT snapshot_id FROM strategy_orders WHERE id = ANY(:orders::uuid[])
+        SELECT DISTINCT snapshot_id FROM strategy_orders WHERE user_id=:user AND execution_mode='demo'
         UNION
-        SELECT DISTINCT strategy_snapshot_id FROM trades WHERE id = ANY(:trades::uuid[]) AND strategy_snapshot_id IS NOT NULL
+        SELECT DISTINCT strategy_snapshot_id FROM trades WHERE user_id=:user AND execution_mode='demo' AND strategy_snapshot_id IS NOT NULL
         """),
-        {"orders": demo_order_ids, "trades": demo_trade_ids},
+        {"user": user_id},
     )).fetchall() if r[0] is not None]
 
     removed_signals = [str(r[0]) for r in (await db.execute(
@@ -174,10 +174,13 @@ async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[s
         DELETE FROM strategy_execution_intents i
          USING strategy_signals s
          WHERE i.signal_id=s.id AND i.user_id=:user
-           AND (i.strategy_order_id = ANY(:orders::uuid[]) OR i.trade_id = ANY(:trades::uuid[]))
+           AND (
+             i.strategy_order_id IN (SELECT id FROM strategy_orders WHERE user_id=:user AND execution_mode='demo')
+             OR i.trade_id IN (SELECT id FROM trades WHERE user_id=:user AND execution_mode='demo')
+           )
          RETURNING i.signal_id
         """),
-        {"user": user_id, "orders": demo_order_ids, "trades": demo_trade_ids},
+        {"user": user_id},
     )).fetchall() if r[0] is not None]
     deleted_demo_intents = len(removed_signals)
 
@@ -198,22 +201,38 @@ async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[s
     )).rowcount or 0
 
     await db.execute(
-        text("DELETE FROM strategy_reversal_intents WHERE user_id=:user AND source_trade_id = ANY(:trades::uuid[])"),
-        {"user": user_id, "trades": demo_trade_ids},
+        text("""
+        DELETE FROM strategy_reversal_intents
+         WHERE user_id=:user
+           AND source_trade_id IN (SELECT id FROM trades WHERE user_id=:user AND execution_mode='demo')
+        """),
+        {"user": user_id},
     )
 
-    deleted_demo_events = (await db.execute(
-        text("""
-        DELETE FROM strategy_events
-         WHERE user_id=:user AND (
-           payload->>'mode'='demo'
-           OR payload->>'execution_mode'='demo'
-           OR payload->>'trade_id' = ANY(:trades::text[])
-           OR payload->>'order_id' = ANY(:orders::text[])
-         )
-        """),
-        {"user": user_id, "trades": demo_trade_ids, "orders": demo_order_ids},
-    )).rowcount or 0
+    if demo_trade_ids or demo_order_ids:
+        deleted_demo_events = (await db.execute(
+            text("""
+            DELETE FROM strategy_events
+             WHERE user_id=:user AND (
+               payload->>'mode'='demo'
+               OR payload->>'execution_mode'='demo'
+               OR payload->>'trade_id' = ANY(CAST(:trades AS text[]))
+               OR payload->>'order_id' = ANY(CAST(:orders AS text[]))
+             )
+            """),
+            {"user": user_id, "trades": demo_trade_ids, "orders": demo_order_ids},
+        )).rowcount or 0
+    else:
+        deleted_demo_events = (await db.execute(
+            text("""
+            DELETE FROM strategy_events
+             WHERE user_id=:user AND (
+               payload->>'mode'='demo'
+               OR payload->>'execution_mode'='demo'
+             )
+            """),
+            {"user": user_id},
+        )).rowcount or 0
 
     deleted_demo_orders = (await db.execute(
         text("DELETE FROM strategy_orders WHERE user_id=:user AND execution_mode='demo'"),
@@ -235,7 +254,7 @@ async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[s
         deleted_orphan_signals = (await db.execute(
             text("""
             DELETE FROM strategy_signals s
-             WHERE s.id = ANY(:signals::uuid[])
+             WHERE s.id = ANY(CAST(:signals AS uuid[]))
                AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.signal_id=s.id)
             """),
             {"signals": removed_signals},
@@ -246,7 +265,7 @@ async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[s
         deleted_orphan_snapshots = (await db.execute(
             text("""
             DELETE FROM strategy_market_snapshots s
-             WHERE s.id = ANY(:snapshots::uuid[])
+             WHERE s.id = ANY(CAST(:snapshots AS uuid[]))
                AND NOT EXISTS (SELECT 1 FROM strategy_orders o WHERE o.snapshot_id=s.id)
                AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.strategy_snapshot_id=s.id)
                AND NOT EXISTS (SELECT 1 FROM strategy_reversal_intents r WHERE r.snapshot_id=s.id)
@@ -280,46 +299,69 @@ async def _clear_user_live_trade_state(db: AsyncSession, user_id: str) -> dict[s
 
     candidate_snapshot_ids = [str(r[0]) for r in (await db.execute(
         text("""
-        SELECT DISTINCT snapshot_id FROM strategy_orders WHERE id = ANY(:orders::uuid[])
+        SELECT DISTINCT snapshot_id FROM strategy_orders WHERE user_id=:user AND execution_mode='live'
         UNION
-        SELECT DISTINCT strategy_snapshot_id FROM trades WHERE id = ANY(:trades::uuid[]) AND strategy_snapshot_id IS NOT NULL
+        SELECT DISTINCT strategy_snapshot_id FROM trades WHERE user_id=:user AND execution_mode='live' AND strategy_snapshot_id IS NOT NULL
         """),
-        {"orders": live_order_ids, "trades": live_trade_ids},
+        {"user": user_id},
     )).fetchall() if r[0] is not None]
 
     removed_signals = [str(r[0]) for r in (await db.execute(
         text("""
         DELETE FROM strategy_execution_intents i
          WHERE i.user_id=:user
-           AND (i.strategy_order_id = ANY(:orders::uuid[]) OR i.trade_id = ANY(:trades::uuid[]))
+           AND (
+             i.strategy_order_id IN (SELECT id FROM strategy_orders WHERE user_id=:user AND execution_mode='live')
+             OR i.trade_id IN (SELECT id FROM trades WHERE user_id=:user AND execution_mode='live')
+           )
          RETURNING i.signal_id
         """),
-        {"user": user_id, "orders": live_order_ids, "trades": live_trade_ids},
+        {"user": user_id},
     )).fetchall() if r[0] is not None]
     deleted_live_intents = len(removed_signals)
 
     await db.execute(
-        text("DELETE FROM strategy_reversal_intents WHERE user_id=:user AND source_trade_id = ANY(:trades::uuid[])"),
-        {"user": user_id, "trades": live_trade_ids},
+        text("""
+        DELETE FROM strategy_reversal_intents
+         WHERE user_id=:user
+           AND source_trade_id IN (SELECT id FROM trades WHERE user_id=:user AND execution_mode='live')
+        """),
+        {"user": user_id},
     )
 
     await db.execute(
-        text("DELETE FROM manual_trade_close_intents WHERE user_id=:user AND trade_id = ANY(:trades::uuid[])"),
-        {"user": user_id, "trades": live_trade_ids},
+        text("""
+        DELETE FROM manual_trade_close_intents
+         WHERE user_id=:user
+           AND trade_id IN (SELECT id FROM trades WHERE user_id=:user AND execution_mode='live')
+        """),
+        {"user": user_id},
     )
 
-    deleted_live_events = (await db.execute(
-        text("""
-        DELETE FROM strategy_events
-         WHERE user_id=:user AND (
-           payload->>'mode'='live'
-           OR payload->>'execution_mode'='live'
-           OR payload->>'trade_id' = ANY(:trades::text[])
-           OR payload->>'order_id' = ANY(:orders::text[])
-         )
-        """),
-        {"user": user_id, "trades": live_trade_ids, "orders": live_order_ids},
-    )).rowcount or 0
+    if live_trade_ids or live_order_ids:
+        deleted_live_events = (await db.execute(
+            text("""
+            DELETE FROM strategy_events
+             WHERE user_id=:user AND (
+               payload->>'mode'='live'
+               OR payload->>'execution_mode'='live'
+               OR payload->>'trade_id' = ANY(CAST(:trades AS text[]))
+               OR payload->>'order_id' = ANY(CAST(:orders AS text[]))
+             )
+            """),
+            {"user": user_id, "trades": live_trade_ids, "orders": live_order_ids},
+        )).rowcount or 0
+    else:
+        deleted_live_events = (await db.execute(
+            text("""
+            DELETE FROM strategy_events
+             WHERE user_id=:user AND (
+               payload->>'mode'='live'
+               OR payload->>'execution_mode'='live'
+             )
+            """),
+            {"user": user_id},
+        )).rowcount or 0
 
     deleted_live_orders = (await db.execute(
         text("DELETE FROM strategy_orders WHERE user_id=:user AND execution_mode='live'"),
@@ -341,7 +383,7 @@ async def _clear_user_live_trade_state(db: AsyncSession, user_id: str) -> dict[s
         deleted_orphan_signals = (await db.execute(
             text("""
             DELETE FROM strategy_signals s
-             WHERE s.id = ANY(:signals::uuid[])
+             WHERE s.id = ANY(CAST(:signals AS uuid[]))
                AND NOT EXISTS (SELECT 1 FROM strategy_execution_intents i WHERE i.signal_id=s.id)
             """),
             {"signals": removed_signals},
@@ -352,7 +394,7 @@ async def _clear_user_live_trade_state(db: AsyncSession, user_id: str) -> dict[s
         deleted_orphan_snapshots = (await db.execute(
             text("""
             DELETE FROM strategy_market_snapshots s
-             WHERE s.id = ANY(:snapshots::uuid[])
+             WHERE s.id = ANY(CAST(:snapshots AS uuid[]))
                AND NOT EXISTS (SELECT 1 FROM strategy_orders o WHERE o.snapshot_id=s.id)
                AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.strategy_snapshot_id=s.id)
                AND NOT EXISTS (SELECT 1 FROM strategy_reversal_intents r WHERE r.snapshot_id=s.id)
