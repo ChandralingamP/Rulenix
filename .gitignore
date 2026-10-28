@@ -2,18 +2,59 @@
 frontend/node_modules/
 frontend/dist/
 
-# Rust
-backend/target/
-backend/.env
-backend/logs/*.log
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+ENV/
+env/
+python-backend/.mypy_cache/
+python-backend/.pytest_cache/
+python-backend/.ruff_cache/
+python-backend/rulenix_python_foundation.egg-info/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.*.example
+python-backend/.env
+python-backend/.env.*
+!python-backend/.env.*.example
 secrets/
+*.pem
+*.key
+*.crt
+
+# Runtime / Deployment
+*.log
+backend_logs/
+.runlogs/
+*.tar.gz
 
 # Editors / OS
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-.runlogs/
-Futures_Breakout_Strategy_Spec_v3.pdf
-Prompts.txt
-Expense.txt

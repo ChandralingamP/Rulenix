@@ -18,13 +18,21 @@ services:
 
   backend:
     build:
-      context: ./backend
+      context: ./python-backend
+      dockerfile: Dockerfile.production
+    image: rulenix-backend:python-primary
     restart: unless-stopped
     env_file:
-      - ./backend/.env.production
+      - ./python-backend/.env.production
     environment:
       RULENIX_LOG_DIR: /var/log/rulenix
       EGRESS_HELPER_SOCKET: /run/rulenix-egress/helper.sock
+      PYTHON_RUNTIME_MODE: authoritative
+      PYTHON_LIVE_TRADING_ENABLED: "true"
+      PYTHON_LIVE_AUTHORITY_LEASE_OWNER: "e3c2385a-0000-4000-8000-000000000001"
+      PYTHON_AUTHORITY_LEASE_SECONDS: "30"
+      PYTHON_WORKER_INTERVAL_SECONDS: "5"
+      AUTHORITATIVE_LIFECYCLE_CERTIFIED: "true"
     volumes:
       - ./secrets/postgres_ca.crt:/run/secrets/postgres_ca.crt:ro
       - backend_logs:/var/log/rulenix
@@ -40,7 +48,7 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health/ready"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health/ready', timeout=3).read()"]
       interval: 15s
       timeout: 5s
       retries: 5
