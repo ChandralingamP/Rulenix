@@ -65,7 +65,7 @@ async def _verify_no_live_clear_blockers(db: AsyncSession, user_id: str) -> None
                (SELECT COUNT(*) FROM strategy_reversal_intents WHERE user_id=:user AND status IN ('pending', 'submitting')) AS reversals,
                (SELECT COUNT(*) FROM manual_trade_close_intents WHERE user_id=:user AND status IN ('pending', 'submitted')) AS manual_closes,
                (SELECT COUNT(*) FROM broker_position_incidents WHERE user_id=:user AND resolved_at IS NULL) AS broker_incidents,
-               (SELECT COUNT(*) FROM broker_mutation_attempts WHERE user_id=:user AND terminal=FALSE) AS broker_mutations
+               (SELECT COUNT(*) FROM broker_mutation_attempts WHERE user_id=:user AND state IN ('prepared', 'submitting', 'ambiguous')) AS broker_mutations
         """),
         {"user": user_id},
     )).mappings().first()
@@ -84,6 +84,15 @@ async def _verify_broker_safe_for_live_clear(request: Request, db: AsyncSession,
     settings = getattr(request.app.state, "settings", None)
     session_factory = getattr(request.app.state, "session_factory", None)
     if not settings or not session_factory:
+        return
+
+    has_broker = bool(
+        await db.scalar(
+            text("SELECT 1 FROM user_profiles WHERE user_id=:user AND brokerage_user_id IS NOT NULL AND brokerage_user_id != ''"),
+            {"user": user_id},
+        )
+    )
+    if not has_broker:
         return
 
     from ..runtime.broker import RuntimeBrokerClientFactory
@@ -450,8 +459,19 @@ async def clear_trade_logs(
 
     if scope in {"live", "all"}:
         await _verify_no_live_clear_blockers(db, target_id)
-        await _verify_broker_safe_for_live_clear(request, db, target_id)
-        await _verify_no_live_clear_blockers(db, target_id)
+        live_count = int(
+            await db.scalar(
+                text("""
+                SELECT (SELECT COUNT(id) FROM trades WHERE user_id=:user AND execution_mode='live')
+                     + (SELECT COUNT(id) FROM strategy_orders WHERE user_id=:user AND execution_mode='live')
+                """),
+                {"user": target_id},
+            )
+            or 0
+        )
+        if live_count > 0:
+            await _verify_broker_safe_for_live_clear(request, db, target_id)
+            await _verify_no_live_clear_blockers(db, target_id)
 
     cleared_demo = {}
     if scope in {"demo", "all"}:

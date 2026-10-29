@@ -148,7 +148,7 @@ def evaluate_supertrend_signal(row: dict[str, Any]) -> tuple[dict[str, Any], dic
         )
         for item in row["candles"]
     ]
-    signal = current_signal(supertrend_points(candles), signal_at + timedelta(minutes=5))
+    signal = current_signal(supertrend_points(candles), signal_at + timedelta(minutes=1))
     payload = row["payload"]
     event = row.get("event_payload") or {}
     rust = {

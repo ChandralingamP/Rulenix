@@ -339,7 +339,7 @@ class AuthoritativeExecutionWorker:
         return generated
 
     async def _evaluate_supertrend(self, session: AsyncSession, now: datetime) -> int:
-        if not supertrend_entry_allowed(now) or now.minute % 5:
+        if not supertrend_entry_allowed(now):
             return 0
         generated = 0
         for underlying, config in CONFIGS.items():
@@ -350,7 +350,7 @@ class AuthoritativeExecutionWorker:
                     SELECT candle_time,open_price,high_price,low_price,close_price
                       FROM backtest_market_candles
                      WHERE exchange=:exchange AND symbol_token=:token
-                       AND interval_key='FIVE_MINUTE' AND candle_time>=:start AND candle_time<=:end
+                       AND interval_key='ONE_MINUTE' AND candle_time>=:start AND candle_time<=:end
                      ORDER BY candle_time
                     """),
                         {

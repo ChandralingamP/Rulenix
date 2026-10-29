@@ -10,6 +10,7 @@ from .common import (
     IST,
     Candle,
     as_ist,
+    latest_completed_one_minute,
     latest_completed_five_minute,
     supertrend_entry_allowed,
     supertrend_eod_due,
@@ -179,7 +180,7 @@ def signal_from_transition(
 
 
 def current_signal(points: list[SuperTrendPoint], now: datetime) -> SuperTrendSignal | None:
-    target = latest_completed_five_minute(now).replace(tzinfo=None)
+    target = latest_completed_one_minute(now).replace(tzinfo=None)
     for previous, latest in pairwise(points):
         if latest.candle.at.replace(tzinfo=None) == target:
             return signal_from_transition(previous, latest)
@@ -187,7 +188,7 @@ def current_signal(points: list[SuperTrendPoint], now: datetime) -> SuperTrendSi
 
 
 def signal_is_fresh(signal: SuperTrendSignal, now: datetime) -> bool:
-    closed_at = signal.signal_at + timedelta(minutes=5)
+    closed_at = signal.signal_at + timedelta(minutes=1)
     local_now = as_ist(now).replace(tzinfo=None)
     signal_closed = closed_at.replace(tzinfo=None)
     return signal_closed <= local_now <= signal_closed + MAX_ENTRY_DELAY
@@ -226,7 +227,7 @@ def continuous_session_candles(
         while expected <= latest:
             if not any(candle.at.astimezone(IST) == expected for candle in selected):
                 raise ValueError(f"completed index candle {expected} is not available yet")
-            expected += timedelta(minutes=5)
+            expected += timedelta(minutes=1)
     return selected, previous_session
 
 

@@ -83,6 +83,11 @@ def normalize_to_tick(
     return normalized.normalize()
 
 
+def latest_completed_one_minute(value: datetime) -> datetime:
+    local = as_ist(value).replace(second=0, microsecond=0)
+    return local - timedelta(minutes=1)
+
+
 def latest_completed_five_minute(value: datetime) -> datetime:
     local = as_ist(value).replace(second=0, microsecond=0)
     minute = (local.minute // 5) * 5
@@ -96,6 +101,7 @@ __all__ = [
     "futures_session_open",
     "is_weekend",
     "ist_now",
+    "latest_completed_one_minute",
     "latest_completed_five_minute",
     "minute_of_day",
     "normalize_to_tick",

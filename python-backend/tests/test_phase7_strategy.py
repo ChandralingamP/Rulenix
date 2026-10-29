@@ -95,14 +95,14 @@ def test_supertrend_flip_to_call_matches_rust_fixture():
     closes = [100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 91, 92, 93, 108]
     points = supertrend_points(
         [
-            candle(ts(9, 15) + timedelta(minutes=index * 5), str(close))
+            candle(ts(9, 15) + timedelta(minutes=index), str(close))
             for index, close in enumerate(closes)
         ],
         3,
         1,
     )
     assert points[-2].direction == "DOWN" and points[-1].direction == "UP"
-    signal = current_signal(points, ts(10, 30))
+    signal = current_signal(points, ts(9, 30))
     assert signal is not None and signal.side is OptionSide.CALL
 
 
@@ -117,7 +117,7 @@ def test_supertrend_entry_cutoff_and_eod_are_ist_and_timezone_independent():
 
 def test_supertrend_stale_flip_is_not_replayed():
     points = supertrend_points(
-        [candle(ts(9, 15) + timedelta(minutes=i * 5), str(100 + i)) for i in range(10)], 3, 1
+        [candle(ts(9, 15) + timedelta(minutes=i), str(100 + i)) for i in range(10)], 3, 1
     )
     assert current_signal(points, ts(12, 0)) is None
 
@@ -127,14 +127,14 @@ def test_supertrend_continuity_requires_previous_session_and_current_candles():
 
     friday = datetime(2026, 8, 21, 14, 40, tzinfo=ZoneInfo("Asia/Kolkata"))
     monday = datetime(2026, 8, 24, 9, 15, tzinfo=ZoneInfo("Asia/Kolkata"))
-    previous = [candle(friday + timedelta(minutes=i * 5), "100") for i in range(9)]
+    previous = [candle(friday + timedelta(minutes=i), "100") for i in range(9)]
     selected, previous_session = continuous_session_candles(
         previous + [candle(monday, "110")], monday.date(), monday
     )
     assert previous_session.isoformat() == "2026-08-21" and selected[-1].at == monday
     with pytest.raises(ValueError):
         continuous_session_candles(
-            [candle(monday, "110")], monday.date(), monday + timedelta(minutes=5)
+            [candle(monday, "110")], monday.date(), monday + timedelta(minutes=1)
         )
 
 

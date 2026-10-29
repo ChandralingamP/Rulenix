@@ -137,7 +137,7 @@ class SourceReader:
                 SELECT candle_time AS at,open_price AS open,high_price AS high,
                        low_price AS low,close_price AS close
                   FROM public.backtest_market_candles
-                 WHERE exchange=$1 AND symbol_token=$2 AND interval_key='FIVE_MINUTE'
+                 WHERE exchange=$1 AND symbol_token=$2 AND interval_key='ONE_MINUTE'
                    AND candle_time BETWEEN $3 AND $4 ORDER BY candle_time
                 """,
                 config[0],

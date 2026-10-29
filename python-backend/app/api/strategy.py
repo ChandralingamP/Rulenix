@@ -15,7 +15,7 @@ from ..errors import DomainError
 router = APIRouter(tags=["strategy"])
 _STRATEGIES = {
     "futures_breakout_v3": ("Futures Breakout v3", "Four-day MCX futures breakout with stop-and-reverse trade management.", ("GOLDTEN", "GOLDM", "SILVERM", "SILVERMIC", "NATGASMINI")),
-    "supertrend_index_options_v1": ("SuperTrend Index Options v1", "Intraday 5-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.", ("SENSEX", "NIFTY")),
+    "supertrend_index_options_v1": ("SuperTrend Index Options v1", "Intraday 1-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.", ("SENSEX", "NIFTY")),
 }
 _FUTURES_LABELS = {"GOLDTEN": "Gold Ten", "GOLDM": "Gold Mini", "SILVERM": "Silver Mini", "SILVERMIC": "Silver Micro", "NATGASMINI": "Natural Gas Mini"}
 _INDEX_OPTIONS = {
@@ -59,7 +59,7 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
             "run_evening_session": bool(row["run_evening_session"]) if row else False,
             "target_points": target,
             "stop_loss_points": stop,
-            "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "FIVE_MINUTE", "contract_selection": "ATM"},
+            "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "ONE_MINUTE", "contract_selection": "ATM"},
             "snapshot": {"strategy_key": "supertrend_index_options_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_expiry": None, "lot_size": None, "market_data": market_data},
         })
     return [
@@ -109,7 +109,50 @@ async def update(payload: dict, user: Principal = Depends(current_user), db: Asy
         raise DomainError(400, "Lots must be a positive integer.")
     if payload.get("enabled") and not await db.scalar(text("SELECT COALESCE(is_active,FALSE) FROM user_strategy_activations WHERE user_id=:user AND strategy_key=:key"), {"user": user.id, "key": key}):
         raise DomainError(400, "Activate the strategy before enabling an instrument.")
-    await db.execute(text("INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session,target_points,stop_loss_points) VALUES(:user,:key,:instrument,:enabled,:lots,:day,:evening,:target,:stop) ON CONFLICT(user_id,strategy_key,instrument) DO UPDATE SET enabled=EXCLUDED.enabled,lots=EXCLUDED.lots,run_day_session=EXCLUDED.run_day_session,run_evening_session=EXCLUDED.run_evening_session,target_points=EXCLUDED.target_points,stop_loss_points=EXCLUDED.stop_loss_points,updated_at=NOW()"), {"user": user.id, "key": key, "instrument": instrument, "enabled": bool(payload.get("enabled", False)), "lots": lots, "day": bool(payload.get("run_day_session", True)), "evening": bool(payload.get("run_evening_session", key != "supertrend_index_options_v1")), "target": payload.get("target_points"), "stop": payload.get("stop_loss_points")})
+    target_raw = payload.get("target_points")
+    stop_raw = payload.get("stop_loss_points")
+    if key == "supertrend_index_options_v1":
+        default_target = _INDEX_OPTIONS.get(instrument, {}).get("target", 25.0)
+        default_stop = _INDEX_OPTIONS.get(instrument, {}).get("stop", 15.0)
+        try:
+            target = float(target_raw) if target_raw is not None and float(target_raw) > 0 else default_target
+        except (ValueError, TypeError):
+            target = default_target
+        try:
+            stop = float(stop_raw) if stop_raw is not None and float(stop_raw) > 0 else default_stop
+        except (ValueError, TypeError):
+            stop = default_stop
+    else:
+        try:
+            target = float(target_raw) if target_raw is not None else 0.0
+        except (ValueError, TypeError):
+            target = 0.0
+        try:
+            stop = float(stop_raw) if stop_raw is not None else 0.0
+        except (ValueError, TypeError):
+            stop = 0.0
+
+    await db.execute(
+        text(
+            "INSERT INTO user_strategy_configs(user_id,strategy_key,instrument,enabled,lots,run_day_session,run_evening_session,target_points,stop_loss_points) "
+            "VALUES(:user,:key,:instrument,:enabled,:lots,:day,:evening,:target,:stop) "
+            "ON CONFLICT(user_id,strategy_key,instrument) DO UPDATE SET "
+            "enabled=EXCLUDED.enabled,lots=EXCLUDED.lots,run_day_session=EXCLUDED.run_day_session,"
+            "run_evening_session=EXCLUDED.run_evening_session,target_points=EXCLUDED.target_points,"
+            "stop_loss_points=EXCLUDED.stop_loss_points,updated_at=NOW()"
+        ),
+        {
+            "user": user.id,
+            "key": key,
+            "instrument": instrument,
+            "enabled": bool(payload.get("enabled", False)),
+            "lots": lots,
+            "day": bool(payload.get("run_day_session", True)),
+            "evening": bool(payload.get("run_evening_session", key != "supertrend_index_options_v1")),
+            "target": target,
+            "stop": stop,
+        },
+    )
     await db.commit()
     return {"strategies": await _catalog(db, user.id)}
 
