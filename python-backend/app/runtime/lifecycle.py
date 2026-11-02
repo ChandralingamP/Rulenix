@@ -8,6 +8,8 @@ are deliberately left for reconciliation and are never blindly replayed.
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -424,7 +426,163 @@ class AuthoritativeExecutionWorker:
                         },
                     )
                 )
-                if not processed:
+                if processed:
+                    continue
+
+                existing_trade = (
+                    await session.execute(
+                        text("""
+                        SELECT t.id, t.direction, t.quantity, t.last_price, t.entry_price,
+                               t.execution_mode, t.pnl, t.notes,
+                               s.instrument AS snapshot_instrument,
+                               s.contract_token, s.exchange_segment
+                          FROM trades t
+                          JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
+                         WHERE t.user_id = :user
+                           AND t.strategy_key = :strategy
+                           AND t.instrument_label = :instrument
+                           AND t.status = 'open'
+                         ORDER BY t.created_at DESC LIMIT 1
+                         FOR UPDATE OF t
+                        """),
+                        {
+                            "user": runner["user_id"],
+                            "strategy": SUPERTREND,
+                            "instrument": underlying,
+                        },
+                    )
+                ).mappings().first()
+
+                if existing_trade is not None:
+                    is_same_side = str(existing_trade["snapshot_instrument"] or "").endswith(signal.side.value)
+                    if is_same_side:
+                        continue
+
+                    # SuperTrend trend reversal: close the existing opposite trade
+                    if existing_trade["execution_mode"] == "demo":
+                        await session.execute(
+                            text("""
+                            UPDATE strategy_orders
+                               SET status='cancelled',
+                                   broker_status='Demo order cancelled on SuperTrend reversal',
+                                   state_version=state_version+1,
+                                   updated_at=NOW()
+                             WHERE trade_id=:trade AND execution_mode='demo'
+                               AND status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+                            """),
+                            {"trade": existing_trade["id"]},
+                        )
+
+                        exit_price = await session.scalar(
+                            text("""
+                            SELECT price FROM market_price_ticks
+                             WHERE UPPER(exchange_segment)=UPPER(:exchange)
+                               AND contract_token=:token
+                               AND price>0
+                             ORDER BY received_at DESC LIMIT 1
+                            """),
+                            {
+                                "exchange": existing_trade["exchange_segment"],
+                                "token": existing_trade["contract_token"],
+                            },
+                        )
+                        if exit_price is None or Decimal(str(exit_price)) <= 0:
+                            exit_price = existing_trade["last_price"] or existing_trade["entry_price"] or Decimal("0")
+
+                        trade_qty = int(existing_trade["quantity"] or 0)
+                        realized_pnl = Decimal(str(existing_trade["pnl"] or 0)) + trade_pnl(
+                            str(existing_trade["direction"]),
+                            existing_trade["entry_price"],
+                            Decimal(str(exit_price)),
+                            trade_qty,
+                        )
+
+                        await session.execute(
+                            text("""
+                            UPDATE trades
+                               SET status='closed',
+                                   safety_status='CLOSED',
+                                   remaining_lots=0,
+                                   exit_price=:price,
+                                   last_price=:price,
+                                   pnl=:pnl,
+                                   exit_datetime=NOW(),
+                                   exit_reason='SIGNAL_REVERSAL',
+                                   notes=CONCAT(COALESCE(notes,''),'; closed on SuperTrend trend reversal'),
+                                   updated_at=NOW()
+                             WHERE id=:trade AND status='open'
+                            """),
+                            {
+                                "trade": existing_trade["id"],
+                                "price": exit_price,
+                                "pnl": realized_pnl,
+                            },
+                        )
+
+                        await session.execute(
+                            text("""
+                            INSERT INTO strategy_events(user_id, strategy_key, instrument, event_type, payload)
+                            VALUES(:user, :strategy, :instrument, 'operational_alert', CAST(:payload AS jsonb))
+                            """),
+                            {
+                                "user": runner["user_id"],
+                                "strategy": SUPERTREND,
+                                "instrument": underlying,
+                                "payload": json.dumps({
+                                    "severity": "INFO",
+                                    "code": "SIGNAL_REVERSAL",
+                                    "message": f"SuperTrend reversed to {signal.side.value}. Closed existing DEMO {underlying} position.",
+                                }),
+                            },
+                        )
+                        pending.append(runner)
+                    else:
+                        has_in_flight_close = bool(
+                            await session.scalar(
+                                text("""
+                                SELECT EXISTS(
+                                    SELECT 1 FROM manual_trade_close_intents
+                                     WHERE trade_id=:trade AND status NOT IN ('completed','cancelled','failed')
+                                )
+                                """),
+                                {"trade": existing_trade["id"]},
+                            )
+                        )
+                        if not has_in_flight_close:
+                            from app.trading.repository import TradingRepository
+
+                            await TradingRepository(session).request_manual_close(
+                                trade_id=UUID(str(existing_trade["id"])),
+                                user_id=UUID(str(runner["user_id"])),
+                                requested_quantity=int(existing_trade["quantity"]),
+                            )
+                            await session.execute(
+                                text("""
+                                UPDATE trades
+                                   SET notes=CONCAT(COALESCE(notes,''),'; SuperTrend reversal close requested'),
+                                       updated_at=NOW()
+                                 WHERE id=:trade
+                                """),
+                                {"trade": existing_trade["id"]},
+                            )
+                            await session.execute(
+                                text("""
+                                INSERT INTO strategy_events(user_id, strategy_key, instrument, event_type, payload)
+                                VALUES(:user, :strategy, :instrument, 'operational_alert', CAST(:payload AS jsonb))
+                                """),
+                                {
+                                    "user": runner["user_id"],
+                                    "strategy": SUPERTREND,
+                                    "instrument": underlying,
+                                    "payload": json.dumps({
+                                        "severity": "INFO",
+                                        "code": "SIGNAL_REVERSAL",
+                                        "message": f"SuperTrend reversed to {signal.side.value}. Squaring off existing LIVE {underlying} position before reverse entry.",
+                                    }),
+                                },
+                            )
+                        continue
+                else:
                     pending.append(runner)
             if not pending or self.market_provider is None:
                 continue
@@ -781,7 +939,9 @@ class FillLifecycleWorker:
         remaining_lots = 0 if remaining == 0 else max(1, (remaining + lot_size - 1) // lot_size)
         role = str(order["role"])
         reason = (
-            "MARKET_CLOSED"
+            "SIGNAL_REVERSAL"
+            if trade.get("notes") and "SuperTrend reversal" in str(trade["notes"])
+            else "MARKET_CLOSED"
             if str(order["session_key"]).startswith("stsq-")
             else "MANUAL_RULENIX_CLOSE"
             if str(order["session_key"]).startswith("mc-")
