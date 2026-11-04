@@ -52,6 +52,7 @@ secrets/
 backend_logs/
 .runlogs/
 *.tar.gz
+scratch/
 
 # Editors / OS
 .idea/

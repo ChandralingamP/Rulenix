@@ -43,8 +43,13 @@ class ReconciliationService:
     async def apply_snapshot(self, snapshot: ReconciliationSnapshot) -> ReconciliationResult:
         async with self.session.begin(), self.repository.user_lock(snapshot.user_id) as acquired:
             if not acquired:
-                return ReconciliationResult(False, False, 1, 0, "Another reconciliation owns this account.")
-            current_revision = await self.session.scalar(text("SELECT broker_credential_revision FROM user_profiles WHERE user_id=:user"), {"user": snapshot.user_id})
+                return ReconciliationResult(
+                    False, False, 1, 0, "Another reconciliation owns this account."
+                )
+            current_revision = await self.session.scalar(
+                text("SELECT broker_credential_revision FROM user_profiles WHERE user_id=:user"),
+                {"user": snapshot.user_id},
+            )
             if current_revision is not None:
                 snapshot = replace(snapshot, current_credential_revision=int(current_revision))
             healthy = await self.repository.record_health(snapshot)
@@ -61,7 +66,7 @@ class ReconciliationService:
                         await self.session.execute(
                             text("""
                     SELECT t.id,t.strategy_key,t.instrument_label,t.status,t.direction,t.quantity,t.execution_mode,
-                           t.entry_price,t.pnl,t.entry_datetime,t.safety_status,
+                           t.entry_price,t.last_price,t.pnl,t.entry_datetime,t.safety_status,
                            s.exchange_segment,s.contract_token,s.contract_symbol,s.lot_size
                     FROM trades t LEFT JOIN strategy_market_snapshots s ON s.id=t.strategy_snapshot_id
                     WHERE t.user_id=:user AND t.execution_mode='live' AND (
@@ -162,7 +167,12 @@ class ReconciliationService:
                         .mappings()
                         .first()
                     )
-                    if manual_intent is not None and broker is None:
+                    if broker is None:
+                        evidence_since = (
+                            manual_intent["requested_at"]
+                            if manual_intent is not None
+                            else trade["entry_datetime"]
+                        )
                         local_count = int(
                             await self.session.scalar(
                                 text("""
@@ -201,9 +211,21 @@ class ReconciliationService:
                             local_trade_count=local_count,
                             local_direction=str(trade["direction"]),
                             trade_id=UUID(str(trade["id"])),
-                            evidence_since=manual_intent["requested_at"],
+                            evidence_since=evidence_since,
                             known_order_ids=known_broker_ids,
                         )
+                        if classification is not ManualCloseClassification.MANUAL_BROKER_CLOSE:
+                            trade_entry_date = (
+                                trade["entry_datetime"].date()
+                                if hasattr(trade["entry_datetime"], "date")
+                                else None
+                            )
+                            if trade_entry_date and trade_entry_date < datetime.now(UTC).date():
+                                classification = ManualCloseClassification.MANUAL_BROKER_CLOSE
+                                price = Decimal(
+                                    str(trade.get("last_price") or trade["entry_price"])
+                                )
+
                         if (
                             classification is ManualCloseClassification.MANUAL_BROKER_CLOSE
                             and price is not None
@@ -228,11 +250,35 @@ class ReconciliationService:
                             )
                             await self.session.execute(
                                 text("""
-                                UPDATE manual_trade_close_intents SET status='completed',last_error='',
-                                  completed_at=NOW(),updated_at=NOW() WHERE trade_id=:trade
+                                UPDATE strategy_orders
+                                   SET status='cancelled',
+                                       broker_status='Cancelled: position closed at broker',
+                                       updated_at=NOW()
+                                 WHERE trade_id=:trade
+                                   AND status IN ('pending','submitting','ambiguous','submitted','open','trigger_pending','partially_filled','processing','cancelling')
                                 """),
                                 {"trade": trade["id"]},
                             )
+                            await self.session.execute(
+                                text("""
+                                UPDATE strategy_execution_intents
+                                   SET status='expired',
+                                       completed_at=NOW(),
+                                       updated_at=NOW(),
+                                       last_error='Expired: position closed at broker'
+                                 WHERE trade_id=:trade
+                                   AND status IN ('pending','claimed','retry_wait','submitted')
+                                """),
+                                {"trade": trade["id"]},
+                            )
+                            if manual_intent is not None:
+                                await self.session.execute(
+                                    text("""
+                                    UPDATE manual_trade_close_intents SET status='completed',last_error='',
+                                      completed_at=NOW(),updated_at=NOW() WHERE trade_id=:trade
+                                    """),
+                                    {"trade": trade["id"]},
+                                )
                             await self.repository.consume_manual_close_evidence(
                                 trade_id=UUID(str(trade["id"])),
                                 user_id=snapshot.user_id,
@@ -276,25 +322,62 @@ class ReconciliationService:
                 observations: list[dict[str, object]] = []
                 ownership_counts = {ownership: 0 for ownership in ExposureOwnership}
 
-                def observe(kind: str, reference: str, ownership: ExposureOwnership, *, exchange: str = "", token: str = "", symbol: str = "", side: str = "", quantity: int = 0) -> None:
+                def observe(
+                    kind: str,
+                    reference: str,
+                    ownership: ExposureOwnership,
+                    *,
+                    exchange: str = "",
+                    token: str = "",
+                    symbol: str = "",
+                    side: str = "",
+                    quantity: int = 0,
+                ) -> None:
                     ownership_counts[ownership] += 1
-                    observations.append({"kind": kind, "reference": reference, "ownership": ownership.value, "exchange": exchange.upper(), "token": token, "symbol": symbol, "side": side, "quantity": quantity, "evidence": "authoritative broker reconciliation"})
+                    observations.append(
+                        {
+                            "kind": kind,
+                            "reference": reference,
+                            "ownership": ownership.value,
+                            "exchange": exchange.upper(),
+                            "token": token,
+                            "symbol": symbol,
+                            "side": side,
+                            "quantity": quantity,
+                            "evidence": "authoritative broker reconciliation",
+                        }
+                    )
 
                 for position in snapshot.positions.data or ():
                     if position.quantity == 0:
                         continue
                     ownership = classify_position_ownership(
-                        position, fills=snapshot.fills.data or (), orders=snapshot.orders.data or (),
-                        local_contracts=local_contracts, known_broker_ids=known_broker_ids,
+                        position,
+                        fills=snapshot.fills.data or (),
+                        orders=snapshot.orders.data or (),
+                        local_contracts=local_contracts,
+                        known_broker_ids=known_broker_ids,
                         known_client_ids=known_client_ids,
                     )
-                    observe("position", f"{position.exchange}:{position.token}", ownership,
-                            exchange=position.exchange, token=position.token, symbol=position.symbol,
-                            side="BUY" if position.quantity > 0 else "SELL",
-                            quantity=position.quantity)
+                    observe(
+                        "position",
+                        f"{position.exchange}:{position.token}",
+                        ownership,
+                        exchange=position.exchange,
+                        token=position.token,
+                        symbol=position.symbol,
+                        side="BUY" if position.quantity > 0 else "SELL",
+                        quantity=position.quantity,
+                    )
                 for order in snapshot.orders.data or ():
                     if order.status.lower() in {
-                        "complete", "completed", "filled", "cancelled", "canceled", "rejected", "expired"
+                        "complete",
+                        "completed",
+                        "filled",
+                        "cancelled",
+                        "canceled",
+                        "rejected",
+                        "expired",
                     }:
                         continue
                     ownership = classify_order_ownership(
@@ -302,18 +385,33 @@ class ReconciliationService:
                     )
                     if not order.status.strip():
                         ownership = ExposureOwnership.AMBIGUOUS
-                    observe("order", order.order_id or f"unknown:{len(observations)}", ownership,
-                            exchange=order.exchange, token=order.token, symbol=order.symbol,
-                            side=order.side, quantity=order.quantity)
+                    observe(
+                        "order",
+                        order.order_id or f"unknown:{len(observations)}",
+                        ownership,
+                        exchange=order.exchange,
+                        token=order.token,
+                        symbol=order.symbol,
+                        side=order.side,
+                        quantity=order.quantity,
+                    )
                 for rule in snapshot.conditional_rules.data or ():
                     if not rule.active:
                         continue
                     ownership = classify_conditional_ownership(rule)
-                    observe("conditional", rule.rule_id or f"unknown:{len(observations)}", ownership,
-                            exchange=rule.exchange, token=rule.token, symbol=rule.symbol,
-                            side=rule.side, quantity=rule.quantity)
+                    observe(
+                        "conditional",
+                        rule.rule_id or f"unknown:{len(observations)}",
+                        ownership,
+                        exchange=rule.exchange,
+                        token=rule.token,
+                        symbol=rule.symbol,
+                        side=rule.side,
+                        quantity=rule.quantity,
+                    )
                 await self.repository.replace_exposure_observations(
-                    user_id=snapshot.user_id, credential_revision=snapshot.credential_revision,
+                    user_id=snapshot.user_id,
+                    credential_revision=snapshot.credential_revision,
                     observations=observations,
                 )
                 owned = ownership_counts[ExposureOwnership.RULENIX_OWNED]
@@ -321,10 +419,18 @@ class ReconciliationService:
                 manual = ownership_counts[ExposureOwnership.MANUAL_EXTERNAL]
                 blockers = int(bool(owned or ambiguous))
                 await self.repository.record_blockers(
-                    snapshot, rulenix_owned_exposure=owned,
-                    ambiguous_exposure=ambiguous, manual_external_exposure=manual,
+                    snapshot,
+                    rulenix_owned_exposure=owned,
+                    ambiguous_exposure=ambiguous,
+                    manual_external_exposure=manual,
                 )
-            return ReconciliationResult(snapshot.authoritative, healthy, blockers, incidents, "Authoritative reconciliation applied." if healthy else snapshot.failure_detail)
+            return ReconciliationResult(
+                snapshot.authoritative,
+                healthy,
+                blockers,
+                incidents,
+                "Authoritative reconciliation applied." if healthy else snapshot.failure_detail,
+            )
 
     async def _resolve_position_incidents(self, user_id: UUID, trade) -> None:
         await self.session.execute(
@@ -346,7 +452,7 @@ class ReconciliationService:
             (
                 await self.session.execute(
                     text("""
-                SELECT id,status,broker_order_id,client_order_id,filled_quantity,processed_quantity
+                SELECT id,status,broker_order_id,client_order_id,filled_quantity,processed_quantity,created_at
                   FROM strategy_orders
                  WHERE user_id=:user AND execution_mode='live'
                    AND status IN ('submitting','ambiguous','submitted','partially_filled','processing','cancelling')
@@ -372,11 +478,56 @@ class ReconciliationService:
                 ),
                 None,
             )
+            order_not_found = False
             if broker is None and order["broker_order_id"]:
                 evidence = snapshot.individual_orders.get(str(order["broker_order_id"]))
                 if evidence is not None and evidence.status.successful:
                     broker = evidence.data
+                    if broker is None:
+                        order_not_found = True
+
             if broker is None:
+                is_stale_order = False
+                created = order.get("created_at")
+                if (
+                    created is not None
+                    and hasattr(created, "date")
+                    and created.date() < datetime.now(UTC).date()
+                ):
+                    is_stale_order = True
+
+                if order_not_found or is_stale_order:
+                    reason = (
+                        "Order not found on broker"
+                        if order_not_found
+                        else "Intraday order expired on previous session"
+                    )
+                    await self.session.execute(
+                        text("""
+                        UPDATE strategy_orders
+                           SET status='cancelled',broker_status=:reason,
+                               last_reconciled_at=NOW(),state_version=state_version+1,updated_at=NOW()
+                         WHERE id=:order
+                        """),
+                        {"reason": reason, "order": order["id"]},
+                    )
+                    await self.session.execute(
+                        text("""
+                        UPDATE strategy_execution_intents
+                           SET status='expired',completed_at=NOW(),updated_at=NOW(),last_error=:reason
+                         WHERE strategy_order_id=:order AND status IN ('pending','claimed','retry_wait','submitted')
+                        """),
+                        {"reason": reason, "order": order["id"]},
+                    )
+                    await self.session.execute(
+                        text("""
+                        UPDATE broker_mutation_attempts
+                           SET state='acknowledged',completed_at=COALESCE(completed_at,NOW()),
+                               diagnostic=:reason,updated_at=NOW()
+                         WHERE strategy_order_id=:order AND state IN ('prepared','submitting','ambiguous')
+                        """),
+                        {"reason": reason, "order": order["id"]},
+                    )
                 continue
             status = broker.status.strip().lower().replace(" ", "_")
             cumulative = max(int(order["filled_quantity"] or 0), int(broker.filled_quantity or 0))
@@ -500,35 +651,87 @@ class ReconciliationService:
                     {"order": order["id"]},
                 )
 
-    async def classify_manual_close(self, *, snapshot: ReconciliationSnapshot, local_symbol: str, local_token: str, local_exchange: str, entry_at, remaining_quantity: int, conflicting_executable_sibling: bool = False, local_trade_count: int = 1, local_direction: str | None = None, trade_id: UUID | None = None, evidence_since: datetime | None = None, known_order_ids: frozenset[str] = frozenset()) -> tuple[ManualCloseClassification, Decimal | None]:
+    async def classify_manual_close(
+        self,
+        *,
+        snapshot: ReconciliationSnapshot,
+        local_symbol: str,
+        local_token: str,
+        local_exchange: str,
+        entry_at,
+        remaining_quantity: int,
+        conflicting_executable_sibling: bool = False,
+        local_trade_count: int = 1,
+        local_direction: str | None = None,
+        trade_id: UUID | None = None,
+        evidence_since: datetime | None = None,
+        known_order_ids: frozenset[str] = frozenset(),
+    ) -> tuple[ManualCloseClassification, Decimal | None]:
         if not snapshot.authoritative:
             return ManualCloseClassification.RECONCILIATION_REQUIRED, None
-        broker_position = next((position for position in (snapshot.positions.data or ()) if position.token == local_token), None)
+        broker_position = next(
+            (
+                position
+                for position in (snapshot.positions.data or ())
+                if position.token == local_token
+            ),
+            None,
+        )
         fills = [fill for fill in (snapshot.fills.data or ()) if fill.token == local_token]
-        classification = classify_manual_broker_close(local_open=True, local_symbol=local_symbol, local_token=local_token, local_exchange=local_exchange, entry_at=entry_at, remaining_quantity=remaining_quantity, broker_position=broker_position, fills=fills, order_book_succeeded=True, positions_succeeded=True, fills_succeeded=True, conflicting_executable_sibling=conflicting_executable_sibling, local_trade_count=local_trade_count, local_direction=local_direction, evidence_since=evidence_since, known_order_ids=known_order_ids)
+        classification = classify_manual_broker_close(
+            local_open=True,
+            local_symbol=local_symbol,
+            local_token=local_token,
+            local_exchange=local_exchange,
+            entry_at=entry_at,
+            remaining_quantity=remaining_quantity,
+            broker_position=broker_position,
+            fills=fills,
+            order_book_succeeded=True,
+            positions_succeeded=True,
+            fills_succeeded=True,
+            conflicting_executable_sibling=conflicting_executable_sibling,
+            local_trade_count=local_trade_count,
+            local_direction=local_direction,
+            evidence_since=evidence_since,
+            known_order_ids=known_order_ids,
+        )
         if classification is not ManualCloseClassification.MANUAL_BROKER_CLOSE:
             return classification, None
         attributable = [
-            fill for fill in fills
-            if fill.symbol == local_symbol and fill.token == local_token
-            and fill.exchange == local_exchange and fill.filled_at >= entry_at
+            fill
+            for fill in fills
+            if fill.symbol == local_symbol
+            and fill.token == local_token
+            and fill.exchange == local_exchange
+            and fill.filled_at >= entry_at
             and (evidence_since is None or fill.filled_at >= evidence_since)
-            and not fill.owned_by_rulenix and fill.order_id not in known_order_ids
-            and (local_direction is None or fill.side.upper() == ("SELL" if local_direction.upper() == "BUY" else "BUY"))
+            and not fill.owned_by_rulenix
+            and fill.order_id not in known_order_ids
+            and (
+                local_direction is None
+                or fill.side.upper() == ("SELL" if local_direction.upper() == "BUY" else "BUY")
+            )
         ]
         price = weighted_fill_price(attributable)
         if trade_id is not None and price is not None:
-            await self.repository.store_manual_close_evidence(ManualCloseEvidence(
-                trade_id=trade_id, user_id=snapshot.user_id,
-                broker_credential_revision=snapshot.credential_revision,
-                exchange=local_exchange, token=local_token, symbol=local_symbol,
-                close_side=attributable[0].side.upper(), filled_quantity=remaining_quantity,
-                weighted_fill_price=price,
-                broker_order_ids=tuple(sorted({fill.order_id for fill in attributable})),
-                first_fill_at=min(fill.filled_at for fill in attributable),
-                last_fill_at=max(fill.filled_at for fill in attributable),
-                observed_at=datetime.now(UTC),
-            ))
+            await self.repository.store_manual_close_evidence(
+                ManualCloseEvidence(
+                    trade_id=trade_id,
+                    user_id=snapshot.user_id,
+                    broker_credential_revision=snapshot.credential_revision,
+                    exchange=local_exchange,
+                    token=local_token,
+                    symbol=local_symbol,
+                    close_side=attributable[0].side.upper(),
+                    filled_quantity=remaining_quantity,
+                    weighted_fill_price=price,
+                    broker_order_ids=tuple(sorted({fill.order_id for fill in attributable})),
+                    first_fill_at=min(fill.filled_at for fill in attributable),
+                    last_fill_at=max(fill.filled_at for fill in attributable),
+                    observed_at=datetime.now(UTC),
+                )
+            )
         return classification, price
 
 
