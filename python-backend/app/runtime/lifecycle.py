@@ -9,7 +9,6 @@ are deliberately left for reconciliation and are never blindly replayed.
 from __future__ import annotations
 
 import json
-
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -30,7 +29,6 @@ from app.strategy.execution import ExecutionOrchestrator
 from app.strategy.persistence import PreparedIntent, SignalRepository, prepare_square_off_intent
 from app.strategy.supertrend import (
     CONFIGS,
-    OptionSide,
     current_signal,
     signal_is_fresh,
     supertrend_points,
@@ -429,21 +427,13 @@ class AuthoritativeExecutionWorker:
                 if processed:
                     continue
 
-                existing_trade = (
-                    await session.execute(
+                active_intent = bool(
+                    await session.scalar(
                         text("""
-                        SELECT t.id, t.direction, t.quantity, t.last_price, t.entry_price,
-                               t.execution_mode, t.pnl, t.notes,
-                               s.instrument AS snapshot_instrument,
-                               s.contract_token, s.exchange_segment
-                          FROM trades t
-                          JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
-                         WHERE t.user_id = :user
-                           AND t.strategy_key = :strategy
-                           AND t.instrument_label = :instrument
-                           AND t.status = 'open'
-                         ORDER BY t.created_at DESC LIMIT 1
-                         FOR UPDATE OF t
+                        SELECT EXISTS(SELECT 1 FROM strategy_execution_intents
+                         WHERE user_id=:user AND strategy_key=:strategy
+                           AND instrument=:instrument AND action='ENTRY'
+                           AND status IN ('pending','claimed','retry_wait','submitted'))
                         """),
                         {
                             "user": runner["user_id"],
@@ -451,11 +441,46 @@ class AuthoritativeExecutionWorker:
                             "instrument": underlying,
                         },
                     )
-                ).mappings().first()
+                )
+                if active_intent:
+                    continue
+
+                existing_trade = (
+                    (
+                        await session.execute(
+                            text("""
+                        SELECT t.id, t.direction, t.quantity, t.last_price, t.entry_price,
+                               t.execution_mode, t.pnl, t.notes, t.instrument_label,
+                               s.instrument AS snapshot_instrument,
+                               s.contract_token, s.exchange_segment
+                          FROM trades t
+                          JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
+                         WHERE t.user_id = :user
+                           AND t.strategy_key = :strategy
+                           AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
+                           AND t.status = 'open'
+                         ORDER BY t.created_at DESC LIMIT 1
+                         FOR UPDATE OF t
+                        """),
+                            {
+                                "user": runner["user_id"],
+                                "strategy": SUPERTREND,
+                                "instrument": underlying,
+                                "prefix": f"{underlying}_%",
+                            },
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
 
                 if existing_trade is not None:
-                    is_same_side = str(existing_trade["snapshot_instrument"] or "").endswith(signal.side.value)
-                    if is_same_side:
+                    trade_inst = str(
+                        existing_trade["instrument_label"]
+                        or existing_trade["snapshot_instrument"]
+                        or ""
+                    )
+                    if trade_inst.endswith((signal.side.value, f"_{signal.side.value}")):
                         continue
 
                     # SuperTrend trend reversal: close the existing opposite trade
@@ -487,7 +512,11 @@ class AuthoritativeExecutionWorker:
                             },
                         )
                         if exit_price is None or Decimal(str(exit_price)) <= 0:
-                            exit_price = existing_trade["last_price"] or existing_trade["entry_price"] or Decimal("0")
+                            exit_price = (
+                                existing_trade["last_price"]
+                                or existing_trade["entry_price"]
+                                or Decimal(0)
+                            )
 
                         trade_qty = int(existing_trade["quantity"] or 0)
                         realized_pnl = Decimal(str(existing_trade["pnl"] or 0)) + trade_pnl(
@@ -528,11 +557,13 @@ class AuthoritativeExecutionWorker:
                                 "user": runner["user_id"],
                                 "strategy": SUPERTREND,
                                 "instrument": underlying,
-                                "payload": json.dumps({
-                                    "severity": "INFO",
-                                    "code": "SIGNAL_REVERSAL",
-                                    "message": f"SuperTrend reversed to {signal.side.value}. Closed existing DEMO {underlying} position.",
-                                }),
+                                "payload": json.dumps(
+                                    {
+                                        "severity": "INFO",
+                                        "code": "SIGNAL_REVERSAL",
+                                        "message": f"SuperTrend reversed to {signal.side.value}. Closed existing DEMO {underlying} position.",
+                                    }
+                                ),
                             },
                         )
                         pending.append(runner)
@@ -574,15 +605,51 @@ class AuthoritativeExecutionWorker:
                                     "user": runner["user_id"],
                                     "strategy": SUPERTREND,
                                     "instrument": underlying,
-                                    "payload": json.dumps({
-                                        "severity": "INFO",
-                                        "code": "SIGNAL_REVERSAL",
-                                        "message": f"SuperTrend reversed to {signal.side.value}. Squaring off existing LIVE {underlying} position before reverse entry.",
-                                    }),
+                                    "payload": json.dumps(
+                                        {
+                                            "severity": "INFO",
+                                            "code": "SIGNAL_REVERSAL",
+                                            "message": f"SuperTrend reversed to {signal.side.value}. Squaring off existing LIVE {underlying} position before reverse entry.",
+                                        }
+                                    ),
                                 },
                             )
                         continue
                 else:
+                    last_trade = (
+                        (
+                            await session.execute(
+                                text("""
+                            SELECT t.id, t.instrument_label, s.instrument AS snapshot_instrument
+                              FROM trades t
+                              LEFT JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
+                             WHERE t.user_id = :user
+                               AND t.strategy_key = :strategy
+                               AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
+                               AND t.created_at::date = :trade_date
+                             ORDER BY t.created_at DESC LIMIT 1
+                            """),
+                                {
+                                    "user": runner["user_id"],
+                                    "strategy": SUPERTREND,
+                                    "instrument": underlying,
+                                    "prefix": f"{underlying}_%",
+                                    "trade_date": signal.signal_at.date(),
+                                },
+                            )
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    if last_trade is not None:
+                        last_label = str(
+                            last_trade["instrument_label"]
+                            or last_trade["snapshot_instrument"]
+                            or ""
+                        )
+                        if last_label.endswith((signal.side.value, f"_{signal.side.value}")):
+                            # Strict alternation: already executed this side today, wait for next trend reversal
+                            continue
                     pending.append(runner)
             if not pending or self.market_provider is None:
                 continue
@@ -661,7 +728,6 @@ class AuthoritativeExecutionWorker:
             f"{signal.signal_at:%Y%m%d%H%M}-{selection.contract.symbol}-"
             f"{UUID(str(runner['user_id'])).hex}"
         )
-        call = signal.side is OptionSide.CALL
         await session.execute(
             text("""
             INSERT INTO strategy_market_snapshots(

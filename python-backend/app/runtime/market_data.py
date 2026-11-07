@@ -1,51 +1,27 @@
 """Continuous market-data ingestion for Futures Breakout snapshots and SuperTrend 1-minute candles."""
 
-
-
 from __future__ import annotations
 
-
-
 import asyncio
-
 import logging
-
 from collections.abc import Callable, Sequence
-
 from datetime import UTC, date, datetime, timedelta
-
 from decimal import Decimal
-
 from typing import Any
-
 from uuid import UUID, uuid4
 
-
-
 import httpx
-
 from sqlalchemy import text
-
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-
-
 from app.broker.angel.client import AngelClient
-
 from app.config import Settings
-
 from app.runtime.market import quote_ltps
-
 from app.strategy.common import IST
-
 from app.strategy.futures_breakout import calculate_levels
-
 from app.strategy.supertrend import parse_expiry
 
-
-
 logger = logging.getLogger(__name__)
-
 
 
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -53,15 +29,9 @@ MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenA
 FUTURES_INSTRUMENTS = ("GOLDTEN", "GOLDM", "SILVERM", "SILVERMIC", "NATGASMINI")
 
 INDEX_INSTRUMENTS = {
-
     "NIFTY": ("NSE", "99926000", "NIFTY"),
-
     "SENSEX": ("BSE", "99919000", "SENSEX"),
-
 }
-
-
-
 
 
 def weekdays_until(start: date, end: date) -> int:
@@ -71,91 +41,62 @@ def weekdays_until(start: date, end: date) -> int:
     current = start
 
     while current < end:
-
         current += timedelta(days=1)
 
         if current.weekday() < 5:
-
             count += 1
 
     return count
 
 
-
-
-
 def select_futures_contract(
-
     contracts: Sequence[dict[str, Any]],
-
     instrument: str,
-
     trade_date: date,
-
 ) -> dict[str, Any] | None:
 
     candidates: list[tuple[date, dict[str, Any]]] = []
 
     for item in contracts:
-
         if (
-
             str(item.get("exch_seg") or "") == "MCX"
-
             and str(item.get("name") or "").upper() == instrument.upper()
-
             and str(item.get("instrumenttype") or "") == "FUTCOM"
-
         ):
-
             try:
-
                 expiry = parse_expiry(str(item.get("expiry") or ""))
 
             except Exception as exc:
-
                 logger.debug("Failed parsing expiry for contract %s: %s", item.get("symbol"), exc)
 
                 continue
 
             if expiry >= trade_date and weekdays_until(trade_date, expiry) >= 10:
-
                 candidates.append((expiry, item))
 
-
-
     if not candidates:
-
         for item in contracts:
-
             if (
-
                 str(item.get("exch_seg") or "") == "MCX"
-
                 and str(item.get("name") or "").upper() == instrument.upper()
-
                 and str(item.get("instrumenttype") or "") == "FUTCOM"
-
             ):
-
                 try:
-
                     expiry = parse_expiry(str(item.get("expiry") or ""))
 
                 except Exception as exc:
-
-                    logger.debug("Failed parsing expiry for fallback contract %s: %s", item.get("symbol"), exc)
+                    logger.debug(
+                        "Failed parsing expiry for fallback contract %s: %s",
+                        item.get("symbol"),
+                        exc,
+                    )
 
                     continue
 
                 if expiry >= trade_date:
-
                     candidates.append((expiry, item))
 
-
-
     if not candidates:
-
         return None
 
     candidates.sort(key=lambda pair: pair[0])
@@ -163,15 +104,11 @@ def select_futures_contract(
     return candidates[0][1]
 
 
-
-
-
 def exchange_feed_expected(exchange: str, now: datetime | None = None) -> bool:
 
     now_ist = (now or datetime.now(UTC)).astimezone(IST)
 
     if now_ist.weekday() >= 5:
-
         return False
 
     minute = now_ist.hour * 60 + now_ist.minute
@@ -179,37 +116,23 @@ def exchange_feed_expected(exchange: str, now: datetime | None = None) -> bool:
     exch = exchange.upper().strip()
 
     if exch in {"NSE", "NFO", "BSE", "BFO"}:
-
         return (9 * 60 + 15) <= minute <= (15 * 60 + 30)
 
     elif exch == "MCX":
-
         return (9 * 60) <= minute <= (23 * 60 + 30)
 
     return True
 
 
-
-
-
 class MarketDataIngestionService:
-
     def __init__(
-
         self,
-
         session_factory: async_sessionmaker[AsyncSession],
-
         client_factory: Callable[[UUID], Any],
-
         settings: Settings,
-
         *,
-
         master_url: str = MASTER_URL,
-
         http_client: httpx.AsyncClient | None = None,
-
     ) -> None:
 
         self.session_factory = session_factory
@@ -228,16 +151,12 @@ class MarketDataIngestionService:
 
         self._master_lock = asyncio.Lock()
 
-
-
     async def get_master_contracts(self, *, refresh: bool = False) -> tuple[dict[str, Any], ...]:
 
         today = datetime.now(IST).date()
 
         async with self._master_lock:
-
             if not refresh and self._cache_date == today and self._contracts:
-
                 return self._contracts
 
             owns_client = self.http_client is None
@@ -245,7 +164,6 @@ class MarketDataIngestionService:
             client = self.http_client or httpx.AsyncClient(timeout=120)
 
             try:
-
                 response = await client.get(self.master_url)
 
                 response.raise_for_status()
@@ -253,19 +171,15 @@ class MarketDataIngestionService:
                 payload = response.json()
 
             finally:
-
                 if owns_client:
-
                     await client.aclose()
 
             if not isinstance(payload, list) or not payload:
-
                 raise RuntimeError("Angel contract master is empty or malformed.")
 
             contracts = tuple(item for item in payload if isinstance(item, dict))
 
             if not contracts:
-
                 raise RuntimeError("Angel contract master contains no valid contracts.")
 
             self._cache_date = today
@@ -274,16 +188,11 @@ class MarketDataIngestionService:
 
             return contracts
 
-
-
     async def get_active_broker_client(self) -> tuple[UUID, AngelClient] | None:
 
         async with self.session_factory() as session:
-
             row = (
-
                 await session.execute(
-
                     text("""
 
                     SELECT p.user_id
@@ -309,13 +218,10 @@ class MarketDataIngestionService:
                      LIMIT 1
 
                     """)
-
                 )
-
             ).first()
 
             if not row:
-
                 return None
 
             user_id = row[0]
@@ -324,29 +230,22 @@ class MarketDataIngestionService:
 
         return user_id, client
 
-
-
     async def sync_supertrend_candles(
-
         self,
-
         until: datetime | None = None,
-
         days: int = 5,
-
     ) -> int:
 
         active = await self.get_active_broker_client()
 
         if not active:
-
-            logger.warning("No active connected broker session found for SuperTrend candle ingestion.")
+            logger.warning(
+                "No active connected broker session found for SuperTrend candle ingestion."
+            )
 
             return 0
 
         _, client = active
-
-
 
         now = until or datetime.now(UTC)
 
@@ -356,62 +255,45 @@ class MarketDataIngestionService:
 
         to_str = now.astimezone(IST).strftime("%Y-%m-%d %H:%M")
 
-
-
         total_inserted = 0
 
         for instrument_name, (exchange, token, trading_symbol) in INDEX_INSTRUMENTS.items():
-
             try:
-
-                raw_candles = await client.rest.candles(exchange, token, "ONE_MINUTE", from_str, to_str)
-
+                raw_candles = await client.rest.candles(
+                    exchange, token, "ONE_MINUTE", from_str, to_str
+                )
             except Exception as exc:
-
-                if "rate limit" in str(exc).lower():
-
-                    await asyncio.sleep(1.5)
-
+                err_text = str(exc).lower()
+                if "rate limit" in err_text or "too many requests" in err_text or "429" in err_text:
+                    await asyncio.sleep(2.5)
                     try:
-
-                        raw_candles = await client.rest.candles(exchange, token, "ONE_MINUTE", from_str, to_str)
-
+                        raw_candles = await client.rest.candles(
+                            exchange, token, "ONE_MINUTE", from_str, to_str
+                        )
                     except Exception as retry_exc:
-
-                        logger.warning("Failed fetching 1-min candles for %s on retry: %s", instrument_name, retry_exc)
-
+                        logger.warning(
+                            "Failed fetching 1-min candles for %s on retry: %s",
+                            instrument_name,
+                            retry_exc,
+                        )
                         continue
-
                 else:
-
                     logger.warning("Failed fetching 1-min candles for %s: %s", instrument_name, exc)
-
                     continue
-
             finally:
-
                 await asyncio.sleep(1.0)
 
-
-
             if not isinstance(raw_candles, list):
-
                 continue
 
-
-
             async with self.session_factory() as session:
-
                 last_close_price: float | None = None
 
                 for item in raw_candles:
-
                     if not isinstance(item, list) or len(item) < 5:
-
                         continue
 
                     try:
-
                         time_str = str(item[0])
 
                         candle_dt = datetime.fromisoformat(time_str).astimezone(UTC)
@@ -429,13 +311,9 @@ class MarketDataIngestionService:
                         last_close_price = close_p
 
                     except (ValueError, TypeError):
-
                         continue
 
-
-
                     await session.execute(
-
                         text("""
 
                         INSERT INTO backtest_market_candles (
@@ -469,43 +347,25 @@ class MarketDataIngestionService:
                             fetched_at = NOW()
 
                         """),
-
                         {
-
                             "id": uuid4(),
-
                             "exchange": exchange,
-
                             "instrument": instrument_name,
-
                             "token": token,
-
                             "trading_symbol": trading_symbol,
-
                             "candle_time": candle_dt,
-
                             "open_price": open_p,
-
                             "high_price": high_p,
-
                             "low_price": low_p,
-
                             "close_price": close_p,
-
                             "volume": vol,
-
                         },
-
                     )
 
                     total_inserted += 1
 
-
-
                 if last_close_price is not None and last_close_price > 0:
-
                     await session.execute(
-
                         text("""
 
                         INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
@@ -517,16 +377,12 @@ class MarketDataIngestionService:
                           SET price = EXCLUDED.price, received_at = NOW()
 
                         """),
-
                         {"exchange": exchange, "token": token, "price": last_close_price},
-
                     )
 
                 await session.commit()
 
         return total_inserted
-
-
 
     async def sync_futures_snapshots(self, target_date: date | None = None) -> int:
 
@@ -535,14 +391,11 @@ class MarketDataIngestionService:
         active = await self.get_active_broker_client()
 
         if not active:
-
             logger.warning("No active connected broker session found for Futures snapshot sync.")
 
             return 0
 
         _, client = active
-
-
 
         contracts = await self.get_master_contracts()
 
@@ -550,46 +403,33 @@ class MarketDataIngestionService:
 
         to_str = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d 23:59")
 
-
-
         synced_count = 0
 
         for instrument in FUTURES_INSTRUMENTS:
-
             contract = select_futures_contract(contracts, instrument, trade_date)
 
             if not contract:
-
                 logger.warning("No contract available for %s on %s", instrument, trade_date)
 
                 continue
-
-
 
             token = str(contract.get("token") or "")
 
             symbol = str(contract.get("symbol") or "")
 
             try:
-
                 expiry = parse_expiry(str(contract.get("expiry") or ""))
 
                 lot_size = int(float(str(contract.get("lotsize") or "1")))
 
             except Exception as exc:
-
                 logger.warning("Invalid contract fields for %s: %s", instrument, exc)
 
                 continue
 
-
-
             async with self.session_factory() as session:
-
                 existing_snap = (
-
                     await session.execute(
-
                         text("""
 
                         SELECT 1 FROM strategy_market_snapshots
@@ -601,78 +441,59 @@ class MarketDataIngestionService:
                            AND trade_date = :trade_date
 
                         """),
-
                         {"instrument": instrument, "trade_date": trade_date},
-
                     )
-
                 ).scalar()
 
             if existing_snap:
-
                 continue
 
-
-
             try:
-
                 raw_candles = await client.rest.candles("MCX", token, "ONE_DAY", from_str, to_str)
 
             except Exception as exc:
-
                 if "rate limit" in str(exc).lower():
-
                     await asyncio.sleep(1.5)
 
                     try:
-
-                        raw_candles = await client.rest.candles("MCX", token, "ONE_DAY", from_str, to_str)
+                        raw_candles = await client.rest.candles(
+                            "MCX", token, "ONE_DAY", from_str, to_str
+                        )
 
                     except Exception as retry_exc:
-
-                        logger.warning("Failed fetching daily candles for %s on retry: %s", instrument, retry_exc)
+                        logger.warning(
+                            "Failed fetching daily candles for %s on retry: %s",
+                            instrument,
+                            retry_exc,
+                        )
 
                         continue
 
                 else:
-
                     logger.warning("Failed fetching daily candles for %s: %s", instrument, exc)
 
                     continue
 
             finally:
-
                 await asyncio.sleep(1.0)
-
-
 
             daily_candles: list[tuple[date, float, float, float]] = []
 
             if isinstance(raw_candles, list):
-
                 for row in raw_candles:
-
                     if not isinstance(row, list) or len(row) < 5:
-
                         continue
 
                     try:
-
                         c_date = datetime.fromisoformat(str(row[0])).date()
 
                         if c_date < trade_date:
-
                             daily_candles.append(
-
                                 (c_date, float(row[2]), float(row[3]), float(row[4]))
-
                             )
 
                     except (ValueError, TypeError):
-
                         continue
-
-
 
             daily_candles.sort(key=lambda item: item[0])
 
@@ -681,25 +502,16 @@ class MarketDataIngestionService:
             seen_dates: set[date] = set()
 
             for item in daily_candles:
-
                 if item[0] not in seen_dates:
-
                     seen_dates.add(item[0])
 
                     deduped.append(item)
 
-
-
             if len(deduped) > 4:
-
                 deduped = deduped[-4:]
 
-
-
             async with self.session_factory() as session:
-
                 if len(deduped) == 4:
-
                     c_dates = [item[0] for item in deduped]
 
                     highs = [item[1] for item in deduped]
@@ -708,60 +520,49 @@ class MarketDataIngestionService:
 
                     prev_close = deduped[-1][3]
 
-
-
                     levels = calculate_levels(
-
                         [Decimal(str(h)) for h in highs],
-
                         [Decimal(str(l)) for l in lows],
-
                     )
-
-
 
                     quote = None
 
                     try:
-
                         quote = await client.rest.quote("FULL", {"MCX": [token]})
 
                     except Exception as exc:
-
                         logger.debug("Could not fetch MCX quote for token %s: %s", token, exc)
-
-
 
                     market_open: float | None = None
 
                     ltp: float | None = None
 
                     if isinstance(quote, dict):
-
                         data = quote.get("data")
 
                         if isinstance(data, dict):
-
                             market_open = float(data.get("open") or data.get("opn") or 0.0) or None
 
                             ltp = float(data.get("ltp") or data.get("lastPrice") or 0.0) or None
 
                         elif isinstance(data, list) and data:
-
                             first_item = data[0]
 
                             if isinstance(first_item, dict):
+                                market_open = (
+                                    float(first_item.get("open") or first_item.get("opn") or 0.0)
+                                    or None
+                                )
 
-                                market_open = float(first_item.get("open") or first_item.get("opn") or 0.0) or None
-
-                                ltp = float(first_item.get("ltp") or first_item.get("lastPrice") or 0.0) or None
-
-
+                                ltp = (
+                                    float(
+                                        first_item.get("ltp") or first_item.get("lastPrice") or 0.0
+                                    )
+                                    or None
+                                )
 
                     if ltp is not None and ltp > 0:
-
                         await session.execute(
-
                             text("""
 
                             INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
@@ -773,23 +574,15 @@ class MarketDataIngestionService:
                               SET price = EXCLUDED.price, received_at = NOW()
 
                             """),
-
                             {"token": token, "price": ltp},
-
                         )
-
-
 
                     buy_entry = float(levels.buy_entry)
 
                     sell_entry = float(levels.sell_entry)
 
-
-
                     if market_open is not None and market_open > 0:
-
                         if market_open > buy_entry:
-
                             gap_dir = "BUY_MISSED"
 
                             plan_status = "WAITING_RANGE"
@@ -797,7 +590,6 @@ class MarketDataIngestionService:
                             src = "OPENING_RANGE"
 
                         elif market_open < sell_entry:
-
                             gap_dir = "SELL_MISSED"
 
                             plan_status = "WAITING_RANGE"
@@ -805,7 +597,6 @@ class MarketDataIngestionService:
                             src = "OPENING_RANGE"
 
                         else:
-
                             gap_dir = "NONE_MISSED"
 
                             plan_status = "READY"
@@ -813,7 +604,6 @@ class MarketDataIngestionService:
                             src = "STANDARD"
 
                     else:
-
                         market_open = prev_close
 
                         gap_dir = "NONE_MISSED"
@@ -822,10 +612,7 @@ class MarketDataIngestionService:
 
                         src = "STANDARD"
 
-
-
                     await session.execute(
-
                         text("""
 
                         INSERT INTO strategy_market_snapshots (
@@ -923,75 +710,43 @@ class MarketDataIngestionService:
                             fetched_at = NOW()
 
                         """),
-
                         {
-
                             "id": uuid4(),
-
                             "instrument": instrument,
-
                             "trade_date": trade_date,
-
                             "contract_token": token,
-
                             "contract_symbol": symbol,
-
                             "contract_expiry": expiry,
-
                             "lot_size": lot_size,
-
                             "candle_dates": c_dates,
-
                             "highs": highs,
-
                             "lows": lows,
-
                             "hh2": float(levels.hh2),
-
                             "ll2": float(levels.ll2),
-
                             "hh4": float(levels.hh4),
-
                             "ll4": float(levels.ll4),
-
                             "buy_entry": buy_entry,
-
                             "buy_target": float(levels.buy_target),
-
                             "buy_sl1": float(levels.buy_sl1),
-
                             "buy_sl2": float(levels.buy_sl2),
-
                             "sell_entry": sell_entry,
-
                             "sell_target": float(levels.sell_target),
-
                             "sell_sl1": float(levels.sell_sl1),
-
                             "sell_sl2": float(levels.sell_sl2),
-
                             "previous_close": prev_close,
-
                             "market_open": market_open,
-
                             "gap_direction": gap_dir,
-
                             "entry_source": src,
-
                             "gap_plan_status": plan_status,
-
                         },
-
                     )
 
                     synced_count += 1
 
                 else:
-
                     err_msg = f"Expected 4 completed trading days, received {len(deduped)}."
 
                     await session.execute(
-
                         text("""
 
                         INSERT INTO strategy_market_snapshots (
@@ -1031,36 +786,21 @@ class MarketDataIngestionService:
                             fetched_at = NOW()
 
                         """),
-
                         {
-
                             "id": uuid4(),
-
                             "instrument": instrument,
-
                             "trade_date": trade_date,
-
                             "error": err_msg,
-
                             "contract_token": token,
-
                             "contract_symbol": symbol,
-
                             "contract_expiry": expiry,
-
                             "lot_size": lot_size,
-
                         },
-
                     )
 
                 await session.commit()
 
-
-
         return synced_count
-
-
 
     async def run_cycle(self) -> dict[str, object]:
 
@@ -1068,27 +808,19 @@ class MarketDataIngestionService:
 
         today = now_ist.date()
 
-
-
         # Sync futures snapshots for today
 
         futures_synced = await self.sync_futures_snapshots(today)
-
-
 
         # If past 16:00 IST on a weekday, pre-populate next trading day's snapshots
 
         next_day = today + timedelta(days=1)
 
         while next_day.weekday() >= 5:
-
             next_day += timedelta(days=1)
 
         if now_ist.hour >= 16:
-
             await self.sync_futures_snapshots(next_day)
-
-
 
         # Sync 1-minute candles
 
@@ -1096,40 +828,26 @@ class MarketDataIngestionService:
 
         minute = now_ist.hour * 60 + now_ist.minute
 
+        await asyncio.sleep(1.0)
         if now_ist.weekday() < 5 and (9 * 60 + 15 <= minute <= 15 * 60 + 35):
-
             candles_synced = await self.sync_supertrend_candles(days=1)
 
         elif now_ist.weekday() < 5:
-
             candles_synced = await self.sync_supertrend_candles(days=3)
 
-
-
         return {
-
             "status": "ok",
-
             "trade_date": str(today),
-
             "futures_snapshots_synced": futures_synced,
-
             "candles_synced": candles_synced,
-
         }
 
-
-
     async def sync_active_contract_ticks(self) -> int:
-
         """Continuously update market_price_ticks and trades.last_price for active contracts."""
 
         async with self.session_factory() as session:
-
             rows = (
-
                 await session.execute(
-
                     text("""
 
                     SELECT DISTINCT UPPER(s.exchange_segment) AS exchange_segment, s.contract_token
@@ -1159,95 +877,63 @@ class MarketDataIngestionService:
                        AND TRIM(s.contract_token) <> ''
 
                     """)
-
                 )
-
             ).all()
 
-
-
         if not rows:
-
             return 0
-
-
 
         exchange_tokens: dict[str, list[str]] = {}
 
         for exch, token in rows:
-
             if not exch or not token:
-
                 continue
 
             if not exchange_feed_expected(str(exch)):
-
                 continue
 
             exchange_tokens.setdefault(str(exch).strip(), []).append(str(token).strip())
 
-
-
         if not exchange_tokens:
-
             return 0
-
-
 
         active = await self.get_active_broker_client()
 
         if not active:
-
             logger.debug("No active connected broker session found for tick sync.")
 
             return 0
 
         _, client = active
 
-
-
         updated_count = 0
 
         try:
-
             for exchange, tokens in exchange_tokens.items():
-
                 for i in range(0, len(tokens), 50):
-
                     chunk = tokens[i : i + 50]
 
                     try:
-
                         payload = await client.rest.quote("LTP", {exchange: chunk})
 
                     except Exception as exc:
-
                         logger.warning("Failed fetching LTP quote for %s tokens: %s", exchange, exc)
 
                         continue
 
-
-
                     prices = quote_ltps(payload)
 
                     if not prices:
-
                         continue
 
-
-
                     async with self.session_factory() as session, session.begin():
-
                         for token, price in prices.items():
-
                             if price is None or price <= 0:
-
                                 continue
 
                             p_float = float(price)
 
                             await session.execute(
-
                                 text("""
 
                                 INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
@@ -1259,13 +945,10 @@ class MarketDataIngestionService:
                                   SET price = EXCLUDED.price, received_at = NOW()
 
                                 """),
-
                                 {"exchange": exchange, "token": token, "price": p_float},
-
                             )
 
                             await session.execute(
-
                                 text("""
 
                                 UPDATE trades t
@@ -1283,38 +966,22 @@ class MarketDataIngestionService:
                                    AND s.contract_token = :token
 
                                 """),
-
                                 {"exchange": exchange, "token": token, "price": p_float},
-
                             )
 
                             updated_count += 1
 
         finally:
-
             await client.close()
-
-
 
         return updated_count
 
 
-
-
-
 __all__ = [
-
     "FUTURES_INSTRUMENTS",
-
     "INDEX_INSTRUMENTS",
-
     "MarketDataIngestionService",
-
     "exchange_feed_expected",
-
     "select_futures_contract",
-
     "weekdays_until",
-
 ]
-
