@@ -16,11 +16,15 @@ router = APIRouter(tags=["strategy"])
 _STRATEGIES = {
     "futures_breakout_v3": ("Futures Breakout v3", "Four-day MCX futures breakout with stop-and-reverse trade management.", ("GOLDTEN", "GOLDM", "SILVERM", "SILVERMIC", "NATGASMINI")),
     "supertrend_index_options_v1": ("SuperTrend Index Options v1", "Intraday 1-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.", ("SENSEX", "NIFTY")),
+    "nifty_opponent_v1": ("Nifty 50 Equivalent Opponent v1", "Intraday quantitative parity strategy trading Nifty 50 index options.", ("NIFTY",)),
 }
 _FUTURES_LABELS = {"GOLDTEN": "Gold Ten", "GOLDM": "Gold Mini", "SILVERM": "Silver Mini", "SILVERMIC": "Silver Micro", "NATGASMINI": "Natural Gas Mini"}
 _INDEX_OPTIONS = {
     "SENSEX": {"label": "SENSEX ATM Options", "exchange": "BFO", "token": "99919000", "target": 40.0, "stop": 25.0},
     "NIFTY": {"label": "NIFTY ATM Options", "exchange": "NFO", "token": "99926000", "target": 25.0, "stop": 15.0},
+}
+_OPPONENT_OPTIONS = {
+    "NIFTY": {"label": "Nifty 50 Opponent Parity", "exchange": "NFO", "token": "99926000", "default_partial_close_pct": 50.0},
 }
 
 
@@ -36,7 +40,7 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
     market_data = {
         "status": "connected" if connected_sessions else "disconnected",
         "connected_sessions": connected_sessions,
-        "message": "Angel One market-data session is connected." if connected_sessions else "Angel One market-data session is disconnected. Reconnect Angel One before SuperTrend can fetch index candles/options LTP or place live/demo entries.",
+        "message": "Angel One market-data session is connected." if connected_sessions else "Angel One market-data session is disconnected. Reconnect Angel One before strategies can fetch index candles/options LTP or place live/demo entries.",
     }
     breakout_alerts = list((await db.execute(text("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key='futures_breakout_v3' AND event_type='operational_alert' AND (user_id=:user OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' AND (instrument='' OR instrument=ANY(:instruments)) ORDER BY created_at DESC LIMIT 1"), {"user": user_id, "instruments": list(_STRATEGIES["futures_breakout_v3"][2])})).scalars().all())
     runs = list((await db.execute(text("SELECT jsonb_build_object('instrument',instrument,'session',session_key,'action',action,'status',status,'attempts',attempts,'scheduled_for',scheduled_for,'last_error',last_error,'updated_at',updated_at) FROM strategy_scheduler_runs WHERE strategy_key='futures_breakout_v3' AND trade_date=:date AND instrument=ANY(:instruments) ORDER BY scheduled_for,action"), {"date": today, "instruments": list(_STRATEGIES["futures_breakout_v3"][2])})).scalars().all())
@@ -62,9 +66,28 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
             "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "ONE_MINUTE", "contract_selection": "ATM"},
             "snapshot": {"strategy_key": "supertrend_index_options_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_expiry": None, "lot_size": None, "market_data": market_data},
         })
+    opponent_alerts = list((await db.execute(text("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key='nifty_opponent_v1' AND event_type='operational_alert' AND (user_id=:user OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1"), {"user": user_id})).scalars().all())
+    opponent_instruments = []
+    for instrument, defaults in _OPPONENT_OPTIONS.items():
+        row = configs.get(("nifty_opponent_v1", instrument))
+        partial_pct = float(row["target_points"]) if row and row["target_points"] and row["target_points"] > 0 else defaults["default_partial_close_pct"]
+        opponent_instruments.append({
+            "instrument": instrument,
+            "label": defaults["label"],
+            "enabled": bool(row["enabled"]) if row else False,
+            "lots": int(row["lots"]) if row else 1,
+            "run_day_session": bool(row["run_day_session"]) if row else True,
+            "run_evening_session": False,
+            "partial_close_pct": partial_pct,
+            "target_points": partial_pct,
+            "stop_loss_points": 0.0,
+            "parameters": {"partial_close_pct": partial_pct, "timeframe": 3, "interval": "THREE_MINUTE", "spot_abort_points": 150.0, "retracement_band": 5.0},
+            "snapshot": {"strategy_key": "nifty_opponent_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_symbol": "NIFTY CE/PE paired at 09:33", "contract_expiry": None, "lot_size": 65, "market_data": market_data},
+        })
     return [
         {"key": "futures_breakout_v3", "name": "Futures Breakout v3", "description": _STRATEGIES["futures_breakout_v3"][1], "active": activations.get("futures_breakout_v3", False), "operational_alerts": breakout_alerts, "scheduler_runs": runs, "instruments": breakout_instruments},
         {"key": "supertrend_index_options_v1", "name": "SuperTrend Index Options v1", "description": _STRATEGIES["supertrend_index_options_v1"][1], "active": activations.get("supertrend_index_options_v1", False), "operational_alerts": supertrend_alerts, "scheduler_runs": [], "instruments": supertrend_instruments},
+        {"key": "nifty_opponent_v1", "name": "Nifty 50 Equivalent Opponent v1", "description": _STRATEGIES["nifty_opponent_v1"][1], "active": activations.get("nifty_opponent_v1", False), "operational_alerts": opponent_alerts, "scheduler_runs": [], "instruments": opponent_instruments},
     ]
 
 
@@ -101,7 +124,10 @@ async def status(instrument: str = Query("GOLDTEN"), user: Principal = Depends(c
 @router.put("/strategy/futures-breakout")
 async def update(payload: dict, user: Principal = Depends(current_user), db: AsyncSession = Depends(get_db)):
     key = str(payload.get("strategy_key") or "futures_breakout_v3").strip()
-    instrument = str(payload.get("instrument") or ("SENSEX" if key == "supertrend_index_options_v1" else "GOLDTEN")).upper()
+    instrument = str(
+        payload.get("instrument")
+        or ("NIFTY" if key == "nifty_opponent_v1" else "SENSEX" if key == "supertrend_index_options_v1" else "GOLDTEN")
+    ).upper()
     if key not in _STRATEGIES or instrument not in _STRATEGIES[key][2]:
         raise DomainError(400, "Unsupported strategy or instrument.")
     lots = payload.get("lots", 1)
@@ -122,6 +148,14 @@ async def update(payload: dict, user: Principal = Depends(current_user), db: Asy
             stop = float(stop_raw) if stop_raw is not None and float(stop_raw) > 0 else default_stop
         except (ValueError, TypeError):
             stop = default_stop
+    elif key == "nifty_opponent_v1":
+        partial_raw = payload.get("partial_close_pct", payload.get("target_points", 50.0))
+        try:
+            pct = float(partial_raw)
+            target = max(10.0, min(100.0, round(pct / 10.0) * 10.0))
+        except (ValueError, TypeError):
+            target = 50.0
+        stop = 0.0
     else:
         try:
             target = float(target_raw) if target_raw is not None else 0.0

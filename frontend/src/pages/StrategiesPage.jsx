@@ -29,7 +29,11 @@ const draftFromInstrument = (instrument) => ({
   runDaySession: instrument.run_day_session ?? true,
   runEveningSession: instrument.run_evening_session ?? true,
   targetPoints:
-    instrument.target_points ?? instrument.parameters?.target_points ?? "",
+    instrument.partial_close_pct ??
+    instrument.target_points ??
+    instrument.parameters?.partial_close_pct ??
+    instrument.parameters?.target_points ??
+    "",
   stopLossPoints:
     instrument.stop_loss_points ?? instrument.parameters?.stop_loss_points ?? "",
 });
@@ -120,7 +124,8 @@ export default function StrategiesPage() {
         runDaySession: Boolean(draft.runDaySession),
         runEveningSession: Boolean(draft.runEveningSession),
         targetPoints:
-          strategy.key === "supertrend_index_options_v1"
+          strategy.key === "supertrend_index_options_v1" ||
+          strategy.key === "nifty_opponent_v1"
             ? targetPoints
             : undefined,
         stopLossPoints:
@@ -303,8 +308,14 @@ export default function StrategiesPage() {
                           <th className="px-4 py-3 font-semibold">Expiry</th>
                           <th className="px-4 py-3 font-semibold">Contract lot</th>
                           <th className="px-4 py-3 font-semibold">Trade lots</th>
-                          <th className="px-4 py-3 font-semibold">TP points</th>
-                          <th className="px-4 py-3 font-semibold">SL points</th>
+                          <th className="px-4 py-3 font-semibold">
+                            {strategy.key === "nifty_opponent_v1"
+                              ? "TP1 partial %"
+                              : "TP points"}
+                          </th>
+                          {strategy.key !== "nifty_opponent_v1" && (
+                            <th className="px-4 py-3 font-semibold">SL points</th>
+                          )}
                           <th className="px-4 py-3 text-center font-semibold">Use</th>
                           <th className="px-4 py-3" />
                         </tr>
@@ -316,16 +327,23 @@ export default function StrategiesPage() {
                             drafts[key] || draftFromInstrument(instrument);
                           const lots = Number(draft.lots);
                           const lotsValid = Number.isInteger(lots) && lots > 0;
+                          const usesOpponentPartial =
+                            strategy.key === "nifty_opponent_v1";
                           const usesPointExits =
                             strategy.key === "supertrend_index_options_v1";
                           const targetPoints = Number(draft.targetPoints);
                           const stopLossPoints = Number(draft.stopLossPoints);
                           const parametersValid =
-                            !usesPointExits ||
-                            (Number.isFinite(targetPoints) &&
+                            (!usesPointExits && !usesOpponentPartial) ||
+                            (usesPointExits &&
+                              Number.isFinite(targetPoints) &&
                               targetPoints > 0 &&
                               Number.isFinite(stopLossPoints) &&
-                              stopLossPoints > 0);
+                              stopLossPoints > 0) ||
+                            (usesOpponentPartial &&
+                              Number.isFinite(targetPoints) &&
+                              targetPoints >= 10 &&
+                              targetPoints <= 100);
                           const snapshot = instrument.snapshot;
                           const marketData = snapshot?.market_data;
                           const isContractPreview =
@@ -399,7 +417,26 @@ export default function StrategiesPage() {
                                 />
                               </td>
                               <td className="px-4 py-4">
-                                {usesPointExits ? (
+                                {usesOpponentPartial ? (
+                                  <select
+                                    aria-label={`${instrument.instrument} TP1 partial close percentage`}
+                                    value={draft.targetPoints || 50}
+                                    onChange={(event) =>
+                                      updateDraft(key, {
+                                        targetPoints: Number(event.target.value),
+                                      })
+                                    }
+                                    className="h-9 w-28 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none focus:border-brand-400 focus:ring focus:ring-brand-500/20"
+                                  >
+                                    {[10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map(
+                                      (pct) => (
+                                        <option key={pct} value={pct}>
+                                          {pct}% close
+                                        </option>
+                                      )
+                                    )}
+                                  </select>
+                                ) : usesPointExits ? (
                                   <input
                                     aria-label={`${instrument.instrument} target points`}
                                     type="number"
@@ -422,30 +459,32 @@ export default function StrategiesPage() {
                                   <span className="text-slate-500">—</span>
                                 )}
                               </td>
-                              <td className="px-4 py-4">
-                                {usesPointExits ? (
-                                  <input
-                                    aria-label={`${instrument.instrument} stop loss points`}
-                                    type="number"
-                                    min="0.05"
-                                    step="0.05"
-                                    value={draft.stopLossPoints}
-                                    onChange={(event) =>
-                                      updateDraft(key, {
-                                        stopLossPoints: event.target.value,
-                                      })
-                                    }
-                                    className={`h-9 w-24 rounded-lg border bg-slate-900 px-3 text-white outline-none focus:ring ${
-                                      Number.isFinite(stopLossPoints) &&
-                                      stopLossPoints > 0
-                                        ? "border-slate-700 focus:border-brand-400 focus:ring-brand-500/20"
-                                        : "border-rose-500 focus:ring-rose-500/20"
-                                    }`}
-                                  />
-                                ) : (
-                                  <span className="text-slate-500">—</span>
-                                )}
-                              </td>
+                              {!usesOpponentPartial && (
+                                <td className="px-4 py-4">
+                                  {usesPointExits ? (
+                                    <input
+                                      aria-label={`${instrument.instrument} stop loss points`}
+                                      type="number"
+                                      min="0.05"
+                                      step="0.05"
+                                      value={draft.stopLossPoints}
+                                      onChange={(event) =>
+                                        updateDraft(key, {
+                                          stopLossPoints: event.target.value,
+                                        })
+                                      }
+                                      className={`h-9 w-24 rounded-lg border bg-slate-900 px-3 text-white outline-none focus:ring ${
+                                        Number.isFinite(stopLossPoints) &&
+                                        stopLossPoints > 0
+                                          ? "border-slate-700 focus:border-brand-400 focus:ring-brand-500/20"
+                                          : "border-rose-500 focus:ring-rose-500/20"
+                                      }`}
+                                    />
+                                  ) : (
+                                    <span className="text-slate-500">—</span>
+                                  )}
+                                </td>
+                              )}
                               <td className="px-4 py-4 text-center">
                                 <Toggle
                                   active={Boolean(draft.enabled)}
