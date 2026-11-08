@@ -310,7 +310,7 @@ export default function StrategiesPage() {
                           <th className="px-4 py-3 font-semibold">Trade lots</th>
                           <th className="px-4 py-3 font-semibold">
                             {strategy.key === "nifty_opponent_v1"
-                              ? "TP1 partial %"
+                              ? "TP partials"
                               : "TP points"}
                           </th>
                           {strategy.key !== "nifty_opponent_v1" && (
@@ -419,8 +419,8 @@ export default function StrategiesPage() {
                               <td className="px-4 py-4">
                                 {usesOpponentPartial ? (
                                   <select
-                                    aria-label={`${instrument.instrument} TP1 partial close percentage`}
-                                    value={draft.targetPoints || 50}
+                                    aria-label={`${instrument.instrument} TP partials percentage`}
+                                    value={Number(draft.targetPoints) || 50}
                                     onChange={(event) =>
                                       updateDraft(key, {
                                         targetPoints: Number(event.target.value),
@@ -431,7 +431,7 @@ export default function StrategiesPage() {
                                     {[10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map(
                                       (pct) => (
                                         <option key={pct} value={pct}>
-                                          {pct}% close
+                                          {pct}%
                                         </option>
                                       )
                                     )}
