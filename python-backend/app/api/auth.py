@@ -17,10 +17,10 @@ from ..security import (
     new_token,
     otp_digest,
     password_error,
+    send_smtp_email,
     valid_email,
     valid_username,
     verify_password,
-    send_smtp_email,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])

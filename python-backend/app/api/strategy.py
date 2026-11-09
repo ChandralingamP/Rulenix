@@ -15,7 +15,7 @@ from ..errors import DomainError
 router = APIRouter(tags=["strategy"])
 _STRATEGIES = {
     "futures_breakout_v3": ("Futures Breakout v3", "Four-day MCX futures breakout with stop-and-reverse trade management.", ("GOLDTEN", "GOLDM", "SILVERM", "SILVERMIC", "NATGASMINI")),
-    "supertrend_index_options_v1": ("SuperTrend Index Options v1", "Intraday 1-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.", ("SENSEX", "NIFTY")),
+    "supertrend_index_options_v1": ("SuperTrend Index Options v1", "Intraday 5-minute SuperTrend flips on SENSEX/NIFTY closed candles, buying ATM CE/PE with user-defined TP and SL points.", ("SENSEX", "NIFTY")),
     "nifty_opponent_v1": ("Nifty 50 Equivalent Opponent v1", "Intraday quantitative parity strategy trading Nifty 50 index options.", ("NIFTY",)),
 }
 _FUTURES_LABELS = {"GOLDTEN": "Gold Ten", "GOLDM": "Gold Mini", "SILVERM": "Silver Mini", "SILVERMIC": "Silver Micro", "NATGASMINI": "Natural Gas Mini"}
@@ -63,7 +63,7 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
             "run_evening_session": bool(row["run_evening_session"]) if row else False,
             "target_points": target,
             "stop_loss_points": stop,
-            "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "ONE_MINUTE", "contract_selection": "ATM"},
+            "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "FIVE_MINUTE", "contract_selection": "ATM"},
             "snapshot": {"strategy_key": "supertrend_index_options_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_expiry": None, "lot_size": None, "market_data": market_data},
         })
     opponent_alerts = list((await db.execute(text("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key='nifty_opponent_v1' AND event_type='operational_alert' AND (user_id=:user OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1"), {"user": user_id})).scalars().all())

@@ -40,6 +40,7 @@ from .market import SuperTrendMarketProvider
 IST = ZoneInfo("Asia/Kolkata")
 FUTURES = "futures_breakout_v3"
 SUPERTREND = "supertrend_index_options_v1"
+OPPONENT = "nifty_opponent_v1"
 ACTIVE_ORDERS = (
     "pending",
     "submitting",
@@ -207,6 +208,7 @@ class AuthoritativeExecutionWorker:
             return 0
         generated = await self._evaluate_futures(session, local)
         generated += await self._evaluate_supertrend(session, local)
+        generated += await self._evaluate_opponent(session, local)
         return generated
 
     async def _evaluate_futures(self, session: AsyncSession, now: datetime) -> int:
@@ -350,7 +352,7 @@ class AuthoritativeExecutionWorker:
                     SELECT candle_time,open_price,high_price,low_price,close_price
                       FROM backtest_market_candles
                      WHERE exchange=:exchange AND symbol_token=:token
-                       AND interval_key='ONE_MINUTE' AND candle_time>=:start AND candle_time<=:end
+                       AND interval_key='FIVE_MINUTE' AND candle_time>=:start AND candle_time<=:end
                      ORDER BY candle_time
                     """),
                         {
@@ -776,6 +778,232 @@ class AuthoritativeExecutionWorker:
                 "strategy": SUPERTREND,
                 "instrument": f"{config.instrument}_{signal.side.value}",
                 "date": signal.signal_at.date(),
+                "key": execution_key,
+            },
+        )
+        return UUID(str(value))
+
+    async def _evaluate_opponent(self, session: AsyncSession, now: datetime) -> int:
+        from app.strategy.opponent import (
+            calculate_3_strike_perimeter,
+            calculate_atm_strike,
+            is_session_trading_allowed,
+        )
+
+        minute = now.hour * 60 + now.minute
+        # Nifty Opponent strategy monitors between 09:30 IST and 15:00 IST
+        if not (9 * 60 + 30 <= minute <= 15 * 60):
+            return 0
+
+        # Check enabled runners for Nifty Opponent
+        runners = (
+            (
+                await session.execute(
+                    text("""
+                SELECT c.user_id, c.lots,
+                       COALESCE(c.target_points, 50.0) AS partial_close_pct
+                  FROM user_strategy_configs c
+                  JOIN user_strategy_activations a ON a.user_id = c.user_id AND a.strategy_key = c.strategy_key
+                  JOIN users u ON u.id = c.user_id
+                  JOIN user_profiles p ON p.user_id = c.user_id
+                 WHERE c.strategy_key = :strategy AND c.instrument = 'NIFTY'
+                   AND c.enabled = TRUE AND a.is_active = TRUE AND u.is_active = TRUE
+                   AND (p.trading_mode = 'demo' OR (p.trading_mode = 'live' AND u.can_live_trade = TRUE))
+                """),
+                    {"strategy": OPPONENT},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        if not runners:
+            return 0
+
+        # Filter runners who haven't exceeded daily trade or loss circuit breaker
+        eligible_runners = []
+        for runner in runners:
+            user_id = runner["user_id"]
+            # Check daily trade count and loss count today
+            counts = (
+                await session.execute(
+                    text("""
+                SELECT COUNT(*) AS total_trades,
+                       COUNT(CASE WHEN pnl < 0 THEN 1 END) AS losses
+                  FROM trades
+                 WHERE user_id = :user AND strategy_key = :strategy
+                   AND created_at::date = :trade_date
+                """),
+                    {"user": user_id, "strategy": OPPONENT, "trade_date": now.date()},
+                )
+            ).mappings().first()
+            total_trades = int(counts["total_trades"] if counts else 0)
+            losses = int(counts["losses"] if counts else 0)
+            if not is_session_trading_allowed(total_trades, losses):
+                continue
+
+            # Check if runner already has an open position or in-flight intent
+            active = bool(
+                await session.scalar(
+                    text("""
+                SELECT EXISTS(
+                    SELECT 1 FROM trades WHERE user_id = :user AND strategy_key = :strategy AND status = 'open'
+                ) OR EXISTS(
+                    SELECT 1 FROM strategy_execution_intents
+                     WHERE user_id = :user AND strategy_key = :strategy
+                       AND action = 'ENTRY' AND status IN ('pending', 'claimed', 'retry_wait', 'submitted')
+                )
+                """),
+                    {"user": user_id, "strategy": OPPONENT},
+                )
+            )
+            if active:
+                continue
+
+            eligible_runners.append(runner)
+
+        if not eligible_runners:
+            return 0
+
+        # Get latest Nifty spot price from ticks
+        spot_ltp = await session.scalar(
+            text("""
+            SELECT price FROM market_price_ticks
+             WHERE UPPER(exchange_segment) = 'NSE' AND contract_token = '99926000'
+               AND price > 0
+             ORDER BY received_at DESC LIMIT 1
+            """)
+        )
+        if spot_ltp is None or float(spot_ltp) <= 0:
+            return 0
+
+        spot = Decimal(str(spot_ltp))
+        atm_strike = calculate_atm_strike(spot)
+        _ = calculate_3_strike_perimeter(spot)
+
+        # Ingest 3-minute candles or check if benchmark is established
+        # In this initial bridge, we query active NFO ATM option market selection
+        if self.market_provider is None:
+            return 0
+
+        from app.strategy.supertrend import CONFIGS, OptionSide
+        config = CONFIGS.get("NIFTY")
+        if config is None:
+            return 0
+
+        # Attempt to select the candidate ATM call or put based on intraday trend
+        side = OptionSide.CALL if spot >= atm_strike else OptionSide.PUT
+        try:
+            selection = await self.market_provider.select(
+                user_id=UUID(str(eligible_runners[0]["user_id"])),
+                config=config,
+                side=side,
+                trade_date=now.date(),
+            )
+        except Exception:
+            return 0
+
+        session_key = f"opp-NIFTY-{now:%Y%m%d-%H%M}-{side.value}"
+        intents: list[PreparedIntent] = []
+        for runner in eligible_runners:
+            snapshot_id = await self._opponent_snapshot(
+                session, runner, selection, side, spot, atm_strike
+            )
+            intents.append(
+                PreparedIntent(
+                    UUID(str(runner["user_id"])),
+                    snapshot_id,
+                    None,
+                    OPPONENT,
+                    "NIFTY",
+                    session_key,
+                    "ENTRY",
+                    "BUY_ENTRY",
+                    "BUY",
+                    "MARKET",
+                    int(runner["lots"]),
+                    int(runner["lots"]) * selection.contract.lot_size,
+                    selection.contract.premium,
+                    None,
+                    now + timedelta(minutes=15),
+                )
+            )
+
+        if not intents:
+            return 0
+
+        _, inserted = await SignalRepository(session).materialize(
+            strategy_key=OPPONENT,
+            instrument="NIFTY",
+            session_key=session_key,
+            signal_at=now,
+            signal_type="ENTRY",
+            snapshot_id=None,
+            payload={
+                "side": side.value,
+                "spot_ltp": str(spot),
+                "atm_strike": str(atm_strike),
+                "option_execution_price": str(selection.contract.premium),
+                "contract_symbol": selection.contract.symbol,
+            },
+            intents=intents,
+        )
+        return int(inserted > 0)
+
+    async def _opponent_snapshot(self, session, runner, selection, side, spot, atm) -> UUID:
+        snapshot_id = _order_uuid(
+            "opponent-snapshot",
+            f"{selection.contract.token}:{runner['user_id']}:{atm}",
+        )
+        execution_key = (
+            f"opp-{selection.contract.symbol}-{UUID(str(runner['user_id'])).hex}"
+        )
+        # Marked levels: SL at Marked Low (default 15 pts below entry), TP1 at +25%
+        entry_price = float(selection.contract.premium)
+        tp1_price = entry_price * 1.25
+        sl_price = max(1.0, entry_price - 15.0)
+
+        await session.execute(
+            text("""
+            INSERT INTO strategy_market_snapshots(
+              id,strategy_key,instrument,trade_date,status,error,contract_token,
+              contract_symbol,contract_expiry,lot_size,exchange_segment,product_type,
+              execution_key,underlying_token,buy_target,buy_sl1,sell_target,sell_sl1,
+              previous_close,fetched_at)
+            VALUES(:id,:strategy,:instrument,CURRENT_DATE,'ready','',:token,:symbol,:expiry,:lot_size,
+              'NFO','INTRADAY',:key,'99926000',:tp1,:sl,:tp1,:sl,
+              :spot,NOW())
+            ON CONFLICT(strategy_key,instrument,trade_date,execution_key) DO UPDATE SET
+              status='ready',error='',contract_token=EXCLUDED.contract_token,
+              contract_symbol=EXCLUDED.contract_symbol,contract_expiry=EXCLUDED.contract_expiry,
+              lot_size=EXCLUDED.lot_size,exchange_segment=EXCLUDED.exchange_segment,
+              product_type=EXCLUDED.product_type,underlying_token=EXCLUDED.underlying_token,
+              buy_target=EXCLUDED.buy_target,buy_sl1=EXCLUDED.buy_sl1,
+              sell_target=EXCLUDED.sell_target,sell_sl1=EXCLUDED.sell_sl1,
+              previous_close=EXCLUDED.previous_close,fetched_at=NOW()
+            """),
+            {
+                "id": snapshot_id,
+                "strategy": OPPONENT,
+                "instrument": f"NIFTY_{side.value}",
+                "token": selection.contract.token,
+                "symbol": selection.contract.symbol,
+                "expiry": selection.contract.expiry,
+                "lot_size": selection.contract.lot_size,
+                "key": execution_key,
+                "tp1": tp1_price,
+                "sl": sl_price,
+                "spot": float(spot),
+            },
+        )
+        value = await session.scalar(
+            text("""
+            SELECT id FROM strategy_market_snapshots
+             WHERE strategy_key=:strategy AND instrument=:instrument
+               AND trade_date=CURRENT_DATE AND execution_key=:key
+            """),
+            {
+                "strategy": OPPONENT,
+                "instrument": f"NIFTY_{side.value}",
                 "key": execution_key,
             },
         )

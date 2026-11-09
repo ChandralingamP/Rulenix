@@ -36,6 +36,7 @@ from .market_data import MarketDataIngestionService
 from .reconciliation import AccountReconciliationWorker
 from .supervisor import DatabaseLeaderScheduler, RuntimeMode, WorkerSupervisor
 
+
 def _authoritative_certified() -> bool:
     return os.environ.get("AUTHORITATIVE_LIFECYCLE_CERTIFIED", "").strip().lower() in {
         "true",
@@ -171,8 +172,8 @@ class ProductionRuntime:
             self.supervisor.start(
                 "market_data_ingestion",
                 self.market_data.run_cycle,
-                interval_seconds=60.0,
-                timeout_seconds=60.0,
+                interval_seconds=15.0,
+                timeout_seconds=30.0,
                 critical=False,
             )
             self.supervisor.start(

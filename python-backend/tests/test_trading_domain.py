@@ -107,8 +107,8 @@ def test_options_trade_pnl_and_supertrend_targets():
         "strategy_key": "supertrend_index_options_v1",
         "buy_target": None,
         "buy_sl1": None,
-        "sell_target": Decimal("40"),
-        "sell_sl1": Decimal("20"),
+        "sell_target": Decimal(40),
+        "sell_sl1": Decimal(20),
     }
     fill = Decimal("436.90")
     target_pts = Decimal(str(order_put["buy_target"] or order_put["sell_target"] or 0))

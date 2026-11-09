@@ -34,7 +34,9 @@ from .strategy.runtime import SchedulerHealth
 
 async def bootstrap_initial_admin(session_factory, settings):
     from uuid import uuid4
+
     from sqlalchemy import text
+
     from .security import hash_password
 
     username = settings.initial_admin_username.strip()

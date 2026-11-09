@@ -89,6 +89,13 @@ async def test_sync_futures_snapshots_and_supertrend_candles(app_client):
     ])
 
     target_date = date(2026, 10, 6)
+    async with session_factory() as session:
+        await session.execute(
+            text("DELETE FROM strategy_market_snapshots WHERE trade_date=:date"),
+            {"date": target_date},
+        )
+        await session.commit()
+
     synced_futures = await service.sync_futures_snapshots(target_date)
     assert synced_futures == 5
 

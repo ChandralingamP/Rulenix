@@ -10,7 +10,6 @@ from .common import (
     IST,
     Candle,
     as_ist,
-    latest_completed_one_minute,
     latest_completed_five_minute,
     supertrend_entry_allowed,
     supertrend_eod_due,
@@ -18,7 +17,7 @@ from .common import (
 
 ATR_PERIOD = 7
 SUPERTREND_FACTOR = Decimal(2)
-MAX_ENTRY_DELAY = timedelta(seconds=90)
+MAX_ENTRY_DELAY = timedelta(seconds=180)
 STRATEGY_KEY = "supertrend_index_options_v1"
 
 
@@ -180,7 +179,7 @@ def signal_from_transition(
 
 
 def current_signal(points: list[SuperTrendPoint], now: datetime) -> SuperTrendSignal | None:
-    target = latest_completed_one_minute(now).replace(tzinfo=None)
+    target = latest_completed_five_minute(now).replace(tzinfo=None)
     for previous, latest in pairwise(points):
         if latest.candle.at.replace(tzinfo=None) == target:
             return signal_from_transition(previous, latest)
@@ -188,7 +187,7 @@ def current_signal(points: list[SuperTrendPoint], now: datetime) -> SuperTrendSi
 
 
 def signal_is_fresh(signal: SuperTrendSignal, now: datetime) -> bool:
-    closed_at = signal.signal_at + timedelta(minutes=1)
+    closed_at = signal.signal_at + timedelta(minutes=5)
     local_now = as_ist(now).replace(tzinfo=None)
     signal_closed = closed_at.replace(tzinfo=None)
     return signal_closed <= local_now <= signal_closed + MAX_ENTRY_DELAY

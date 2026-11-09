@@ -144,6 +144,7 @@ async def test_supertrend_market_skips_unquoteable_nearest_candidate() -> None:
 def test_exchange_feed_expected_hours_and_weekdays() -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
+
     from app.runtime.market_data import exchange_feed_expected
 
     ist = ZoneInfo("Asia/Kolkata")

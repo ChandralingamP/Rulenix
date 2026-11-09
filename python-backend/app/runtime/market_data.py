@@ -260,7 +260,7 @@ class MarketDataIngestionService:
         for instrument_name, (exchange, token, trading_symbol) in INDEX_INSTRUMENTS.items():
             try:
                 raw_candles = await client.rest.candles(
-                    exchange, token, "ONE_MINUTE", from_str, to_str
+                    exchange, token, "FIVE_MINUTE", from_str, to_str
                 )
             except Exception as exc:
                 err_text = str(exc).lower()
@@ -268,17 +268,17 @@ class MarketDataIngestionService:
                     await asyncio.sleep(2.5)
                     try:
                         raw_candles = await client.rest.candles(
-                            exchange, token, "ONE_MINUTE", from_str, to_str
+                            exchange, token, "FIVE_MINUTE", from_str, to_str
                         )
                     except Exception as retry_exc:
                         logger.warning(
-                            "Failed fetching 1-min candles for %s on retry: %s",
+                            "Failed fetching 5-min candles for %s on retry: %s",
                             instrument_name,
                             retry_exc,
                         )
                         continue
                 else:
-                    logger.warning("Failed fetching 1-min candles for %s: %s", instrument_name, exc)
+                    logger.warning("Failed fetching 5-min candles for %s: %s", instrument_name, exc)
                     continue
             finally:
                 await asyncio.sleep(1.0)
@@ -328,7 +328,7 @@ class MarketDataIngestionService:
 
                             :id, :exchange, :instrument, :token, :trading_symbol,
 
-                            'ONE_MINUTE', :candle_time, :open_price, :high_price, :low_price,
+                            'FIVE_MINUTE', :candle_time, :open_price, :high_price, :low_price,
 
                             :close_price, :volume, 'angel_one', NOW()
 
