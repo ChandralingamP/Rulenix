@@ -84,21 +84,25 @@ def test_ranked_coincidence_queue_walkthrough() -> None:
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     queue = build_ranked_coincidence_queue(ce_contracts, pe_contracts, strikes)
 
-    assert len(queue) == 9
+    # Exactly 3 identical-strike pairs (24450, 24500, 24550) - never crosses strikes!
+    assert len(queue) == 3
+    for pair in queue:
+        assert pair.ce_contract.strike == pair.pe_contract.strike
+
     top_pair = queue[0]
     assert top_pair.rank == 1
-    # Best coincidence is 24500 CE (124) and 24550 PE (123.8) -> delta 0.2
+    # Best coincidence is ATM 24500 CE (123.2) and 24500 PE (105) -> diff 18.2
     assert top_pair.ce_contract.strike == Decimal(24500)
-    assert top_pair.pe_contract.strike == Decimal(24550)
-    assert top_pair.premium_diff == Decimal("0.2")
+    assert top_pair.pe_contract.strike == Decimal(24500)
+    assert top_pair.premium_diff == Decimal("18.2")
 
-    # Cross-projected levels:
-    # CE chart gets PE's High (123) and Low (108)
+    # Cross-projected levels within identical strike 24500:
+    # 24500 CE gets 24500 PE's High (118) and Low (100)
     ce_levels = top_pair.ce_levels
-    assert ce_levels.marked_high == Decimal(123)
-    assert ce_levels.marked_low == Decimal(108)
+    assert ce_levels.marked_high == Decimal(118)
+    assert ce_levels.marked_low == Decimal(100)
 
-    # PE chart gets CE's High (125) and Low (110)
+    # 24500 PE gets 24500 CE's High (125) and Low (110)
     pe_levels = top_pair.pe_levels
     assert pe_levels.marked_high == Decimal(125)
     assert pe_levels.marked_low == Decimal(110)
@@ -239,41 +243,72 @@ def test_next_best_coincidence_fallback() -> None:
         ),
     }
 
-    # 3 PE strikes
+    # 3 PE strikes (strictly identical strikes 24450, 24500, 24550)
     pe_contracts = {
         Decimal(24450): (
             OptionContract("PE1", "NIFTY24450PE", expiry, 25, Decimal(24450), OptionSide.PUT),
-            _candle(t0, 90, 95, 80, "89.5"),  # Delta with CE3 is |90 - 89.5| = 0.5 (Second best)
+            _candle(t0, 148, 152, 142, 150),  # Delta with CE1 is |155 - 150| = 5.0 (Rank 3)
         ),
         Decimal(24500): (
             OptionContract("PE2", "NIFTY24500PE", expiry, 25, Decimal(24500), OptionSide.PUT),
-            _candle(t0, 110, 118, 100, 105),
+            _candle(t0, 110, 125, 100, "123.0"),  # Delta with CE2 is |123.2 - 123.0| = 0.2 (Rank 1)
         ),
         Decimal(24550): (
             OptionContract("PE3", "NIFTY24550PE", expiry, 25, Decimal(24550), OptionSide.PUT),
-            _candle(t0, 112, 123, 108, "123.0"),  # Delta with CE2 is |123.2 - 123.0| = 0.2 (Best)
+            _candle(t0, 92, 98, 88, "89.5"),  # Delta with CE3 is |90 - 89.5| = 0.5 (Rank 2)
         ),
     }
 
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     queue = build_ranked_coincidence_queue(ce_contracts, pe_contracts, strikes)
 
-    # Best coincidence is Rank 1
+    assert len(queue) == 3
+
+    # Best coincidence is Rank 1 on identical strike 24500
     rank_1 = queue[0]
     assert rank_1.rank == 1
     assert rank_1.ce_contract.strike == Decimal(24500)
-    assert rank_1.pe_contract.strike == Decimal(24550)
+    assert rank_1.pe_contract.strike == Decimal(24500)
     assert rank_1.premium_diff == Decimal("0.2")
 
-    # If Rank 1 fails or invalidates, promote Next Best Coincidence (Rank 2)
+    # If Rank 1 is rejected, promote Next Best Coincidence (Rank 2 on strike 24550)
     rank_2 = queue[1]
     assert rank_2.rank == 2
     assert rank_2.ce_contract.strike == Decimal(24550)
-    assert rank_2.pe_contract.strike == Decimal(24450)
+    assert rank_2.pe_contract.strike == Decimal(24550)
     assert rank_2.premium_diff == Decimal("0.5")
 
-    # Levels for Rank 2 are derived cleanly from its own candles
+    # Levels for Rank 2 are derived cleanly from its own 24550 PE candle (High=98, Low=88)
     r2_ce_levels = rank_2.ce_levels
-    assert r2_ce_levels.marked_high == Decimal(95)
-    assert r2_ce_levels.marked_low == Decimal(80)
+    assert r2_ce_levels.marked_high == Decimal(98)
+    assert r2_ce_levels.marked_low == Decimal(88)
+
+
+def test_benchmark_window_timings() -> None:
+    from app.strategy.opponent import (
+        benchmark_is_due,
+        benchmark_is_recording,
+        latest_completed_three_minute,
+    )
+
+    t_pre = datetime(2026, 11, 10, 9, 29, 59, tzinfo=IST)
+    t_rec = datetime(2026, 11, 10, 9, 30, 0, tzinfo=IST)
+    t_rec_mid = datetime(2026, 11, 10, 9, 31, 45, tzinfo=IST)
+    t_closed = datetime(2026, 11, 10, 9, 33, 0, tzinfo=IST)
+    t_post = datetime(2026, 11, 10, 15, 1, 0, tzinfo=IST)
+
+    assert benchmark_is_recording(t_pre) is False
+    assert benchmark_is_recording(t_rec) is True
+    assert benchmark_is_recording(t_rec_mid) is True
+    assert benchmark_is_recording(t_closed) is False
+
+    assert benchmark_is_due(t_rec) is False
+    assert benchmark_is_due(t_rec_mid) is False
+    assert benchmark_is_due(t_closed) is True
+    assert benchmark_is_due(t_post) is False
+
+    assert latest_completed_three_minute(t_rec_mid) == datetime(2026, 11, 10, 9, 30, 0, tzinfo=IST)
+    assert latest_completed_three_minute(datetime(2026, 11, 10, 9, 37, 20, tzinfo=IST)) == datetime(
+        2026, 11, 10, 9, 36, 0, tzinfo=IST
+    )
 

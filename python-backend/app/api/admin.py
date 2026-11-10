@@ -1,3 +1,4 @@
+import logging
 from datetime import date as Date
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from ..dependencies import Principal, admin_only, get_db
 from ..errors import DomainError
 
 router = APIRouter(prefix="/auth/admin", tags=["admin"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/users/")
@@ -150,8 +152,8 @@ async def _verify_broker_safe_for_live_clear(request: Request, db: AsyncSession,
                 )
     except DomainError:
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Silently ignoring rule check error: %s", exc)
 
 
 async def _clear_user_demo_trade_state(db: AsyncSession, user_id: str) -> dict[str, int]:

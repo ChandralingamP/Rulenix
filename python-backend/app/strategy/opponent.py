@@ -120,6 +120,24 @@ class OpponentSignal:
     pair_rank: int
 
 
+def benchmark_is_recording(now: datetime) -> bool:
+    """Return True if within the 09:30:00 - 09:32:59 benchmark recording window."""
+    t = now.time()
+    return BENCHMARK_TIME <= t < BENCHMARK_CLOSE_TIME
+
+
+def benchmark_is_due(now: datetime) -> bool:
+    """Return True if 09:33:00 has arrived and the session is still within active trading hours."""
+    t = now.time()
+    return BENCHMARK_CLOSE_TIME <= t < time(15, 0)
+
+
+def latest_completed_three_minute(now: datetime) -> datetime:
+    """Return the timestamp of the latest closed 3-minute candle boundary."""
+    minute = now.minute - (now.minute % TIMEFRAME_MINUTES)
+    return now.replace(minute=minute, second=0, microsecond=0)
+
+
 def calculate_atm_strike(spot_price: Decimal | str | float) -> Decimal:
     """Calculate the nearest At-The-Money strike for Nifty 50 (50 point grid)."""
     spot = Decimal(str(spot_price))
@@ -140,30 +158,31 @@ def build_ranked_coincidence_queue(
     pe_contracts: dict[Decimal, tuple[OptionContract, Candle]],
     strikes: list[Decimal],
 ) -> list[CoincidencePair]:
-    """Scan all 9 combinations across 3 strikes and rank by smallest |Close_CE - Close_PE|."""
-    candidates: list[CoincidencePair] = []
-    for ce_strike in strikes:
-        if ce_strike not in ce_contracts:
-            continue
-        ce_contract, ce_candle = ce_contracts[ce_strike]
-        for pe_strike in strikes:
-            if pe_strike not in pe_contracts:
-                continue
-            pe_contract, pe_candle = pe_contracts[pe_strike]
-            diff = abs(ce_candle.close - pe_candle.close)
-            candidates.append(
-                CoincidencePair(
-                    ce_contract=ce_contract,
-                    pe_contract=pe_contract,
-                    ce_candle=ce_candle,
-                    pe_candle=pe_candle,
-                    premium_diff=diff,
-                    rank=0,
-                )
-            )
+    """Scan identical-strike pairs across the 3 strikes and rank by smallest |Close_CE - Close_PE|.
 
-    # Sort primarily by smallest absolute difference in closing premiums
-    candidates.sort(key=lambda pair: (pair.premium_diff, abs(pair.ce_contract.strike - pair.pe_contract.strike)))
+    Crucial: CE and PE must strictly share the IDENTICAL strike price (e.g. 24500 CE is strictly paired
+    with 24500 PE). Cross-strike pairing (e.g. 24500 CE with 24550 PE) is disallowed.
+    """
+    candidates: list[CoincidencePair] = []
+    for strike in strikes:
+        if strike not in ce_contracts or strike not in pe_contracts:
+            continue
+        ce_contract, ce_candle = ce_contracts[strike]
+        pe_contract, pe_candle = pe_contracts[strike]
+        diff = abs(ce_candle.close - pe_candle.close)
+        candidates.append(
+            CoincidencePair(
+                ce_contract=ce_contract,
+                pe_contract=pe_contract,
+                ce_candle=ce_candle,
+                pe_candle=pe_candle,
+                premium_diff=diff,
+                rank=0,
+            )
+        )
+
+    # Sort strictly by smallest absolute difference in closing premiums
+    candidates.sort(key=lambda pair: pair.premium_diff)
 
     # Assign 1-based ranks
     ranked = [
@@ -188,19 +207,17 @@ def verify_opponent_no_retouch(
 
     Following the opponent breakdown close, at least one subsequent candle must complete
     whose entire price action remains completely detached from the marked Low (High < Low).
-    If the candle tests, wicks, or breaches the marked Low (High >= marked Low), it is invalid.
+    If any subsequent candle tests, wicks, or breaches the marked Low (High >= marked Low),
+    the breakdown is invalidated and this function returns False.
     """
     if not opponent_candles_after_breakdown:
         return False
 
     for candle in opponent_candles_after_breakdown:
-        # Check if entire candle price action is safely below marked Low
-        if candle.high < opponent_marked_low:
-            return True
-        # If candle wicks or touches marked Low, this candle is not detached
-        # Any breach means not valid yet
+        if candle.high >= opponent_marked_low:
+            return False
 
-    return False
+    return True
 
 
 def check_confirmation_and_entry(

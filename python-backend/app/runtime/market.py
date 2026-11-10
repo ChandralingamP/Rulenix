@@ -26,6 +26,13 @@ class SuperTrendMarketSelection:
     underlying_ltp: Decimal
 
 
+@dataclass(frozen=True)
+class OpponentOptionBasket:
+    strike: Decimal
+    ce_contract: OptionContract
+    pe_contract: OptionContract
+
+
 class SuperTrendMarketProvider(Protocol):
     async def select(
         self,
@@ -35,6 +42,14 @@ class SuperTrendMarketProvider(Protocol):
         side: OptionSide,
         trade_date: date,
     ) -> SuperTrendMarketSelection: ...
+
+    async def select_opponent_basket(
+        self,
+        *,
+        user_id: UUID,
+        strikes: list[Decimal],
+        trade_date: date,
+    ) -> list[OpponentOptionBasket]: ...
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -198,9 +213,68 @@ class AngelSuperTrendMarketProvider:
             f"No quoteable {config.instrument} {side.value} option contract is available."
         )
 
+    async def select_opponent_basket(
+        self,
+        *,
+        user_id: UUID,
+        strikes: list[Decimal],
+        trade_date: date,
+    ) -> list[OpponentOptionBasket]:
+        strike_set = set(strikes)
+        baskets: list[OpponentOptionBasket] = []
+        for refresh in (False, True):
+            rows = await self._master(refresh=refresh)
+            ce_candidates: dict[tuple[date, Decimal], OptionContract] = {}
+            pe_candidates: dict[tuple[date, Decimal], OptionContract] = {}
+
+            for row in rows:
+                if (
+                    str(row.get("exch_seg") or "") != "NFO"
+                    or str(row.get("name") or "").upper() != "NIFTY"
+                    or str(row.get("instrumenttype") or "") != "OPTIDX"
+                ):
+                    continue
+                symbol = str(row.get("symbol") or "")
+                if not symbol.endswith(("CE", "PE")):
+                    continue
+                try:
+                    expiry = parse_expiry(str(row.get("expiry") or ""))
+                    lot_size = int(Decimal(str(row.get("lotsize") or "0")))
+                    strike = Decimal(str(row.get("strike") or "0")) / 100
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                token = str(row.get("token") or "")
+                if expiry < trade_date or token == "" or lot_size <= 0 or strike not in strike_set:
+                    continue
+
+                side = OptionSide.CALL if symbol.endswith("CE") else OptionSide.PUT
+                contract = OptionContract(token, symbol, expiry, lot_size, strike, side)
+                if side is OptionSide.CALL:
+                    ce_candidates[(expiry, strike)] = contract
+                else:
+                    pe_candidates[(expiry, strike)] = contract
+
+            common_expiries = sorted({exp for exp, _ in ce_candidates} & {exp for exp, _ in pe_candidates})
+            if not common_expiries:
+                continue
+
+            target_expiry = common_expiries[0]
+            baskets.clear()
+            for strike in strikes:
+                ce = ce_candidates.get((target_expiry, strike))
+                pe = pe_candidates.get((target_expiry, strike))
+                if ce is not None and pe is not None:
+                    baskets.append(OpponentOptionBasket(strike, ce, pe))
+
+            if len(baskets) == len(strikes):
+                return baskets
+
+        return baskets
+
 
 __all__ = [
     "AngelSuperTrendMarketProvider",
+    "OpponentOptionBasket",
     "SuperTrendMarketProvider",
     "SuperTrendMarketSelection",
     "quote_ltps",

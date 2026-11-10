@@ -9,6 +9,7 @@ are deliberately left for reconciliation and are never blindly replayed.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -36,6 +37,8 @@ from app.strategy.supertrend import (
 from app.trading.domain import futures_pnl_units, sl2_reversal, trade_pnl
 
 from .market import SuperTrendMarketProvider
+
+logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 FUTURES = "futures_breakout_v3"
@@ -785,14 +788,28 @@ class AuthoritativeExecutionWorker:
 
     async def _evaluate_opponent(self, session: AsyncSession, now: datetime) -> int:
         from app.strategy.opponent import (
+            benchmark_is_due,
+            benchmark_is_recording,
             calculate_3_strike_perimeter,
             calculate_atm_strike,
+            check_spot_expansion_abort,
+            is_in_retracement_zone,
             is_session_trading_allowed,
         )
 
         minute = now.hour * 60 + now.minute
         # Nifty Opponent strategy monitors between 09:30 IST and 15:00 IST
         if not (9 * 60 + 30 <= minute <= 15 * 60):
+            return 0
+
+        # CRITICAL HARD GUARD:
+        # Between 09:30:00 and 09:32:59 IST, the foundational 3-minute benchmark candle
+        # is actively recording. Under NO circumstance should any order or entry intent
+        # be placed during this window.
+        if benchmark_is_recording(now):
+            return 0
+
+        if not benchmark_is_due(now):
             return 0
 
         # Check enabled runners for Nifty Opponent
@@ -880,8 +897,65 @@ class AuthoritativeExecutionWorker:
         atm_strike = calculate_atm_strike(spot)
         _ = calculate_3_strike_perimeter(spot)
 
-        # Ingest 3-minute candles or check if benchmark is established
-        # In this initial bridge, we query active NFO ATM option market selection
+        # Check or lock benchmark snapshot for today
+        benchmark_key = f"opp-benchmark-{now.date()}"
+        bench_row = (
+            await session.execute(
+                text("""
+                SELECT id, status, previous_close FROM strategy_market_snapshots
+                 WHERE strategy_key = :strategy AND instrument = 'NIFTY'
+                   AND trade_date = :trade_date AND execution_key = :key
+                """),
+                {"strategy": OPPONENT, "trade_date": now.date(), "key": benchmark_key},
+            )
+        ).mappings().first()
+
+        if bench_row:
+            if str(bench_row["status"]) == "aborted":
+                return 0
+            bench_spot = Decimal(str(bench_row["previous_close"]))
+            if check_spot_expansion_abort(bench_spot, spot):
+                await session.execute(
+                    text("UPDATE strategy_market_snapshots SET status='aborted' WHERE id=:id"),
+                    {"id": bench_row["id"]},
+                )
+                return 0
+        else:
+            # First evaluation at/after 09:33: lock benchmark reference spot & discover 3-strike basket
+            bench_id = _order_uuid("opponent-benchmark", f"NIFTY:{now.date()}")
+            perimeter = calculate_3_strike_perimeter(spot)
+            if hasattr(self.market_provider, "select_opponent_basket"):
+                try:
+                    await self.market_provider.select_opponent_basket(
+                        user_id=UUID(str(eligible_runners[0]["user_id"])),
+                        strikes=perimeter,
+                        trade_date=now.date(),
+                    )
+                except Exception as exc:
+                    logger.debug("Opponent basket discovery failed: %s", exc)
+
+            await session.execute(
+                text("""
+                INSERT INTO strategy_market_snapshots(
+                  id, strategy_key, instrument, trade_date, status, error, execution_key,
+                  underlying_token, exchange_segment, product_type, previous_close, fetched_at)
+                VALUES(:id, :strategy, 'NIFTY', :trade_date, 'ready', '', :key,
+                  '99926000', 'NSE', 'INTRADAY', :spot, NOW())
+                ON CONFLICT(strategy_key, instrument, trade_date, execution_key) DO UPDATE SET
+                  previous_close = EXCLUDED.previous_close, fetched_at = NOW()
+                """),
+                {
+                    "id": bench_id,
+                    "strategy": OPPONENT,
+                    "trade_date": now.date(),
+                    "key": benchmark_key,
+                    "spot": float(spot),
+                },
+            )
+            # Benchmark was just locked at 09:33:00. Under no circumstances should an order
+            # be created immediately before candidate breakout confirmation candles close.
+            return 0
+
         if self.market_provider is None:
             return 0
 
@@ -890,7 +964,7 @@ class AuthoritativeExecutionWorker:
         if config is None:
             return 0
 
-        # Attempt to select the candidate ATM call or put based on intraday trend
+        # Query candidate options for both the traded side and its opponent
         side = OptionSide.CALL if spot >= atm_strike else OptionSide.PUT
         try:
             selection = await self.market_provider.select(
@@ -899,14 +973,105 @@ class AuthoritativeExecutionWorker:
                 side=side,
                 trade_date=now.date(),
             )
+            opponent_selection = await self.market_provider.select(
+                user_id=UUID(str(eligible_runners[0]["user_id"])),
+                config=config,
+                side=side.opposite,
+                trade_date=now.date(),
+            )
         except Exception:
+            return 0
+
+        if opponent_selection is None:
+            return 0
+
+        # Verify whether 3-minute candle confirmation has materialized
+        # Query completed 3-minute candles for both traded contract and opponent contract
+        start_candle_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        breakout_rows = (
+            await session.execute(
+                text("""
+                SELECT candle_time, open_price, high_price, low_price, close_price
+                  FROM backtest_market_candles
+                 WHERE exchange = 'NFO' AND symbol_token = :token
+                   AND interval_key IN ('THREE_MINUTE', 'FIVE_MINUTE')
+                   AND candle_time >= :start_time AND candle_time <= :end_time
+                 ORDER BY candle_time
+                """),
+                {
+                    "token": selection.contract.token,
+                    "start_time": start_candle_time,
+                    "end_time": now,
+                },
+            )
+        ).mappings().all()
+
+        opponent_rows = (
+            await session.execute(
+                text("""
+                SELECT candle_time, open_price, high_price, low_price, close_price
+                  FROM backtest_market_candles
+                 WHERE exchange = 'NFO' AND symbol_token = :token
+                   AND interval_key IN ('THREE_MINUTE', 'FIVE_MINUTE')
+                   AND candle_time >= :start_time AND candle_time <= :end_time
+                 ORDER BY candle_time
+                """),
+                {
+                    "token": opponent_selection.contract.token,
+                    "start_time": start_candle_time,
+                    "end_time": now,
+                },
+            )
+        ).mappings().all()
+
+        # Hard requirement: Both traded side and opponent side must have at least
+        # the 09:30 benchmark candle and at least one completed post-benchmark candle
+        if len(breakout_rows) < 2 or len(opponent_rows) < 2:
+            return 0
+
+        # Marked High & Low for the breakout side come strictly from the OPPONENT's 09:30 benchmark candle
+        opp_bench = opponent_rows[0]
+        marked_h = Decimal(str(opp_bench["high_price"]))
+        marked_l = Decimal(str(opp_bench["low_price"]))
+
+        # Step 1: Breakout side must demonstrate a decisive 3-minute candle close ABOVE marked High
+        has_breakout = any(
+            Decimal(str(r["close_price"])) > marked_h
+            for r in breakout_rows[1:]
+        )
+        if not has_breakout:
+            return 0
+
+        # Step 2: Opponent side must print a breakdown Red candle close BELOW marked Low
+        breakdown_idx = next(
+            (
+                idx
+                for idx, r in enumerate(opponent_rows[1:], start=1)
+                if Decimal(str(r["close_price"])) < Decimal(str(r["open_price"]))
+                and Decimal(str(r["close_price"])) < marked_l
+            ),
+            None,
+        )
+        if breakdown_idx is None:
+            return 0
+
+        # Step 3: Opponent No Re-Touch: subsequent candles must remain detached (High < marked Low)
+        subsequent_opp = opponent_rows[breakdown_idx + 1 :]
+        if not subsequent_opp:
+            return 0
+        if any(Decimal(str(r["high_price"])) >= marked_l for r in subsequent_opp):
+            return 0
+
+        # Step 4: Retracement Pullback: Current LTP must be in [Marked High, Marked High + 5.0 pts]
+        current_opt_ltp = Decimal(str(selection.contract.premium))
+        if not is_in_retracement_zone(current_opt_ltp, marked_h):
             return 0
 
         session_key = f"opp-NIFTY-{now:%Y%m%d-%H%M}-{side.value}"
         intents: list[PreparedIntent] = []
         for runner in eligible_runners:
             snapshot_id = await self._opponent_snapshot(
-                session, runner, selection, side, spot, atm_strike
+                session, runner, selection, side, spot, atm_strike, marked_h, marked_l
             )
             intents.append(
                 PreparedIntent(
@@ -942,6 +1107,8 @@ class AuthoritativeExecutionWorker:
                 "side": side.value,
                 "spot_ltp": str(spot),
                 "atm_strike": str(atm_strike),
+                "marked_high": str(marked_h),
+                "marked_low": str(marked_l),
                 "option_execution_price": str(selection.contract.premium),
                 "contract_symbol": selection.contract.symbol,
             },
@@ -949,7 +1116,9 @@ class AuthoritativeExecutionWorker:
         )
         return int(inserted > 0)
 
-    async def _opponent_snapshot(self, session, runner, selection, side, spot, atm) -> UUID:
+    async def _opponent_snapshot(
+        self, session, runner, selection, side, spot, atm, marked_h=None, marked_l=None
+    ) -> UUID:
         snapshot_id = _order_uuid(
             "opponent-snapshot",
             f"{selection.contract.token}:{runner['user_id']}:{atm}",
@@ -957,10 +1126,11 @@ class AuthoritativeExecutionWorker:
         execution_key = (
             f"opp-{selection.contract.symbol}-{UUID(str(runner['user_id'])).hex}"
         )
-        # Marked levels: SL at Marked Low (default 15 pts below entry), TP1 at +25%
         entry_price = float(selection.contract.premium)
-        tp1_price = entry_price * 1.25
-        sl_price = max(1.0, entry_price - 15.0)
+        h = float(marked_h) if marked_h is not None else entry_price
+        l = float(marked_l) if marked_l is not None else max(1.0, entry_price - 15.0)
+        tp1_price = h * 1.25
+        sl_price = max(1.0, l)
 
         await session.execute(
             text("""
@@ -2523,9 +2693,9 @@ class EodLifecycleWorker:
                 SELECT t.id,t.user_id,t.strategy_snapshot_id,t.strategy_key,t.instrument_label,
                        t.direction,t.quantity,t.last_price,t.entry_price,t.execution_mode
                   FROM trades t WHERE t.status='open'
-                   AND t.strategy_key=:strategy ORDER BY t.user_id,t.id
+                   AND t.strategy_key IN (:supertrend, :opponent) ORDER BY t.user_id,t.id
             """),
-                        {"strategy": SUPERTREND},
+                        {"supertrend": SUPERTREND, "opponent": OPPONENT},
                     )
                 )
                 .mappings()
@@ -2533,30 +2703,34 @@ class EodLifecycleWorker:
             )
             intents: list[PreparedIntent] = []
             for trade in trades:
+                strat = str(trade["strategy_key"])
+                prefix = "oppsq" if strat == OPPONENT else "stsq"
                 intents.append(
                     prepare_square_off_intent(
                         user_id=UUID(str(trade["user_id"])),
                         trade_id=UUID(str(trade["id"])),
                         snapshot_id=UUID(str(trade["strategy_snapshot_id"])),
-                        strategy_key=SUPERTREND,
+                        strategy_key=strat,
                         instrument=str(trade["instrument_label"]),
-                        session_key=f"stsq-{observed:%Y%m%d}",
+                        session_key=f"{prefix}-{observed:%Y%m%d}",
                         side=_exit_side(str(trade["direction"])),
                         quantity=int(trade["quantity"]),
                         price=Decimal(str(trade["last_price"] or trade["entry_price"])),
                     )
                 )
-            if intents:
-                await SignalRepository(session).materialize(
-                    strategy_key=SUPERTREND,
-                    instrument="ALL",
-                    session_key=f"squareoff-{observed:%Y%m%d}-1510",
-                    signal_at=observed,
-                    signal_type="SQUARE_OFF",
-                    snapshot_id=None,
-                    payload={"scheduled_for": "15:10 IST"},
-                    intents=intents,
-                )
+            for strat in {str(t["strategy_key"]) for t in trades}:
+                strat_intents = [i for i in intents if i.strategy_key == strat]
+                if strat_intents:
+                    await SignalRepository(session).materialize(
+                        strategy_key=strat,
+                        instrument="ALL",
+                        session_key=f"squareoff-{strat}-{observed:%Y%m%d}-1510",
+                        signal_at=observed,
+                        signal_type="SQUARE_OFF",
+                        snapshot_id=None,
+                        payload={"scheduled_for": "15:10 IST"},
+                        intents=strat_intents,
+                    )
         progress = LifecycleProgress()
         for trade in trades:
             outcome = (

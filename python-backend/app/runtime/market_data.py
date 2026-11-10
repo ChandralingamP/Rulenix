@@ -876,6 +876,22 @@ class MarketDataIngestionService:
 
                        AND TRIM(s.contract_token) <> ''
 
+                    UNION
+
+                    SELECT DISTINCT UPPER(s.exchange_segment) AS exchange_segment, s.contract_token
+
+                      FROM strategy_market_snapshots s
+
+                     WHERE s.strategy_key = 'nifty_opponent_v1'
+
+                       AND s.status IN ('ready', 'levels_locked')
+
+                       AND s.trade_date = CURRENT_DATE
+
+                       AND s.contract_token IS NOT NULL
+
+                       AND TRIM(s.contract_token) <> ''
+
                     """)
                 )
             ).all()
