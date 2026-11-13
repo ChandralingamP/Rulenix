@@ -104,6 +104,38 @@ class OpponentTargetLadder:
             target_4=high + (Decimal("1.00") * high),
         )
 
+    def trailing_sl_for_stage(
+        self, stage: str, entry_price: Decimal, initial_sl: Decimal
+    ) -> Decimal:
+        """Return the appropriate trailing stop loss level based on ladder stage:
+        - 'INITIAL': Initial SL (Marked Low)
+        - 'T1_HIT': Move SL to Cost-to-Cost (entry_price)
+        - 'T2_HIT': Trail SL to T1 Level
+        - 'T3_HIT': Trail SL to T2 Level
+        - 'T4_HIT': Trail SL to T3 Level
+        """
+        if stage == "T1_HIT":
+            return entry_price
+        elif stage == "T2_HIT":
+            return self.target_1
+        elif stage == "T3_HIT":
+            return self.target_2
+        elif stage == "T4_HIT":
+            return self.target_3
+        return initial_sl
+
+    def next_target_for_stage(self, stage: str) -> Decimal | None:
+        """Return the next target milestone for the given stage."""
+        if stage == "INITIAL":
+            return self.target_1
+        elif stage == "T1_HIT":
+            return self.target_2
+        elif stage == "T2_HIT":
+            return self.target_3
+        elif stage == "T3_HIT":
+            return self.target_4
+        return None
+
 
 @dataclass(frozen=True)
 class OpponentSignal:
@@ -158,28 +190,31 @@ def build_ranked_coincidence_queue(
     pe_contracts: dict[Decimal, tuple[OptionContract, Candle]],
     strikes: list[Decimal],
 ) -> list[CoincidencePair]:
-    """Scan identical-strike pairs across the 3 strikes and rank by smallest |Close_CE - Close_PE|.
+    """Scan CE and PE contract pairs across the 3 strikes and rank by smallest |Close_CE - Close_PE|.
 
-    Crucial: CE and PE must strictly share the IDENTICAL strike price (e.g. 24500 CE is strictly paired
-    with 24500 PE). Cross-strike pairing (e.g. 24500 CE with 24550 PE) is disallowed.
+    Scans both identical-strike and cross-strike pairs within the 3-strike perimeter
+    (e.g., 24500 CE with 24550 PE) to locate the pair whose option premiums coincide.
     """
     candidates: list[CoincidencePair] = []
-    for strike in strikes:
-        if strike not in ce_contracts or strike not in pe_contracts:
+    for ce_strike in strikes:
+        if ce_strike not in ce_contracts:
             continue
-        ce_contract, ce_candle = ce_contracts[strike]
-        pe_contract, pe_candle = pe_contracts[strike]
-        diff = abs(ce_candle.close - pe_candle.close)
-        candidates.append(
-            CoincidencePair(
-                ce_contract=ce_contract,
-                pe_contract=pe_contract,
-                ce_candle=ce_candle,
-                pe_candle=pe_candle,
-                premium_diff=diff,
-                rank=0,
+        ce_contract, ce_candle = ce_contracts[ce_strike]
+        for pe_strike in strikes:
+            if pe_strike not in pe_contracts:
+                continue
+            pe_contract, pe_candle = pe_contracts[pe_strike]
+            diff = abs(ce_candle.close - pe_candle.close)
+            candidates.append(
+                CoincidencePair(
+                    ce_contract=ce_contract,
+                    pe_contract=pe_contract,
+                    ce_candle=ce_candle,
+                    pe_candle=pe_candle,
+                    premium_diff=diff,
+                    rank=0,
+                )
             )
-        )
 
     # Sort strictly by smallest absolute difference in closing premiums
     candidates.sort(key=lambda pair: pair.premium_diff)

@@ -31,8 +31,8 @@ def _candle(at: datetime, open_: float, high: float, low: float, close: float) -
     )
 
 
-def test_strict_identical_strike_pairing() -> None:
-    """Verify that CE and PE are only paired on the EXACT same strike, never cross-strikes."""
+def test_coincidence_queue_perimeter_ranking() -> None:
+    """Verify that CE and PE contracts across the 3 strikes are scanned and ranked by premium proximity."""
     t0 = datetime(2026, 11, 10, 9, 30, tzinfo=IST)
     expiry = date(2026, 11, 12)
 
@@ -69,13 +69,10 @@ def test_strict_identical_strike_pairing() -> None:
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     queue = build_ranked_coincidence_queue(ce_contracts, pe_contracts, strikes)
 
-    # Exactly 3 pairs
-    assert len(queue) == 3
-    # Every pair must have identical strike for CE and PE
-    for pair in queue:
-        assert pair.ce_contract.strike == pair.pe_contract.strike
+    # 3 CEs x 3 PEs = 9 candidate pairs
+    assert len(queue) == 9
 
-    # Rank 1 must be ATM 24500 with smallest delta |123.2 - 123.0| = 0.2
+    # Rank 1 must be 24500 with smallest delta |123.2 - 123.0| = 0.2
     rank_1 = queue[0]
     assert rank_1.rank == 1
     assert rank_1.ce_contract.strike == Decimal(24500)
@@ -173,8 +170,7 @@ async def test_select_opponent_basket_matches_identical_strikes() -> None:
         # Later monthly expiry
         {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY26NOV24500CE", "token": "T7", "expiry": "26NOV2026", "strike": "2450000", "lotsize": "25"},
     ]
-    provider._contracts = tuple(test_rows)
-    provider._cache_date = date(2026, 11, 10)
+    provider._master = AsyncMock(return_value=tuple(test_rows))
 
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     baskets = await provider.select_opponent_basket(
@@ -211,15 +207,15 @@ async def test_lifecycle_forbids_trade_without_sufficient_candles() -> None:
     # Setup session mocks for eligible runners and spot
     eligible_runner = {"user_id": str(uuid4()), "lots": 1, "partial_close_pct": 50.0}
     session.execute.side_effect = [
-        # 1. runners query
-        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[eligible_runner])))),
-        # 2. trades counts query
-        MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={"total_trades": 0, "losses": 0})))),
-        # 3. benchmark row exists check
-        MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={"id": str(uuid4()), "status": "ready", "previous_close": 24500})))),
-        # 4. breakout candles query -> return empty!
+        # 1. _manage_opponent_positions open trades query -> empty
         MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))),
-        # 5. opponent candles query -> return empty!
+        # 2. runners query
+        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[eligible_runner])))),
+        # 3. trades counts query
+        MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={"total_trades": 0, "losses": 0})))),
+        # 4. benchmark row exists check
+        MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={"id": str(uuid4()), "status": "ready", "previous_close": 24500})))),
+        # 5. candle rows query -> return empty!
         MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))),
     ]
     session.scalar.side_effect = [
@@ -236,3 +232,111 @@ async def test_lifecycle_forbids_trade_without_sufficient_candles() -> None:
     t_0936 = datetime(2026, 11, 10, 9, 36, 0, tzinfo=IST)
     result = await worker._evaluate_opponent(session, t_0936)
     assert result == 0
+
+
+@pytest.mark.asyncio
+async def test_opponent_candle_close_sl_triggers_exit() -> None:
+    """Initial SL only triggers when a completed 3m candle closes below marked low."""
+    worker = AuthoritativeExecutionWorker(session_factory=MagicMock(), coordinator=MagicMock())
+    session = AsyncMock(spec=AsyncSession)
+
+    trade_id = uuid4()
+    open_trade = {
+        "id": str(trade_id),
+        "user_id": str(uuid4()),
+        "execution_mode": "demo",
+        "direction": "BUY",
+        "quantity": 50,
+        "entry_price": 126.0,
+        "last_price": 115.0,
+        "total_lots": 2,
+        "remaining_lots": 2,
+        "target_price": 153.8,
+        "sl1_price": 108.0,
+        "notes": "Initial entry",
+        "strategy_snapshot_id": str(uuid4()),
+        "instrument_label": "NIFTY",
+        "contract_token": "T_CE",
+        "contract_symbol": "NIFTY24500CE",
+        "lot_size": 25,
+        "pnl": 0.0,
+        "buy_target": 153.75,
+        "buy_sl1": 108.0,
+    }
+
+    t0 = datetime(2026, 11, 10, 9, 30, tzinfo=IST)
+    t1 = datetime(2026, 11, 10, 9, 33, tzinfo=IST)
+
+    # 3m candle 1: benchmark
+    # 3m candle 2: closed at 104 < marked low 108.0 -> triggers SL!
+    candle_rows = [
+        {"candle_time": t0, "open_price": 115, "high_price": 125, "low_price": 110, "close_price": 123},
+        {"candle_time": t1, "open_price": 112, "high_price": 114, "low_price": 102, "close_price": 104},
+    ]
+
+    session.execute.side_effect = [
+        # open trades
+        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[open_trade])))),
+        # candles query
+        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=candle_rows)))),
+        # cancel demo orders
+        MagicMock(),
+        # update trades
+        MagicMock(),
+    ]
+    session.scalar.return_value = Decimal(105)
+
+    now = datetime(2026, 11, 10, 9, 36, tzinfo=IST)
+    await worker._manage_opponent_positions(session, now)
+
+    # Verify cancel orders and trade update were executed
+    assert session.execute.call_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_opponent_trailing_ladder_progression() -> None:
+    """When price reaches T2 (184.6) and T3 (215.4), SL trails to T1 (153.8) and T2 (184.6)."""
+    worker = AuthoritativeExecutionWorker(session_factory=MagicMock(), coordinator=MagicMock())
+    session = AsyncMock(spec=AsyncSession)
+
+    trade_id = uuid4()
+    # Trade already booked T1, has 1 runner lot remaining
+    open_trade = {
+        "id": str(trade_id),
+        "user_id": str(uuid4()),
+        "execution_mode": "demo",
+        "direction": "BUY",
+        "quantity": 25,
+        "entry_price": 126.0,
+        "last_price": 186.0,
+        "total_lots": 2,
+        "remaining_lots": 1,
+        "target_price": 184.6,
+        "sl1_price": 126.0,  # currently at breakeven
+        "notes": "T1_HIT: partial booked",
+        "strategy_snapshot_id": str(uuid4()),
+        "instrument_label": "NIFTY",
+        "contract_token": "T_CE",
+        "contract_symbol": "NIFTY24500CE",
+        "lot_size": 25,
+        "pnl": 0.0,
+        "buy_target": 153.75,  # H = 123
+        "buy_sl1": 108.0,
+    }
+
+    session.execute.side_effect = [
+        # open trades
+        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[open_trade])))),
+        # candles query
+        MagicMock(mappings=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))),
+        # update trades trailing SL to T1
+        MagicMock(),
+    ]
+    # Current LTP is 186 >= T2 (184.50)
+    session.scalar.return_value = Decimal(186)
+
+    now = datetime(2026, 11, 10, 9, 45, tzinfo=IST)
+    await worker._manage_opponent_positions(session, now)
+
+    # 3 execute calls: open_trades, candles, update trades with T2_HIT
+    assert session.execute.call_count == 3

@@ -84,25 +84,23 @@ def test_ranked_coincidence_queue_walkthrough() -> None:
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     queue = build_ranked_coincidence_queue(ce_contracts, pe_contracts, strikes)
 
-    # Exactly 3 identical-strike pairs (24450, 24500, 24550) - never crosses strikes!
-    assert len(queue) == 3
-    for pair in queue:
-        assert pair.ce_contract.strike == pair.pe_contract.strike
+    # 3 CEs x 3 PEs = 9 candidate pairs across the 3-strike perimeter
+    assert len(queue) == 9
 
     top_pair = queue[0]
     assert top_pair.rank == 1
-    # Best coincidence is ATM 24500 CE (123.2) and 24500 PE (105) -> diff 18.2
+    # Best coincidence from PDF Walkthrough is 24500 CE (123.2) and 24550 PE (123.0) -> diff 0.2
     assert top_pair.ce_contract.strike == Decimal(24500)
-    assert top_pair.pe_contract.strike == Decimal(24500)
-    assert top_pair.premium_diff == Decimal("18.2")
+    assert top_pair.pe_contract.strike == Decimal(24550)
+    assert top_pair.premium_diff == Decimal("0.2")
 
-    # Cross-projected levels within identical strike 24500:
-    # 24500 CE gets 24500 PE's High (118) and Low (100)
+    # Cross-projected levels:
+    # 24500 CE gets 24550 PE's High (123) and Low (108)
     ce_levels = top_pair.ce_levels
-    assert ce_levels.marked_high == Decimal(118)
-    assert ce_levels.marked_low == Decimal(100)
+    assert ce_levels.marked_high == Decimal(123)
+    assert ce_levels.marked_low == Decimal(108)
 
-    # 24500 PE gets 24500 CE's High (125) and Low (110)
+    # 24550 PE gets 24500 CE's High (125) and Low (110)
     pe_levels = top_pair.pe_levels
     assert pe_levels.marked_high == Decimal(125)
     assert pe_levels.marked_low == Decimal(110)
@@ -113,6 +111,25 @@ def test_target_ladder_calculations() -> None:
     ladder = OpponentTargetLadder.from_marked_high(Decimal(123))
     assert ladder.marked_high == Decimal(123)
     assert ladder.target_1 == Decimal("153.75")
+    assert ladder.target_2 == Decimal("184.50")
+    assert ladder.target_3 == Decimal("215.25")
+    assert ladder.target_4 == Decimal("246.00")
+
+    # Trailing SL stages
+    initial_sl = Decimal(108)
+    entry_p = Decimal(126)
+    assert ladder.trailing_sl_for_stage("INITIAL", entry_p, initial_sl) == Decimal(108)
+    assert ladder.trailing_sl_for_stage("T1_HIT", entry_p, initial_sl) == Decimal(126)  # Cost-to-Cost
+    assert ladder.trailing_sl_for_stage("T2_HIT", entry_p, initial_sl) == Decimal("153.75")  # T1
+    assert ladder.trailing_sl_for_stage("T3_HIT", entry_p, initial_sl) == Decimal("184.50")  # T2
+    assert ladder.trailing_sl_for_stage("T4_HIT", entry_p, initial_sl) == Decimal("215.25")  # T3
+
+    # Target progression
+    assert ladder.next_target_for_stage("INITIAL") == Decimal("153.75")
+    assert ladder.next_target_for_stage("T1_HIT") == Decimal("184.50")
+    assert ladder.next_target_for_stage("T2_HIT") == Decimal("215.25")
+    assert ladder.next_target_for_stage("T3_HIT") == Decimal("246.00")
+    assert ladder.next_target_for_stage("T4_HIT") is None
     assert ladder.target_2 == Decimal("184.50")
     assert ladder.target_3 == Decimal("215.25")
     assert ladder.target_4 == Decimal("246.00")
@@ -262,7 +279,7 @@ def test_next_best_coincidence_fallback() -> None:
     strikes = [Decimal(24450), Decimal(24500), Decimal(24550)]
     queue = build_ranked_coincidence_queue(ce_contracts, pe_contracts, strikes)
 
-    assert len(queue) == 3
+    assert len(queue) == 9
 
     # Best coincidence is Rank 1 on identical strike 24500
     rank_1 = queue[0]
