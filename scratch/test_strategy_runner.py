@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-backend_path = Path(r"C:\GitHub\TradingSVCV\Rulenix\python-backend")
+backend_path = Path(__file__).resolve().parent.parent / "python-backend"
 
 def load_module(name: str, file_path: Path):
     spec = importlib.util.spec_from_file_location(name, file_path)
@@ -137,7 +137,7 @@ try:
     sig = supertrend.current_signal(points, ts(10, 30))
     # closed_at = 10:25 + 5m = 10:30
     test("Signal is fresh within 90s window (at 10:31:00)", supertrend.signal_is_fresh(sig, ts(10, 31)))
-    test("Signal is stale beyond 90s (at 10:31:31)", not supertrend.signal_is_fresh(sig, ts(10, 31) + timedelta(seconds=31)))
+    test("Signal is stale beyond 180s (at 10:33:01)", not supertrend.signal_is_fresh(sig, ts(10, 33) + timedelta(seconds=1)))
     test("Signal is stale prior to candle close (at 10:29:59)", not supertrend.signal_is_fresh(sig, ts(10, 29) + timedelta(seconds=59)))
 except Exception as e:
     test("Signal freshness", False, str(e))

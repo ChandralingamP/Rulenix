@@ -295,7 +295,23 @@ class AuthoritativeExecutionWorker:
                 )
                 intents: list[PreparedIntent] = []
                 for runner in runners:
-                    for direction in directions:
+                    open_trade_dir = await session.scalar(
+                        text("""
+                        SELECT direction FROM trades
+                         WHERE user_id=:user AND strategy_key=:strategy AND instrument_label=:instrument
+                           AND status='open'
+                        """),
+                        {
+                            "user": runner["user_id"],
+                            "strategy": FUTURES,
+                            "instrument": snapshot["instrument"],
+                        },
+                    )
+                    user_directions = directions
+                    if open_trade_dir:
+                        reversal_side = "BUY" if str(open_trade_dir).upper() == "SELL" else "SELL"
+                        user_directions = (reversal_side,)
+                    for direction in user_directions:
                         price_value = snapshot["planned_entry"]
                         if snapshot["entry_direction"] == "BOTH":
                             price_value = snapshot[
@@ -1475,6 +1491,7 @@ class FillLifecycleWorker:
                                o.execution_mode,o.lots,o.quantity,o.filled_quantity,
                                o.processed_quantity,o.average_fill_price,o.broker_status,
                                s.strategy_key,s.instrument,s.contract_symbol,s.lot_size,
+                               s.hh2,s.ll2,s.hh4,s.ll4,
                                s.buy_target,s.buy_sl1,s.buy_sl2,s.sell_target,s.sell_sl1,s.sell_sl2
                           FROM strategy_orders o
                           JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
@@ -1578,19 +1595,6 @@ class FillLifecycleWorker:
             return
         trade_id = _order_uuid("trade", order_id)
         strategy = str(order["strategy_key"])
-        if strategy == SUPERTREND:
-            target_pts = Decimal(str(order["buy_target"] or order["sell_target"] or 0))
-            sl_pts = Decimal(str(order["buy_sl1"] or order["sell_sl1"] or 0))
-            target = fill + target_pts
-            sl1 = max(Decimal("0.05"), fill - sl_pts)
-            sl2 = None
-        else:
-            target = Decimal(
-                str(order["buy_target"] if direction == "BUY" else order["sell_target"])
-            )
-            sl1 = Decimal(str(order["buy_sl1"] if direction == "BUY" else order["sell_sl1"]))
-            sl2_value = order["buy_sl2"] if direction == "BUY" else order["sell_sl2"]
-            sl2 = Decimal(str(sl2_value)) if sl2_value is not None else None
         reversal_source = await session.scalar(
             text("""
             SELECT source_trade_id FROM strategy_reversal_intents
@@ -1598,6 +1602,73 @@ class FillLifecycleWorker:
             """),
             {"user": order["user_id"], "session": order["session_key"]},
         )
+        if strategy == SUPERTREND:
+            target_pts = Decimal(str(order["buy_target"] or order["sell_target"] or 0))
+            sl_pts = Decimal(str(order["buy_sl1"] or order["sell_sl1"] or 0))
+            target = fill + target_pts
+            sl1 = max(Decimal("0.05"), fill - sl_pts)
+            sl2 = None
+        elif reversal_source is not None and order.get("hh4") is not None and order.get("ll4") is not None:
+            from app.strategy.futures_breakout import exit_levels_for_entry
+
+            hh2 = Decimal(str(order["hh2"]))
+            ll2 = Decimal(str(order["ll2"]))
+            hh4 = Decimal(str(order["hh4"]))
+            ll4 = Decimal(str(order["ll4"]))
+            reversal_exits = exit_levels_for_entry(direction, fill, hh2, ll2, hh4, ll4)
+            target = reversal_exits.target
+            sl1 = reversal_exits.sl1
+            sl2 = reversal_exits.sl2
+        else:
+            target = Decimal(
+                str(order["buy_target"] if direction == "BUY" else order["sell_target"])
+            )
+            sl1 = Decimal(str(order["buy_sl1"] if direction == "BUY" else order["sell_sl1"]))
+            sl2_value = order["buy_sl2"] if direction == "BUY" else order["sell_sl2"]
+            sl2 = Decimal(str(sl2_value)) if sl2_value is not None else None
+
+        opposite_trade = (
+            await session.execute(
+                text("""
+                SELECT * FROM trades
+                 WHERE user_id=:user AND strategy_key=:strategy AND instrument_label=:instrument
+                   AND status='open' AND direction<>:direction
+                 FOR UPDATE
+                """),
+                {
+                    "user": order["user_id"],
+                    "strategy": strategy,
+                    "instrument": order["instrument"],
+                    "direction": direction,
+                },
+            )
+        ).mappings().first()
+        if opposite_trade is not None:
+            closed_qty = int(opposite_trade["quantity"])
+            lot_sz = max(int(order["lot_size"] or 1), 1)
+            realized_pnl = trade_pnl(
+                str(opposite_trade["direction"]),
+                opposite_trade["entry_price"],
+                fill,
+                futures_pnl_units(str(opposite_trade["instrument_label"]), closed_qty, lot_sz),
+            )
+            pnl_total = Decimal(str(opposite_trade["pnl"] or 0)) + realized_pnl
+            await session.execute(
+                text("""
+                UPDATE trades SET status='closed',safety_status='CLOSED',quantity=0,remaining_lots=0,
+                       last_price=:fill,exit_price=:fill,exit_datetime=NOW(),exit_reason='SIGNAL_REVERSAL',
+                       pnl=:pnl,updated_at=NOW()
+                 WHERE id=:trade
+                """),
+                {"trade": opposite_trade["id"], "fill": fill, "pnl": pnl_total},
+            )
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status='cancelled',broker_status='Cancelled by reversal fill',updated_at=NOW()
+                 WHERE trade_id=:trade AND status IN ('pending','submitted','partially_filled')
+                """),
+                {"trade": opposite_trade["id"]},
+            )
         await session.execute(
             text("""
             INSERT INTO trades(
@@ -2683,6 +2754,16 @@ class ReversalLifecycleWorker:
                 order_type="MARKET",
                 idempotency_key=f"python:sl2-reversal:{row['source_trade_id']}",
                 execution_mode=str(source["execution_mode"]),
+            )
+            await session.execute(
+                text("""
+                UPDATE strategy_orders SET status='cancelled',
+                  broker_status='Cancelled by SL2 reversal execution',updated_at=NOW()
+                 WHERE user_id=:user AND snapshot_id=:snapshot AND id<>:order
+                   AND role IN ('BUY_ENTRY','SELL_ENTRY')
+                   AND status IN ('pending','submitted')
+                """),
+                {"user": row["user_id"], "snapshot": row["snapshot_id"], "order": order_id},
             )
             if demo:
                 await session.execute(

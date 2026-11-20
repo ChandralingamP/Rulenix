@@ -85,7 +85,7 @@ class LiveMutationCoordinator:
         return (
             await session.execute(
                 text(f"""
-                SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.role,o.side,o.execution_mode,
+                SELECT o.id,o.user_id,o.snapshot_id,o.trade_id,o.session_key,o.role,o.side,o.execution_mode,
                        o.lots,o.quantity,o.price,o.trigger_price,o.order_type,o.exchange_segment,
                        o.product_type,o.status,o.broker_order_id,o.client_order_id,o.idempotency_key,
                        s.strategy_key,s.instrument,s.contract_symbol,s.contract_token,
@@ -344,6 +344,8 @@ class LiveMutationCoordinator:
                     attributable_quantity=int(order["quantity"]),
                     lots=int(order["lots"]),
                     idempotency_key=str(order["idempotency_key"]),
+                    role=str(order["role"]),
+                    session_key=str(order["session_key"]) if order["session_key"] else None,
                 )
             )
 

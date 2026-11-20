@@ -201,41 +201,79 @@ class SafetyRepository:
             and request.strategy_key
             and request.instrument
         ):
-            duplicate = bool(
-                await self.session.scalar(
-                    text("""
-                SELECT EXISTS(
-                    SELECT 1 FROM trades t
-                     WHERE t.user_id=:user AND t.status='open' AND t.execution_mode=:mode
-                       AND t.strategy_key=:strategy AND t.instrument_label=:instrument
-                ) OR EXISTS(
-                    SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
-                     WHERE o.user_id=:user AND o.execution_mode=:mode
-                       AND o.created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
-                       AND (
-                           CASE
-                               WHEN CAST(:role AS varchar) IS NOT NULL THEN (
-                                   o.role=:role AND (CAST(:session_key AS varchar) IS NULL OR o.session_key=:session_key)
+            role_val = (getattr(request, "role", None) or "").strip() or None
+            side_val = (getattr(request, "side", None) or "").strip() or None
+            if not side_val and role_val:
+                side_val = "BUY" if "BUY" in role_val else ("SELL" if "SELL" in role_val else None)
+
+            if request.action is ActionKind.SL2_REVERSAL:
+                duplicate = bool(
+                    await self.session.scalar(
+                        text("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM trades t
+                             WHERE t.user_id=:user AND t.status='open' AND t.execution_mode=:mode
+                               AND t.strategy_key=:strategy AND t.instrument_label=:instrument
+                        ) OR EXISTS(
+                            SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+                             WHERE o.user_id=:user AND o.execution_mode=:mode
+                               AND o.created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                               AND o.idempotency_key LIKE 'python:sl2-reversal:%'
+                               AND (CAST(:order AS uuid) IS NULL OR o.id<>CAST(:order AS uuid))
+                               AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+                               AND s.strategy_key=:strategy AND s.instrument=:instrument
+                        )
+                        """),
+                        {
+                            "user": request.user_id,
+                            "mode": request.execution_mode,
+                            "strategy": request.strategy_key,
+                            "instrument": request.instrument,
+                            "order": request.order_id,
+                        },
+                    )
+                )
+            else:
+                duplicate = bool(
+                    await self.session.scalar(
+                        text("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM trades t
+                             WHERE t.user_id=:user AND t.status='open' AND t.execution_mode=:mode
+                               AND t.strategy_key=:strategy AND t.instrument_label=:instrument
+                               AND (CAST(:side AS varchar) IS NULL OR t.direction = :side)
+                        ) OR EXISTS(
+                            SELECT 1 FROM strategy_orders o JOIN strategy_market_snapshots s ON s.id=o.snapshot_id
+                             WHERE o.user_id=:user AND o.execution_mode=:mode
+                               AND o.created_at >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                               AND (
+                                   CASE
+                                       WHEN CAST(:role AS varchar) IS NOT NULL THEN (
+                                           o.role=:role AND (CAST(:session_key AS varchar) IS NULL OR o.session_key=:session_key)
+                                       )
+                                       WHEN CAST(:side AS varchar) IS NOT NULL THEN (
+                                           o.side=:side AND o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                                       )
+                                       ELSE o.role IN ('BUY_ENTRY','SELL_ENTRY')
+                                   END
                                )
-                               ELSE o.role IN ('BUY_ENTRY','SELL_ENTRY')
-                           END
-                       )
-                       AND (CAST(:order AS uuid) IS NULL OR o.id<>CAST(:order AS uuid))
-                       AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
-                       AND s.strategy_key=:strategy AND s.instrument=:instrument
+                               AND (CAST(:order AS uuid) IS NULL OR o.id<>CAST(:order AS uuid))
+                               AND o.status IN ('pending','submitting','ambiguous','submitted','partially_filled','processing','cancelling')
+                               AND s.strategy_key=:strategy AND s.instrument=:instrument
+                        )
+                        """),
+                        {
+                            "user": request.user_id,
+                            "mode": request.execution_mode,
+                            "strategy": request.strategy_key,
+                            "instrument": request.instrument,
+                            "order": request.order_id,
+                            "role": role_val,
+                            "side": side_val,
+                            "session_key": (getattr(request, "session_key", None) or "").strip() or None,
+                        },
+                    )
                 )
-            """),
-                    {
-                        "user": request.user_id,
-                        "mode": request.execution_mode,
-                        "strategy": request.strategy_key,
-                        "instrument": request.instrument,
-                        "order": request.order_id,
-                        "role": (getattr(request, "role", None) or "").strip() or None,
-                        "session_key": (getattr(request, "session_key", None) or "").strip() or None,
-                    },
-                )
-            )
 
         broker_contract_collision = False
         if (
