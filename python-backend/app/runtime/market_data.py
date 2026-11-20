@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.broker.angel.client import AngelClient
 from app.config import Settings
 from app.runtime.market import quote_ltps
-from app.strategy.common import IST
+from app.strategy.common import IST, latest_completed_five_minute
 from app.strategy.futures_breakout import calculate_levels
 from app.strategy.supertrend import parse_expiry
 
@@ -258,6 +258,22 @@ class MarketDataIngestionService:
         total_inserted = 0
 
         for instrument_name, (exchange, token, trading_symbol) in INDEX_INSTRUMENTS.items():
+            if days <= 1:
+                latest_expected = latest_completed_five_minute(now.astimezone(IST))
+                if latest_expected.time() >= time(9, 15):
+                    async with self.session_factory() as session:
+                        exists = await session.scalar(
+                            text("""
+                            SELECT 1 FROM backtest_market_candles
+                             WHERE exchange = :exchange AND symbol_token = :token
+                               AND interval_key = 'FIVE_MINUTE'
+                               AND candle_time >= :latest_expected
+                            """),
+                            {"exchange": exchange, "token": token, "latest_expected": latest_expected},
+                        )
+                        if exists:
+                            continue
+
             try:
                 raw_candles = await client.rest.candles(
                     exchange, token, "FIVE_MINUTE", from_str, to_str
@@ -265,18 +281,12 @@ class MarketDataIngestionService:
             except Exception as exc:
                 err_text = str(exc).lower()
                 if "rate limit" in err_text or "too many requests" in err_text or "429" in err_text:
-                    await asyncio.sleep(2.5)
-                    try:
-                        raw_candles = await client.rest.candles(
-                            exchange, token, "FIVE_MINUTE", from_str, to_str
-                        )
-                    except Exception as retry_exc:
-                        logger.warning(
-                            "Failed fetching 5-min candles for %s on retry: %s",
-                            instrument_name,
-                            retry_exc,
-                        )
-                        continue
+                    logger.warning(
+                        "Rate limit detected while fetching 5-min candles for %s: %s. Backing off.",
+                        instrument_name,
+                        exc,
+                    )
+                    break
                 else:
                     logger.warning("Failed fetching 5-min candles for %s: %s", instrument_name, exc)
                     continue

@@ -415,6 +415,8 @@ class AuthoritativeExecutionWorker:
                      WHERE c.strategy_key=:strategy AND c.instrument=:instrument
                        AND c.enabled=TRUE AND a.is_active=TRUE AND u.is_active=TRUE
                        AND (p.trading_mode='demo' OR (p.trading_mode='live' AND u.can_live_trade=TRUE))
+                     ORDER BY CASE WHEN p.token_state='connected' AND p.last_token_status IN ('success','refreshed') THEN 0 ELSE 1 END,
+                              p.token_received_at DESC NULLS LAST
                     """),
                         {
                             "strategy": SUPERTREND,
@@ -480,6 +482,7 @@ class AuthoritativeExecutionWorker:
                            AND t.strategy_key = :strategy
                            AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
                            AND t.status = 'open'
+                           AND (t.created_at AT TIME ZONE 'Asia/Kolkata')::date = :trade_date
                          ORDER BY t.created_at DESC LIMIT 1
                          FOR UPDATE OF t
                         """),
@@ -488,6 +491,7 @@ class AuthoritativeExecutionWorker:
                                 "strategy": SUPERTREND,
                                 "instrument": underlying,
                                 "prefix": f"{underlying}_%",
+                                "trade_date": signal.signal_at.date(),
                             },
                         )
                     )
@@ -647,7 +651,7 @@ class AuthoritativeExecutionWorker:
                              WHERE t.user_id = :user
                                AND t.strategy_key = :strategy
                                AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
-                               AND t.created_at::date = :trade_date
+                               AND (t.created_at AT TIME ZONE 'Asia/Kolkata')::date = :trade_date
                              ORDER BY t.created_at DESC LIMIT 1
                             """),
                                 {
@@ -674,12 +678,35 @@ class AuthoritativeExecutionWorker:
                     pending.append(runner)
             if not pending or self.market_provider is None:
                 continue
-            selection = await self.market_provider.select(
-                user_id=UUID(str(pending[0]["user_id"])),
-                config=config,
-                side=signal.side,
-                trade_date=signal.signal_at.date(),
-            )
+            selection = None
+            for candidate in pending:
+                try:
+                    candidate_selection = await self.market_provider.select(
+                        user_id=UUID(str(candidate["user_id"])),
+                        config=config,
+                        side=signal.side,
+                        trade_date=signal.signal_at.date(),
+                    )
+                    if candidate_selection is not None:
+                        selection = candidate_selection
+                        break
+                except Exception as exc:
+                    logger.warning(
+                        "SuperTrend market selection failed for user %s (%s): %s. Trying next candidate...",
+                        candidate["user_id"],
+                        config.instrument,
+                        exc,
+                    )
+                    continue
+
+            if selection is None:
+                logger.error(
+                    "Could not obtain SuperTrend market selection for %s %s across %d pending runners.",
+                    config.instrument,
+                    signal.side.value,
+                    len(pending),
+                )
+                continue
             if not signal_is_fresh(signal, datetime.now(IST)):
                 continue
             await session.execute(

@@ -163,7 +163,7 @@ async def test_supertrend_alternation_and_reversal(engine):
                      WHERE t.user_id = :user
                        AND t.strategy_key = :strategy
                        AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
-                       AND t.created_at::date = :trade_date
+                       AND (t.created_at AT TIME ZONE 'Asia/Kolkata')::date = :trade_date
                      ORDER BY t.created_at DESC LIMIT 1
                 """),
                         {
@@ -221,6 +221,7 @@ async def test_supertrend_alternation_and_reversal(engine):
                        AND t.strategy_key = :strategy
                        AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
                        AND t.status = 'open'
+                       AND (t.created_at AT TIME ZONE 'Asia/Kolkata')::date = :trade_date
                      ORDER BY t.created_at DESC LIMIT 1
                 """),
                         {
@@ -228,6 +229,7 @@ async def test_supertrend_alternation_and_reversal(engine):
                             "strategy": SUPERTREND,
                             "instrument": "NIFTY",
                             "prefix": "NIFTY_%",
+                            "trade_date": today,
                         },
                     )
                 )
@@ -272,6 +274,57 @@ async def test_supertrend_alternation_and_reversal(engine):
             assert trade_row["status"] == "closed"
             assert trade_row["safety_status"] == "CLOSED"
             assert trade_row["exit_reason"] == "SIGNAL_REVERSAL"
+
+        # Scenario 3: Verify that previous day's trades do NOT block today's trades
+        # If user had a CE trade yesterday, today's first trade can still be CE (no strict cross-day blocking)
+        yesterday_trade_id = uuid4()
+        yesterday = today - timedelta(days=1)
+        yesterday_t = (now_ist - timedelta(days=1)).astimezone(UTC)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("""
+                INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, last_price, status, safety_status, entry_datetime, created_at, strategy_snapshot_id)
+                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 25, 100, 125, 'closed', 'CLOSED', :t, :t, :s_id)
+            """),
+                {
+                    "t_id": yesterday_trade_id,
+                    "u_id": user_id,
+                    "strat": SUPERTREND,
+                    "t": yesterday_t,
+                    "s_id": snap_id,
+                },
+            )
+
+        # Checking last_trade for tomorrow (or a new day where no trade was taken today) returns None!
+        async with session_factory() as session:
+            tomorrow = today + timedelta(days=1)
+            new_day_last_trade = (
+                (
+                    await session.execute(
+                        text("""
+                    SELECT t.id, t.instrument_label, s.instrument AS snapshot_instrument
+                      FROM trades t
+                      LEFT JOIN strategy_market_snapshots s ON s.id = t.strategy_snapshot_id
+                     WHERE t.user_id = :user
+                       AND t.strategy_key = :strategy
+                       AND (t.instrument_label = :instrument OR t.instrument_label LIKE :prefix OR s.instrument LIKE :prefix)
+                       AND (t.created_at AT TIME ZONE 'Asia/Kolkata')::date = :trade_date
+                     ORDER BY t.created_at DESC LIMIT 1
+                """),
+                        {
+                            "user": user_id,
+                            "strategy": SUPERTREND,
+                            "instrument": "NIFTY",
+                            "prefix": "NIFTY_%",
+                            "trade_date": tomorrow,
+                        },
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            # Crucial: On a new day, last_trade MUST be None so the first trade (CE or PE) is not blocked!
+            assert new_day_last_trade is None
 
     finally:
         async with engine.begin() as conn:
