@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -122,6 +123,15 @@ def exchange_feed_expected(exchange: str, now: datetime | None = None) -> bool:
         return (9 * 60) <= minute <= (23 * 60 + 30)
 
     return True
+
+
+async def _close_client(client: Any) -> None:
+    """Close an AngelClient if it exposes an async close method."""
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        result = close_fn()
+        if inspect.isawaitable(result):
+            await result
 
 
 class MarketDataIngestionService:
@@ -249,154 +259,195 @@ class MarketDataIngestionService:
 
         now = until or datetime.now(UTC)
 
-        from_dt = now - timedelta(days=days)
+        now_ist = now.astimezone(IST)
+
+        latest_expected = latest_completed_five_minute(now_ist)
+
+        closed_at = latest_expected + timedelta(minutes=5)
+
+        settled_at = closed_at + timedelta(seconds=2)
+
+        from_dt = now - timedelta(days=max(days, 5) if days <= 1 else days)
 
         from_str = from_dt.astimezone(IST).strftime("%Y-%m-%d %H:%M")
 
-        to_str = now.astimezone(IST).strftime("%Y-%m-%d %H:%M")
+        to_str = now_ist.strftime("%Y-%m-%d %H:%M")
 
         total_inserted = 0
 
-        for instrument_name, (exchange, token, trading_symbol) in INDEX_INSTRUMENTS.items():
-            if days <= 1:
-                latest_expected = latest_completed_five_minute(now.astimezone(IST))
-                if latest_expected.time() >= time(9, 15):
+        try:
+            for instrument_name, (exchange, token, trading_symbol) in INDEX_INSTRUMENTS.items():
+                if days <= 1 and latest_expected.time() >= time(9, 15):
                     async with self.session_factory() as session:
                         exists = await session.scalar(
                             text("""
                             SELECT 1 FROM backtest_market_candles
                              WHERE exchange = :exchange AND symbol_token = :token
                                AND interval_key = 'FIVE_MINUTE'
-                               AND candle_time >= :latest_expected
+                               AND candle_time = :latest_expected
+                               AND fetched_at >= :settled_at
                             """),
-                            {"exchange": exchange, "token": token, "latest_expected": latest_expected},
+                            {
+                                "exchange": exchange,
+                                "token": token,
+                                "latest_expected": latest_expected,
+                                "settled_at": settled_at,
+                            },
                         )
                         if exists:
                             continue
 
-            try:
-                raw_candles = await client.rest.candles(
-                    exchange, token, "FIVE_MINUTE", from_str, to_str
-                )
-            except Exception as exc:
-                err_text = str(exc).lower()
-                if "rate limit" in err_text or "too many requests" in err_text or "429" in err_text:
-                    logger.warning(
-                        "Rate limit detected while fetching 5-min candles for %s: %s. Backing off.",
-                        instrument_name,
-                        exc,
+                try:
+                    raw_candles = await client.rest.candles(
+                        exchange, token, "FIVE_MINUTE", from_str, to_str
                     )
-                    break
-                else:
-                    logger.warning("Failed fetching 5-min candles for %s: %s", instrument_name, exc)
+                except Exception as exc:
+                    err_text = str(exc).lower()
+                    if "rate limit" in err_text or "too many requests" in err_text or "429" in err_text:
+                        logger.warning(
+                            "Rate limit detected while fetching 5-min candles for %s: %s. Backing off.",
+                            instrument_name,
+                            exc,
+                        )
+                        break
+                    else:
+                        logger.warning("Failed fetching 5-min candles for %s: %s", instrument_name, exc)
+                        continue
+                finally:
+                    await asyncio.sleep(1.0)
+
+                if not isinstance(raw_candles, list):
                     continue
-            finally:
-                await asyncio.sleep(1.0)
 
-            if not isinstance(raw_candles, list):
-                continue
+                async with self.session_factory() as session:
+                    last_close_price: float | None = None
 
-            async with self.session_factory() as session:
-                last_close_price: float | None = None
+                    for item in raw_candles:
+                        if not isinstance(item, list) or len(item) < 5:
+                            continue
 
-                for item in raw_candles:
-                    if not isinstance(item, list) or len(item) < 5:
-                        continue
+                        try:
+                            time_str = str(item[0])
 
-                    try:
-                        time_str = str(item[0])
+                            candle_dt = datetime.fromisoformat(time_str).astimezone(UTC)
 
-                        candle_dt = datetime.fromisoformat(time_str).astimezone(UTC)
+                            open_p = float(item[1])
 
-                        open_p = float(item[1])
+                            high_p = float(item[2])
 
-                        high_p = float(item[2])
+                            low_p = float(item[3])
 
-                        low_p = float(item[3])
+                            close_p = float(item[4])
 
-                        close_p = float(item[4])
+                            vol = float(item[5]) if len(item) > 5 else 0.0
 
-                        vol = float(item[5]) if len(item) > 5 else 0.0
+                            last_close_price = close_p
 
-                        last_close_price = close_p
+                        except (ValueError, TypeError):
+                            continue
 
-                    except (ValueError, TypeError):
-                        continue
+                        candle_ist = candle_dt.astimezone(IST)
+                        # Only persist finalized 5-minute market-hours candles; storing a forming
+                        # candle causes the cache-skip check to treat it as closed.
+                        if candle_ist > latest_expected:
+                            continue
+                        if not (time(9, 15) <= candle_ist.time() < time(15, 30)):
+                            continue
 
-                    await session.execute(
-                        text("""
+                        await session.execute(
+                            text("""
 
-                        INSERT INTO backtest_market_candles (
+                            INSERT INTO backtest_market_candles (
 
-                            id, exchange, instrument, symbol_token, trading_symbol,
+                                id, exchange, instrument, symbol_token, trading_symbol,
 
-                            interval_key, candle_time, open_price, high_price, low_price,
+                                interval_key, candle_time, open_price, high_price, low_price,
 
-                            close_price, volume, source, fetched_at
+                                close_price, volume, source, fetched_at
 
-                        ) VALUES (
+                            ) VALUES (
 
-                            :id, :exchange, :instrument, :token, :trading_symbol,
+                                :id, :exchange, :instrument, :token, :trading_symbol,
 
-                            'FIVE_MINUTE', :candle_time, :open_price, :high_price, :low_price,
+                                'FIVE_MINUTE', :candle_time, :open_price, :high_price, :low_price,
 
-                            :close_price, :volume, 'angel_one', NOW()
+                                :close_price, :volume, 'angel_one', NOW()
 
-                        ) ON CONFLICT (exchange, symbol_token, interval_key, candle_time) DO UPDATE SET
+                            ) ON CONFLICT (exchange, symbol_token, interval_key, candle_time) DO UPDATE SET
 
-                            open_price = EXCLUDED.open_price,
+                                open_price = EXCLUDED.open_price,
 
-                            high_price = EXCLUDED.high_price,
+                                high_price = EXCLUDED.high_price,
 
-                            low_price = EXCLUDED.low_price,
+                                low_price = EXCLUDED.low_price,
 
-                            close_price = EXCLUDED.close_price,
+                                close_price = EXCLUDED.close_price,
 
-                            volume = EXCLUDED.volume,
+                                volume = EXCLUDED.volume,
 
-                            fetched_at = NOW()
+                                fetched_at = NOW()
 
-                        """),
-                        {
-                            "id": uuid4(),
-                            "exchange": exchange,
-                            "instrument": instrument_name,
-                            "token": token,
-                            "trading_symbol": trading_symbol,
-                            "candle_time": candle_dt,
-                            "open_price": open_p,
-                            "high_price": high_p,
-                            "low_price": low_p,
-                            "close_price": close_p,
-                            "volume": vol,
-                        },
-                    )
+                            """),
+                            {
+                                "id": uuid4(),
+                                "exchange": exchange,
+                                "instrument": instrument_name,
+                                "token": token,
+                                "trading_symbol": trading_symbol,
+                                "candle_time": candle_dt,
+                                "open_price": open_p,
+                                "high_price": high_p,
+                                "low_price": low_p,
+                                "close_price": close_p,
+                                "volume": vol,
+                            },
+                        )
 
-                    total_inserted += 1
+                        total_inserted += 1
 
-                if last_close_price is not None and last_close_price > 0:
-                    await session.execute(
-                        text("""
+                    if last_close_price is not None and last_close_price > 0:
+                        await session.execute(
+                            text("""
 
-                        INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
+                            INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
 
-                        VALUES (:exchange, :token, :price, NOW())
+                            VALUES (:exchange, :token, :price, NOW())
 
-                        ON CONFLICT (exchange_segment, contract_token) DO UPDATE
+                            ON CONFLICT (exchange_segment, contract_token) DO UPDATE
 
-                          SET price = EXCLUDED.price, received_at = NOW()
+                              SET price = EXCLUDED.price, received_at = NOW()
 
-                        """),
-                        {"exchange": exchange, "token": token, "price": last_close_price},
-                    )
+                            """),
+                            {"exchange": exchange, "token": token, "price": last_close_price},
+                        )
 
-                await session.commit()
+                    await session.commit()
+        finally:
+            await _close_client(client)
 
         return total_inserted
 
     async def sync_futures_snapshots(self, target_date: date | None = None) -> int:
 
         trade_date = target_date or datetime.now(IST).date()
+
+        async with self.session_factory() as session:
+            existing_instruments = set(
+                (
+                    await session.execute(
+                        text("""
+                        SELECT instrument FROM strategy_market_snapshots
+                         WHERE strategy_key = 'futures_breakout_v3'
+                           AND trade_date = :trade_date
+                        """),
+                        {"trade_date": trade_date},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if existing_instruments >= set(FUTURES_INSTRUMENTS):
+            return 0
 
         active = await self.get_active_broker_client()
 
@@ -407,410 +458,434 @@ class MarketDataIngestionService:
 
         _, client = active
 
-        contracts = await self.get_master_contracts()
+        try:
+            contracts = await self.get_master_contracts()
 
-        from_str = (trade_date - timedelta(days=25)).strftime("%Y-%m-%d 00:00")
+            from_str = (trade_date - timedelta(days=25)).strftime("%Y-%m-%d 00:00")
 
-        to_str = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d 23:59")
+            to_str = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d 23:59")
 
-        synced_count = 0
+            synced_count = 0
 
-        for instrument in FUTURES_INSTRUMENTS:
-            contract = select_futures_contract(contracts, instrument, trade_date)
+            for instrument in FUTURES_INSTRUMENTS:
+                synced_count += await self._sync_futures_instrument(
+                    client,
+                    contracts,
+                    instrument,
+                    trade_date,
+                    from_str,
+                    to_str,
+                )
+        finally:
+            await _close_client(client)
 
-            if not contract:
-                logger.warning("No contract available for %s on %s", instrument, trade_date)
+        return synced_count
 
-                continue
+    async def _sync_futures_instrument(
+        self,
+        client: Any,
+        contracts: tuple[dict[str, Any], ...],
+        instrument: str,
+        trade_date: date,
+        from_str: str,
+        to_str: str,
+    ) -> int:
+        contract = select_futures_contract(contracts, instrument, trade_date)
 
-            token = str(contract.get("token") or "")
+        if not contract:
+            logger.warning("No contract available for %s on %s", instrument, trade_date)
 
-            symbol = str(contract.get("symbol") or "")
+            return 0
 
-            try:
-                expiry = parse_expiry(str(contract.get("expiry") or ""))
+        token = str(contract.get("token") or "")
 
-                lot_size = int(float(str(contract.get("lotsize") or "1")))
+        symbol = str(contract.get("symbol") or "")
 
-            except Exception as exc:
-                logger.warning("Invalid contract fields for %s: %s", instrument, exc)
+        try:
+            expiry = parse_expiry(str(contract.get("expiry") or ""))
 
-                continue
+            lot_size = int(float(str(contract.get("lotsize") or "1")))
 
-            async with self.session_factory() as session:
-                existing_snap = (
+        except Exception as exc:
+            logger.warning("Invalid contract fields for %s: %s", instrument, exc)
+
+            return 0
+
+        async with self.session_factory() as session:
+            existing_snap = (
+                await session.execute(
+                    text("""
+
+                    SELECT 1 FROM strategy_market_snapshots
+
+                     WHERE strategy_key = 'futures_breakout_v3'
+
+                       AND instrument = :instrument
+
+                       AND trade_date = :trade_date
+
+                    """),
+                    {"instrument": instrument, "trade_date": trade_date},
+                )
+            ).scalar()
+
+        if existing_snap:
+            return 0
+
+        try:
+            raw_candles = await client.rest.candles("MCX", token, "ONE_DAY", from_str, to_str)
+
+        except Exception as exc:
+            if "rate limit" in str(exc).lower():
+                await asyncio.sleep(1.5)
+
+                try:
+                    raw_candles = await client.rest.candles(
+                        "MCX", token, "ONE_DAY", from_str, to_str
+                    )
+
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Failed fetching daily candles for %s on retry: %s",
+                        instrument,
+                        retry_exc,
+                    )
+
+                    return 0
+
+            else:
+                logger.warning("Failed fetching daily candles for %s: %s", instrument, exc)
+
+                return 0
+
+        finally:
+            await asyncio.sleep(1.0)
+
+        daily_candles: list[tuple[date, float, float, float]] = []
+
+        if isinstance(raw_candles, list):
+            for row in raw_candles:
+                if not isinstance(row, list) or len(row) < 5:
+                    continue
+
+                try:
+                    c_date = datetime.fromisoformat(str(row[0])).date()
+
+                    if c_date < trade_date:
+                        daily_candles.append(
+                            (c_date, float(row[2]), float(row[3]), float(row[4]))
+                        )
+
+                except (ValueError, TypeError):
+                    continue
+
+        daily_candles.sort(key=lambda item: item[0])
+
+        deduped: list[tuple[date, float, float, float]] = []
+
+        seen_dates: set[date] = set()
+
+        for item in daily_candles:
+            if item[0] not in seen_dates:
+                seen_dates.add(item[0])
+
+                deduped.append(item)
+
+        if len(deduped) > 4:
+            deduped = deduped[-4:]
+
+        synced = 0
+        async with self.session_factory() as session:
+            if len(deduped) == 4:
+                c_dates = [item[0] for item in deduped]
+
+                highs = [item[1] for item in deduped]
+
+                lows = [item[2] for item in deduped]
+
+                prev_close = deduped[-1][3]
+
+                levels = calculate_levels(
+                    [Decimal(str(h)) for h in highs],
+                    [Decimal(str(l)) for l in lows],
+                )
+
+                quote = None
+
+                try:
+                    quote = await client.rest.quote("FULL", {"MCX": [token]})
+
+                except Exception as exc:
+                    logger.debug("Could not fetch MCX quote for token %s: %s", token, exc)
+
+                market_open: float | None = None
+
+                ltp: float | None = None
+
+                if isinstance(quote, dict):
+                    data = quote.get("data")
+
+                    if isinstance(data, dict):
+                        market_open = float(data.get("open") or data.get("opn") or 0.0) or None
+
+                        ltp = float(data.get("ltp") or data.get("lastPrice") or 0.0) or None
+
+                    elif isinstance(data, list) and data:
+                        first_item = data[0]
+
+                        if isinstance(first_item, dict):
+                            market_open = (
+                                float(first_item.get("open") or first_item.get("opn") or 0.0)
+                                or None
+                            )
+
+                            ltp = (
+                                float(
+                                    first_item.get("ltp") or first_item.get("lastPrice") or 0.0
+                                )
+                                or None
+                            )
+
+                if ltp is not None and ltp > 0:
                     await session.execute(
                         text("""
 
-                        SELECT 1 FROM strategy_market_snapshots
+                        INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
 
-                         WHERE strategy_key = 'futures_breakout_v3'
+                        VALUES ('MCX', :token, :price, NOW())
 
-                           AND instrument = :instrument
+                        ON CONFLICT (exchange_segment, contract_token) DO UPDATE
 
-                           AND trade_date = :trade_date
+                          SET price = EXCLUDED.price, received_at = NOW()
 
                         """),
-                        {"instrument": instrument, "trade_date": trade_date},
-                    )
-                ).scalar()
-
-            if existing_snap:
-                continue
-
-            try:
-                raw_candles = await client.rest.candles("MCX", token, "ONE_DAY", from_str, to_str)
-
-            except Exception as exc:
-                if "rate limit" in str(exc).lower():
-                    await asyncio.sleep(1.5)
-
-                    try:
-                        raw_candles = await client.rest.candles(
-                            "MCX", token, "ONE_DAY", from_str, to_str
-                        )
-
-                    except Exception as retry_exc:
-                        logger.warning(
-                            "Failed fetching daily candles for %s on retry: %s",
-                            instrument,
-                            retry_exc,
-                        )
-
-                        continue
-
-                else:
-                    logger.warning("Failed fetching daily candles for %s: %s", instrument, exc)
-
-                    continue
-
-            finally:
-                await asyncio.sleep(1.0)
-
-            daily_candles: list[tuple[date, float, float, float]] = []
-
-            if isinstance(raw_candles, list):
-                for row in raw_candles:
-                    if not isinstance(row, list) or len(row) < 5:
-                        continue
-
-                    try:
-                        c_date = datetime.fromisoformat(str(row[0])).date()
-
-                        if c_date < trade_date:
-                            daily_candles.append(
-                                (c_date, float(row[2]), float(row[3]), float(row[4]))
-                            )
-
-                    except (ValueError, TypeError):
-                        continue
-
-            daily_candles.sort(key=lambda item: item[0])
-
-            deduped: list[tuple[date, float, float, float]] = []
-
-            seen_dates: set[date] = set()
-
-            for item in daily_candles:
-                if item[0] not in seen_dates:
-                    seen_dates.add(item[0])
-
-                    deduped.append(item)
-
-            if len(deduped) > 4:
-                deduped = deduped[-4:]
-
-            async with self.session_factory() as session:
-                if len(deduped) == 4:
-                    c_dates = [item[0] for item in deduped]
-
-                    highs = [item[1] for item in deduped]
-
-                    lows = [item[2] for item in deduped]
-
-                    prev_close = deduped[-1][3]
-
-                    levels = calculate_levels(
-                        [Decimal(str(h)) for h in highs],
-                        [Decimal(str(l)) for l in lows],
+                        {"token": token, "price": ltp},
                     )
 
-                    quote = None
+                buy_entry = float(levels.buy_entry)
 
-                    try:
-                        quote = await client.rest.quote("FULL", {"MCX": [token]})
+                sell_entry = float(levels.sell_entry)
 
-                    except Exception as exc:
-                        logger.debug("Could not fetch MCX quote for token %s: %s", token, exc)
+                if market_open is not None and market_open > 0:
+                    if market_open > buy_entry:
+                        gap_dir = "BUY_MISSED"
 
-                    market_open: float | None = None
+                        plan_status = "WAITING_RANGE"
 
-                    ltp: float | None = None
+                        src = "OPENING_RANGE"
 
-                    if isinstance(quote, dict):
-                        data = quote.get("data")
+                    elif market_open < sell_entry:
+                        gap_dir = "SELL_MISSED"
 
-                        if isinstance(data, dict):
-                            market_open = float(data.get("open") or data.get("opn") or 0.0) or None
+                        plan_status = "WAITING_RANGE"
 
-                            ltp = float(data.get("ltp") or data.get("lastPrice") or 0.0) or None
-
-                        elif isinstance(data, list) and data:
-                            first_item = data[0]
-
-                            if isinstance(first_item, dict):
-                                market_open = (
-                                    float(first_item.get("open") or first_item.get("opn") or 0.0)
-                                    or None
-                                )
-
-                                ltp = (
-                                    float(
-                                        first_item.get("ltp") or first_item.get("lastPrice") or 0.0
-                                    )
-                                    or None
-                                )
-
-                    if ltp is not None and ltp > 0:
-                        await session.execute(
-                            text("""
-
-                            INSERT INTO market_price_ticks (exchange_segment, contract_token, price, received_at)
-
-                            VALUES ('MCX', :token, :price, NOW())
-
-                            ON CONFLICT (exchange_segment, contract_token) DO UPDATE
-
-                              SET price = EXCLUDED.price, received_at = NOW()
-
-                            """),
-                            {"token": token, "price": ltp},
-                        )
-
-                    buy_entry = float(levels.buy_entry)
-
-                    sell_entry = float(levels.sell_entry)
-
-                    if market_open is not None and market_open > 0:
-                        if market_open > buy_entry:
-                            gap_dir = "BUY_MISSED"
-
-                            plan_status = "WAITING_RANGE"
-
-                            src = "OPENING_RANGE"
-
-                        elif market_open < sell_entry:
-                            gap_dir = "SELL_MISSED"
-
-                            plan_status = "WAITING_RANGE"
-
-                            src = "OPENING_RANGE"
-
-                        else:
-                            gap_dir = "NONE_MISSED"
-
-                            plan_status = "READY"
-
-                            src = "STANDARD"
+                        src = "OPENING_RANGE"
 
                     else:
-                        market_open = prev_close
-
                         gap_dir = "NONE_MISSED"
 
                         plan_status = "READY"
 
                         src = "STANDARD"
 
-                    await session.execute(
-                        text("""
-
-                        INSERT INTO strategy_market_snapshots (
-
-                            id, strategy_key, instrument, trade_date, status, error,
-
-                            contract_token, contract_symbol, contract_expiry, lot_size,
-
-                            exchange_segment, product_type, execution_key, underlying_token,
-
-                            candle_dates, highs, lows, hh2, ll2, hh4, ll4,
-
-                            buy_entry, buy_target, buy_sl1, buy_sl2,
-
-                            sell_entry, sell_target, sell_sl1, sell_sl2,
-
-                            previous_close, market_open, gap_direction, entry_direction,
-
-                            entry_source, gap_plan_status, fetched_at
-
-                        ) VALUES (
-
-                            :id, 'futures_breakout_v3', :instrument, :trade_date, 'ready', '',
-
-                            :contract_token, :contract_symbol, :contract_expiry, :lot_size,
-
-                            'MCX', 'CARRYFORWARD', 'daily', '',
-
-                            :candle_dates, :highs, :lows, :hh2, :ll2, :hh4, :ll4,
-
-                            :buy_entry, :buy_target, :buy_sl1, :buy_sl2,
-
-                            :sell_entry, :sell_target, :sell_sl1, :sell_sl2,
-
-                            :previous_close, :market_open, :gap_direction, 'BOTH',
-
-                            :entry_source, :gap_plan_status, NOW()
-
-                        ) ON CONFLICT (strategy_key, instrument, trade_date, execution_key) DO UPDATE SET
-
-                            status = 'ready',
-
-                            error = '',
-
-                            contract_token = EXCLUDED.contract_token,
-
-                            contract_symbol = EXCLUDED.contract_symbol,
-
-                            contract_expiry = EXCLUDED.contract_expiry,
-
-                            lot_size = EXCLUDED.lot_size,
-
-                            candle_dates = EXCLUDED.candle_dates,
-
-                            highs = EXCLUDED.highs,
-
-                            lows = EXCLUDED.lows,
-
-                            hh2 = EXCLUDED.hh2,
-
-                            ll2 = EXCLUDED.ll2,
-
-                            hh4 = EXCLUDED.hh4,
-
-                            ll4 = EXCLUDED.ll4,
-
-                            buy_entry = EXCLUDED.buy_entry,
-
-                            buy_target = EXCLUDED.buy_target,
-
-                            buy_sl1 = EXCLUDED.buy_sl1,
-
-                            buy_sl2 = EXCLUDED.buy_sl2,
-
-                            sell_entry = EXCLUDED.sell_entry,
-
-                            sell_target = EXCLUDED.sell_target,
-
-                            sell_sl1 = EXCLUDED.sell_sl1,
-
-                            sell_sl2 = EXCLUDED.sell_sl2,
-
-                            previous_close = EXCLUDED.previous_close,
-
-                            market_open = COALESCE(EXCLUDED.market_open, strategy_market_snapshots.market_open),
-
-                            gap_direction = COALESCE(EXCLUDED.gap_direction, strategy_market_snapshots.gap_direction),
-
-                            entry_direction = EXCLUDED.entry_direction,
-
-                            entry_source = COALESCE(EXCLUDED.entry_source, strategy_market_snapshots.entry_source),
-
-                            gap_plan_status = COALESCE(EXCLUDED.gap_plan_status, strategy_market_snapshots.gap_plan_status),
-
-                            fetched_at = NOW()
-
-                        """),
-                        {
-                            "id": uuid4(),
-                            "instrument": instrument,
-                            "trade_date": trade_date,
-                            "contract_token": token,
-                            "contract_symbol": symbol,
-                            "contract_expiry": expiry,
-                            "lot_size": lot_size,
-                            "candle_dates": c_dates,
-                            "highs": highs,
-                            "lows": lows,
-                            "hh2": float(levels.hh2),
-                            "ll2": float(levels.ll2),
-                            "hh4": float(levels.hh4),
-                            "ll4": float(levels.ll4),
-                            "buy_entry": buy_entry,
-                            "buy_target": float(levels.buy_target),
-                            "buy_sl1": float(levels.buy_sl1),
-                            "buy_sl2": float(levels.buy_sl2),
-                            "sell_entry": sell_entry,
-                            "sell_target": float(levels.sell_target),
-                            "sell_sl1": float(levels.sell_sl1),
-                            "sell_sl2": float(levels.sell_sl2),
-                            "previous_close": prev_close,
-                            "market_open": market_open,
-                            "gap_direction": gap_dir,
-                            "entry_source": src,
-                            "gap_plan_status": plan_status,
-                        },
-                    )
-
-                    synced_count += 1
-
                 else:
-                    err_msg = f"Expected 4 completed trading days, received {len(deduped)}."
+                    market_open = prev_close
 
-                    await session.execute(
-                        text("""
+                    gap_dir = "NONE_MISSED"
 
-                        INSERT INTO strategy_market_snapshots (
+                    plan_status = "READY"
 
-                            id, strategy_key, instrument, trade_date, status, error,
+                    src = "STANDARD"
 
-                            contract_token, contract_symbol, contract_expiry, lot_size,
+                await session.execute(
+                    text("""
 
-                            exchange_segment, product_type, execution_key, underlying_token,
+                    INSERT INTO strategy_market_snapshots (
 
-                            fetched_at
+                        id, strategy_key, instrument, trade_date, status, error,
 
-                        ) VALUES (
+                        contract_token, contract_symbol, contract_expiry, lot_size,
 
-                            :id, 'futures_breakout_v3', :instrument, :trade_date, 'missing', :error,
+                        exchange_segment, product_type, execution_key, underlying_token,
 
-                            :contract_token, :contract_symbol, :contract_expiry, :lot_size,
+                        candle_dates, highs, lows, hh2, ll2, hh4, ll4,
 
-                            'MCX', 'CARRYFORWARD', 'daily', '',
+                        buy_entry, buy_target, buy_sl1, buy_sl2,
 
-                            NOW()
+                        sell_entry, sell_target, sell_sl1, sell_sl2,
 
-                        ) ON CONFLICT (strategy_key, instrument, trade_date, execution_key) DO UPDATE SET
+                        previous_close, market_open, gap_direction, entry_direction,
 
-                            status = 'missing',
+                        entry_source, gap_plan_status, fetched_at
 
-                            error = EXCLUDED.error,
+                    ) VALUES (
 
-                            contract_token = EXCLUDED.contract_token,
+                        :id, 'futures_breakout_v3', :instrument, :trade_date, 'ready', '',
 
-                            contract_symbol = EXCLUDED.contract_symbol,
+                        :contract_token, :contract_symbol, :contract_expiry, :lot_size,
 
-                            contract_expiry = EXCLUDED.contract_expiry,
+                        'MCX', 'CARRYFORWARD', 'daily', '',
 
-                            lot_size = EXCLUDED.lot_size,
+                        :candle_dates, :highs, :lows, :hh2, :ll2, :hh4, :ll4,
 
-                            fetched_at = NOW()
+                        :buy_entry, :buy_target, :buy_sl1, :buy_sl2,
 
-                        """),
-                        {
-                            "id": uuid4(),
-                            "instrument": instrument,
-                            "trade_date": trade_date,
-                            "error": err_msg,
-                            "contract_token": token,
-                            "contract_symbol": symbol,
-                            "contract_expiry": expiry,
-                            "lot_size": lot_size,
-                        },
-                    )
+                        :sell_entry, :sell_target, :sell_sl1, :sell_sl2,
 
-                await session.commit()
+                        :previous_close, :market_open, :gap_direction, 'BOTH',
 
-        return synced_count
+                        :entry_source, :gap_plan_status, NOW()
+
+                    ) ON CONFLICT (strategy_key, instrument, trade_date, execution_key) DO UPDATE SET
+
+                        status = 'ready',
+
+                        error = '',
+
+                        contract_token = EXCLUDED.contract_token,
+
+                        contract_symbol = EXCLUDED.contract_symbol,
+
+                        contract_expiry = EXCLUDED.contract_expiry,
+
+                        lot_size = EXCLUDED.lot_size,
+
+                        candle_dates = EXCLUDED.candle_dates,
+
+                        highs = EXCLUDED.highs,
+
+                        lows = EXCLUDED.lows,
+
+                        hh2 = EXCLUDED.hh2,
+
+                        ll2 = EXCLUDED.ll2,
+
+                        hh4 = EXCLUDED.hh4,
+
+                        ll4 = EXCLUDED.ll4,
+
+                        buy_entry = EXCLUDED.buy_entry,
+
+                        buy_target = EXCLUDED.buy_target,
+
+                        buy_sl1 = EXCLUDED.buy_sl1,
+
+                        buy_sl2 = EXCLUDED.buy_sl2,
+
+                        sell_entry = EXCLUDED.sell_entry,
+
+                        sell_target = EXCLUDED.sell_target,
+
+                        sell_sl1 = EXCLUDED.sell_sl1,
+
+                        sell_sl2 = EXCLUDED.sell_sl2,
+
+                        previous_close = EXCLUDED.previous_close,
+
+                        market_open = COALESCE(EXCLUDED.market_open, strategy_market_snapshots.market_open),
+
+                        gap_direction = COALESCE(EXCLUDED.gap_direction, strategy_market_snapshots.gap_direction),
+
+                        entry_direction = EXCLUDED.entry_direction,
+
+                        entry_source = COALESCE(EXCLUDED.entry_source, strategy_market_snapshots.entry_source),
+
+                        gap_plan_status = COALESCE(EXCLUDED.gap_plan_status, strategy_market_snapshots.gap_plan_status),
+
+                        fetched_at = NOW()
+
+                    """),
+                    {
+                        "id": uuid4(),
+                        "instrument": instrument,
+                        "trade_date": trade_date,
+                        "contract_token": token,
+                        "contract_symbol": symbol,
+                        "contract_expiry": expiry,
+                        "lot_size": lot_size,
+                        "candle_dates": c_dates,
+                        "highs": highs,
+                        "lows": lows,
+                        "hh2": float(levels.hh2),
+                        "ll2": float(levels.ll2),
+                        "hh4": float(levels.hh4),
+                        "ll4": float(levels.ll4),
+                        "buy_entry": buy_entry,
+                        "buy_target": float(levels.buy_target),
+                        "buy_sl1": float(levels.buy_sl1),
+                        "buy_sl2": float(levels.buy_sl2),
+                        "sell_entry": sell_entry,
+                        "sell_target": float(levels.sell_target),
+                        "sell_sl1": float(levels.sell_sl1),
+                        "sell_sl2": float(levels.sell_sl2),
+                        "previous_close": prev_close,
+                        "market_open": market_open,
+                        "gap_direction": gap_dir,
+                        "entry_source": src,
+                        "gap_plan_status": plan_status,
+                    },
+                )
+
+                synced = 1
+
+            else:
+                err_msg = f"Expected 4 completed trading days, received {len(deduped)}."
+
+                await session.execute(
+                    text("""
+
+                    INSERT INTO strategy_market_snapshots (
+
+                        id, strategy_key, instrument, trade_date, status, error,
+
+                        contract_token, contract_symbol, contract_expiry, lot_size,
+
+                        exchange_segment, product_type, execution_key, underlying_token,
+
+                        fetched_at
+
+                    ) VALUES (
+
+                        :id, 'futures_breakout_v3', :instrument, :trade_date, 'missing', :error,
+
+                        :contract_token, :contract_symbol, :contract_expiry, :lot_size,
+
+                        'MCX', 'CARRYFORWARD', 'daily', '',
+
+                        NOW()
+
+                    ) ON CONFLICT (strategy_key, instrument, trade_date, execution_key) DO UPDATE SET
+
+                        status = 'missing',
+
+                        error = EXCLUDED.error,
+
+                        contract_token = EXCLUDED.contract_token,
+
+                        contract_symbol = EXCLUDED.contract_symbol,
+
+                        contract_expiry = EXCLUDED.contract_expiry,
+
+                        lot_size = EXCLUDED.lot_size,
+
+                        fetched_at = NOW()
+
+                    """),
+                    {
+                        "id": uuid4(),
+                        "instrument": instrument,
+                        "trade_date": trade_date,
+                        "error": err_msg,
+                        "contract_token": token,
+                        "contract_symbol": symbol,
+                        "contract_expiry": expiry,
+                        "lot_size": lot_size,
+                    },
+                )
+
+            await session.commit()
+
+        return synced
 
     async def run_cycle(self) -> dict[str, object]:
 

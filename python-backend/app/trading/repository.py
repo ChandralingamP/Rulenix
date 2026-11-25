@@ -221,7 +221,10 @@ class TradingRepository:
         result = await self.session.execute(text("""
             INSERT INTO manual_trade_close_intents(trade_id,user_id,status,requested_quantity,close_side)
             VALUES(:trade,:user,'requested',:quantity,:side)
-            ON CONFLICT (trade_id) DO NOTHING
+            ON CONFLICT (trade_id) DO UPDATE
+              SET status='requested', requested_quantity=EXCLUDED.requested_quantity,
+                  close_side=EXCLUDED.close_side, last_error='', updated_at=NOW()
+             WHERE manual_trade_close_intents.status IN ('cancelled','failed')
         """), {"trade": trade_id, "user": user_id, "quantity": requested_quantity, "side": close_side})
         return bool(getattr(result, "rowcount", 0))
 

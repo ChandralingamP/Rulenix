@@ -25,11 +25,12 @@ from app.broker.mutations import (
     MutationState,
 )
 from app.risk import ActionKind
-from app.strategy.common import Candle, supertrend_entry_allowed
+from app.strategy.common import Candle, latest_completed_five_minute, supertrend_entry_allowed
 from app.strategy.execution import ExecutionOrchestrator
 from app.strategy.persistence import PreparedIntent, SignalRepository, prepare_square_off_intent
 from app.strategy.supertrend import (
     CONFIGS,
+    MAX_ENTRY_DELAY,
     current_signal,
     signal_is_fresh,
     supertrend_points,
@@ -362,6 +363,9 @@ class AuthoritativeExecutionWorker:
     async def _evaluate_supertrend(self, session: AsyncSession, now: datetime) -> int:
         if not supertrend_entry_allowed(now):
             return 0
+        latest_completed = latest_completed_five_minute(now)
+        if latest_completed.date() != now.date() or latest_completed.time() < time(9, 15):
+            return 0
         generated = 0
         for underlying, config in CONFIGS.items():
             rows = (
@@ -378,7 +382,7 @@ class AuthoritativeExecutionWorker:
                             "exchange": config.index_exchange,
                             "token": config.index_token,
                             "start": now - timedelta(days=14),
-                            "end": now,
+                            "end": latest_completed,
                         },
                     )
                 )
@@ -387,13 +391,14 @@ class AuthoritativeExecutionWorker:
             )
             candles = [
                 Candle(
-                    item["candle_time"].astimezone(IST),
+                    candle_ist,
                     Decimal(str(item["open_price"])),
                     Decimal(str(item["high_price"])),
                     Decimal(str(item["low_price"])),
                     Decimal(str(item["close_price"])),
                 )
                 for item in rows
+                if time(9, 15) <= (candle_ist := item["candle_time"].astimezone(IST)).time() < time(15, 30)
             ]
             signal = current_signal(supertrend_points(candles), now)
             if (
@@ -743,7 +748,7 @@ class AuthoritativeExecutionWorker:
                         int(runner["lots"]) * selection.contract.lot_size,
                         selection.contract.premium,
                         None,
-                        signal.signal_at + timedelta(minutes=6, seconds=30),
+                        signal.signal_at + timedelta(minutes=5) + MAX_ENTRY_DELAY,
                     )
                 )
             if not intents:

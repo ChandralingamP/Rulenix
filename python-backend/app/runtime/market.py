@@ -97,6 +97,25 @@ def quote_ltps(value: object, prices: dict[str, Decimal] | None = None) -> dict[
     return found
 
 
+def _payload_mentions_token(value: object, token: str) -> bool:
+    """Return True if a nested quote payload explicitly references token."""
+    if isinstance(value, list):
+        return any(_payload_mentions_token(item, token) for item in value)
+    if isinstance(value, dict):
+        found = next(
+            (
+                str(value[key])
+                for key in ("symbolToken", "symboltoken", "symbol_token", "token")
+                if value.get(key) not in (None, "")
+            ),
+            "",
+        )
+        if found == token:
+            return True
+        return any(_payload_mentions_token(item, token) for item in value.values())
+    return False
+
+
 class AngelSuperTrendMarketProvider:
     """Daily Angel master plus account-egress-bound, read-only quote selection."""
 
@@ -181,37 +200,57 @@ class AngelSuperTrendMarketProvider:
         side: OptionSide,
         trade_date: date,
     ) -> SuperTrendMarketSelection:
-        underlying = await self._quote(user_id, config.index_exchange, config.index_token)
-        if underlying is None:
-            raise RuntimeError(f"Angel {config.instrument} quote did not include LTP.")
-        for refresh in (False, True):
-            candidates = self._candidates(
-                await self._master(refresh=refresh), config, side, trade_date
+        client = await self.client_factory(user_id)
+        try:
+            underlying_payload = await client.rest.quote(
+                "LTP", {config.index_exchange: [config.index_token]}
             )
-            expiries = sorted({item.expiry for item in candidates})
-            for expiry in expiries:
-                bucket = sorted(
-                    (item for item in candidates if item.expiry == expiry),
-                    key=lambda item: (abs(item.strike - underlying), item.strike),
+            underlying = quote_ltps(underlying_payload).get(config.index_token)
+            if underlying is None:
+                raise RuntimeError(f"Angel {config.instrument} quote did not include LTP.")
+            for refresh in (False, True):
+                candidates = self._candidates(
+                    await self._master(refresh=refresh), config, side, trade_date
                 )
-                for candidate in bucket:
-                    premium = await self._quote(user_id, config.option_exchange, candidate.token)
-                    if premium is not None:
-                        return SuperTrendMarketSelection(
-                            OptionContract(
-                                candidate.token,
-                                candidate.symbol,
-                                candidate.expiry,
-                                candidate.lot_size,
-                                candidate.strike,
-                                candidate.option_type,
-                                premium,
-                            ),
-                            underlying,
-                        )
-        raise RuntimeError(
-            f"No quoteable {config.instrument} {side.value} option contract is available."
-        )
+                expiries = sorted({item.expiry for item in candidates})
+                for expiry in expiries:
+                    bucket = sorted(
+                        (item for item in candidates if item.expiry == expiry),
+                        key=lambda item: (abs(item.strike - underlying), item.strike),
+                    )[:10]
+                    if not bucket:
+                        continue
+                    batch_payload = await client.rest.quote(
+                        "LTP", {config.option_exchange: [item.token for item in bucket]}
+                    )
+                    batch_prices = quote_ltps(batch_payload)
+                    for candidate in bucket:
+                        premium = batch_prices.get(candidate.token)
+                        if premium is None and not _payload_mentions_token(
+                            batch_payload, candidate.token
+                        ):
+                            single_payload = await client.rest.quote(
+                                "LTP", {config.option_exchange: [candidate.token]}
+                            )
+                            premium = quote_ltps(single_payload).get(candidate.token)
+                        if premium is not None:
+                            return SuperTrendMarketSelection(
+                                OptionContract(
+                                    candidate.token,
+                                    candidate.symbol,
+                                    candidate.expiry,
+                                    candidate.lot_size,
+                                    candidate.strike,
+                                    candidate.option_type,
+                                    premium,
+                                ),
+                                underlying,
+                            )
+            raise RuntimeError(
+                f"No quoteable {config.instrument} {side.value} option contract is available."
+            )
+        finally:
+            await client.close()
 
     async def select_opponent_basket(
         self,
