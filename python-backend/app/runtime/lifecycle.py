@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from time import monotonic
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,48 @@ from app.trading.domain import futures_pnl_units, sl2_reversal, trade_pnl
 from .market import SuperTrendMarketProvider
 
 logger = logging.getLogger(__name__)
+
+
+class SkipReporter:
+    """Explain why a strategy did not trade, without logging every worker cycle.
+
+    A line is emitted when the reason for a (strategy, instrument) pair changes, and
+    again at most every ``repeat_seconds`` while the same reason persists. Context values
+    must be non-sensitive (counts, timestamps, statuses); never pass credentials or IDs.
+    """
+
+    def __init__(self, repeat_seconds: float = 300.0) -> None:
+        self.repeat_seconds = repeat_seconds
+        self._last: dict[tuple[str, str], tuple[str, float]] = {}
+
+    def report(
+        self,
+        strategy: str,
+        instrument: str,
+        reason: str,
+        *,
+        level: int = logging.INFO,
+        **context: object,
+    ) -> bool:
+        key = (strategy, instrument)
+        now = monotonic()
+        previous = self._last.get(key)
+        if previous is not None and previous[0] == reason and now - previous[1] < self.repeat_seconds:
+            return False
+        self._last[key] = (reason, now)
+        detail = " ".join(f"{name}={value}" for name, value in context.items())
+        logger.log(
+            level,
+            "strategy_skip strategy=%s instrument=%s reason=%s %s",
+            strategy,
+            instrument,
+            reason,
+            detail,
+        )
+        return True
+
+
+skips = SkipReporter()
 
 IST = ZoneInfo("Asia/Kolkata")
 FUTURES = "futures_breakout_v3"
@@ -254,10 +297,40 @@ class AuthoritativeExecutionWorker:
             .mappings()
             .all()
         )
+        if not snapshots:
+            states = (
+                (
+                    await session.execute(
+                        text("""
+                    SELECT instrument,status,gap_plan_status FROM strategy_market_snapshots
+                     WHERE strategy_key=:strategy AND trade_date=:date
+                     ORDER BY instrument
+                    """),
+                        {"strategy": FUTURES, "date": now.date()},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            summary = (
+                ",".join(
+                    f"{row['instrument']}:{row['status']}/{row['gap_plan_status']}"
+                    for row in states
+                )
+                or "none_created"
+            )
+            skips.report(
+                FUTURES,
+                "*",
+                "no_ready_snapshot",
+                level=logging.WARNING,
+                snapshots=summary,
+            )
         for session_name, due in schedules:
             if calendar is not None and not bool(
                 calendar["morning_open" if session_name == "day" else "evening_open"]
             ):
+                skips.report(FUTURES, "*", "calendar_closed", session=session_name)
                 continue
             for snapshot in snapshots:
                 runners = (
@@ -283,6 +356,12 @@ class AuthoritativeExecutionWorker:
                     .all()
                 )
                 if not runners:
+                    skips.report(
+                        FUTURES,
+                        str(snapshot["instrument"]),
+                        "no_eligible_runners",
+                        session=session_name,
+                    )
                     continue
                 directions = (
                     ("BUY", "SELL")
@@ -340,6 +419,12 @@ class AuthoritativeExecutionWorker:
                             )
                         )
                 if not intents:
+                    skips.report(
+                        FUTURES,
+                        str(snapshot["instrument"]),
+                        "no_entry_price",
+                        session=session_name,
+                    )
                     continue
                 key = f"fb-{now:%Y%m%d}-{session_name}-{snapshot['entry_source'] or 'standard'}"
                 _, inserted = await SignalRepository(session).materialize(
@@ -401,11 +486,38 @@ class AuthoritativeExecutionWorker:
                 if time(9, 15) <= (candle_ist := item["candle_time"].astimezone(IST)).time() < time(15, 30)
             ]
             signal = current_signal(supertrend_points(candles), now)
-            if (
-                signal is None
-                or signal.signal_at.date() != now.date()
-                or not signal_is_fresh(signal, now)
-            ):
+            if signal is None:
+                expected_bar = latest_completed_five_minute(now)
+                if not candles:
+                    skips.report(
+                        SUPERTREND, underlying, "no_candles", level=logging.WARNING
+                    )
+                elif candles[-1].at < expected_bar:
+                    skips.report(
+                        SUPERTREND,
+                        underlying,
+                        "stale_candles",
+                        level=logging.WARNING,
+                        latest_candle=candles[-1].at.isoformat(),
+                        expected_bar=expected_bar.isoformat(),
+                    )
+                else:
+                    skips.report(
+                        SUPERTREND,
+                        underlying,
+                        "no_flip",
+                        level=logging.DEBUG,
+                        bar=expected_bar.isoformat(),
+                    )
+                continue
+            if signal.signal_at.date() != now.date() or not signal_is_fresh(signal, now):
+                skips.report(
+                    SUPERTREND,
+                    underlying,
+                    "signal_not_fresh",
+                    signal_at=signal.signal_at.isoformat(),
+                    now=now.isoformat(),
+                )
                 continue
             runners = (
                 (
@@ -435,7 +547,17 @@ class AuthoritativeExecutionWorker:
                 .all()
             )
             session_key = f"st-{underlying}-{signal.signal_at:%Y%m%d-%H%M}-{signal.side.value}"
+            if not runners:
+                skips.report(
+                    SUPERTREND,
+                    underlying,
+                    "no_eligible_runners",
+                    side=signal.side.value,
+                    signal_at=signal.signal_at.isoformat(),
+                )
+                continue
             pending = []
+            runner_skips: dict[str, int] = {}
             for runner in runners:
                 processed = bool(
                     await session.scalar(
@@ -453,6 +575,7 @@ class AuthoritativeExecutionWorker:
                     )
                 )
                 if processed:
+                    runner_skips["already_processed"] = runner_skips.get("already_processed", 0) + 1
                     continue
 
                 active_intent = bool(
@@ -471,6 +594,7 @@ class AuthoritativeExecutionWorker:
                     )
                 )
                 if active_intent:
+                    runner_skips["active_intent"] = runner_skips.get("active_intent", 0) + 1
                     continue
 
                 existing_trade = (
@@ -511,6 +635,7 @@ class AuthoritativeExecutionWorker:
                         or ""
                     )
                     if trade_inst.endswith((signal.side.value, f"_{signal.side.value}")):
+                        runner_skips["same_side_open"] = runner_skips.get("same_side_open", 0) + 1
                         continue
 
                     # SuperTrend trend reversal: close the existing opposite trade
@@ -679,9 +804,23 @@ class AuthoritativeExecutionWorker:
                         )
                         if last_label.endswith((signal.side.value, f"_{signal.side.value}")):
                             # Strict alternation: already executed this side today, wait for next trend reversal
+                            runner_skips["alternation"] = runner_skips.get("alternation", 0) + 1
                             continue
                     pending.append(runner)
             if not pending or self.market_provider is None:
+                reason = (
+                    "no_market_provider"
+                    if pending and self.market_provider is None
+                    else "all_runners_skipped"
+                )
+                skips.report(
+                    SUPERTREND,
+                    underlying,
+                    reason,
+                    side=signal.side.value,
+                    signal_at=signal.signal_at.isoformat(),
+                    **{key: value for key, value in sorted(runner_skips.items())},
+                )
                 continue
             selection = None
             for candidate in pending:
@@ -713,6 +852,13 @@ class AuthoritativeExecutionWorker:
                 )
                 continue
             if not signal_is_fresh(signal, datetime.now(IST)):
+                skips.report(
+                    SUPERTREND,
+                    underlying,
+                    "expired_during_selection",
+                    level=logging.WARNING,
+                    signal_at=signal.signal_at.isoformat(),
+                )
                 continue
             await session.execute(
                 text("""
@@ -1081,10 +1227,12 @@ class AuthoritativeExecutionWorker:
             .all()
         )
         if not runners:
+            skips.report(OPPONENT, "NIFTY", "no_eligible_runners")
             return 0
 
         # Filter runners who haven't exceeded daily trade or loss circuit breaker
         eligible_runners = []
+        runner_skips: dict[str, int] = {}
         for runner in runners:
             user_id = runner["user_id"]
             # Check daily trade count and loss count today
@@ -1103,6 +1251,9 @@ class AuthoritativeExecutionWorker:
             total_trades = int(counts["total_trades"] if counts else 0)
             losses = int(counts["losses"] if counts else 0)
             if not is_session_trading_allowed(total_trades, losses):
+                runner_skips["daily_limit_or_loss_halt"] = (
+                    runner_skips.get("daily_limit_or_loss_halt", 0) + 1
+                )
                 continue
 
             # Check if runner already has an open position or in-flight intent
@@ -1121,11 +1272,20 @@ class AuthoritativeExecutionWorker:
                 )
             )
             if active:
+                runner_skips["position_or_intent_active"] = (
+                    runner_skips.get("position_or_intent_active", 0) + 1
+                )
                 continue
 
             eligible_runners.append(runner)
 
         if not eligible_runners:
+            skips.report(
+                OPPONENT,
+                "NIFTY",
+                "no_runner_available",
+                **{key: value for key, value in sorted(runner_skips.items())},
+            )
             return 0
 
         # Get latest Nifty spot price from ticks
@@ -1138,6 +1298,7 @@ class AuthoritativeExecutionWorker:
             """)
         )
         if spot_ltp is None or float(spot_ltp) <= 0:
+            skips.report(OPPONENT, "NIFTY", "no_spot_tick", level=logging.WARNING)
             return 0
 
         spot = Decimal(str(spot_ltp))
@@ -1159,12 +1320,21 @@ class AuthoritativeExecutionWorker:
 
         if bench_row:
             if str(bench_row["status"]) == "aborted":
+                skips.report(OPPONENT, "NIFTY", "day_aborted_spot_expansion")
                 return 0
             bench_spot = Decimal(str(bench_row["previous_close"]))
             if check_spot_expansion_abort(bench_spot, spot):
                 await session.execute(
                     text("UPDATE strategy_market_snapshots SET status='aborted' WHERE id=:id"),
                     {"id": bench_row["id"]},
+                )
+                skips.report(
+                    OPPONENT,
+                    "NIFTY",
+                    "day_aborted_spot_expansion",
+                    level=logging.WARNING,
+                    benchmark_spot=bench_spot,
+                    spot=spot,
                 )
                 return 0
         else:
@@ -1204,6 +1374,7 @@ class AuthoritativeExecutionWorker:
             return 0
 
         if self.market_provider is None:
+            skips.report(OPPONENT, "NIFTY", "no_market_provider", level=logging.WARNING)
             return 0
 
         # Discover 3-strike perimeter baskets: [ATM - 50, ATM, ATM + 50]
@@ -1217,13 +1388,27 @@ class AuthoritativeExecutionWorker:
                     trade_date=now.date(),
                 )
             except Exception as exc:
-                logger.debug("Opponent basket discovery failed: %s", exc)
+                skips.report(
+                    OPPONENT,
+                    "NIFTY",
+                    "basket_discovery_failed",
+                    level=logging.WARNING,
+                    error=f"{type(exc).__name__}: {str(exc)[:160]}",
+                )
 
         # Fallback for mock environments that only implement select()
         if not baskets or len(baskets) < len(perimeter):
             from app.strategy.supertrend import CONFIGS
             config = CONFIGS.get("NIFTY")
             if config is None or not hasattr(self.market_provider, "select"):
+                skips.report(
+                    OPPONENT,
+                    "NIFTY",
+                    "basket_incomplete_no_fallback",
+                    level=logging.WARNING,
+                    baskets=len(baskets),
+                    needed=len(perimeter),
+                )
                 return 0
             side = OptionSide.CALL if spot >= atm_strike else OptionSide.PUT
             try:
@@ -1239,9 +1424,17 @@ class AuthoritativeExecutionWorker:
                     side=side.opposite,
                     trade_date=now.date(),
                 )
-            except Exception:
+            except Exception as exc:
+                skips.report(
+                    OPPONENT,
+                    "NIFTY",
+                    "fallback_selection_failed",
+                    level=logging.WARNING,
+                    error=f"{type(exc).__name__}: {str(exc)[:160]}",
+                )
                 return 0
             if selection is None or opponent_selection is None:
+                skips.report(OPPONENT, "NIFTY", "fallback_selection_empty", level=logging.WARNING)
                 return 0
             from unittest.mock import MagicMock
             baskets = [
@@ -1298,11 +1491,21 @@ class AuthoritativeExecutionWorker:
                 strikes_available.append(b.strike)
 
         if not ce_map or not pe_map:
+            skips.report(
+                OPPONENT,
+                "NIFTY",
+                "no_option_candles",
+                level=logging.WARNING,
+                baskets=len(baskets),
+                tokens=len(all_tokens),
+                tokens_with_candles=len(candles_by_token),
+            )
             return 0
 
         # Build ranked coincidence queue across the available strikes
         ranked_queue = build_ranked_coincidence_queue(ce_map, pe_map, strikes_available)
         if not ranked_queue:
+            skips.report(OPPONENT, "NIFTY", "no_coincidence_pairs")
             return 0
 
         # Evaluate confirmation on the ranked queue (starting with Rank 1)
@@ -1336,6 +1539,13 @@ class AuthoritativeExecutionWorker:
                 break
 
         if confirmed_signal is None:
+            skips.report(
+                OPPONENT,
+                "NIFTY",
+                "no_confirmation",
+                level=logging.DEBUG,
+                pairs=len(ranked_queue),
+            )
             return 0
 
         # Step 4: Retracement Pullback: Current LTP must be in [Marked High, Marked High + 5.0 pts]
@@ -1354,6 +1564,14 @@ class AuthoritativeExecutionWorker:
         )
 
         if not is_in_retracement_zone(opt_price, confirmed_signal.marked_high):
+            skips.report(
+                OPPONENT,
+                "NIFTY",
+                "outside_retracement_zone",
+                side=confirmed_signal.side.value,
+                price=opt_price,
+                marked_high=confirmed_signal.marked_high,
+            )
             return 0
 
         session_key = f"opp-NIFTY-{now:%Y%m%d-%H%M}-{confirmed_signal.side.value}"

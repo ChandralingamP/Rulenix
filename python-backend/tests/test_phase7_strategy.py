@@ -91,19 +91,22 @@ def test_supertrend_wilder_seed_and_parameters():
     assert ATR_PERIOD == 7
 
 
-def test_supertrend_flip_to_call_matches_rust_fixture():
+def _five_minute_flip_signal():
     closes = [100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 91, 92, 93, 108]
-    points = supertrend_points(
-        [
-            candle(ts(9, 15) + timedelta(minutes=index), str(close))
-            for index, close in enumerate(closes)
-        ],
-        3,
-        1,
-    )
+    candles = [
+        candle(ts(9, 15) + timedelta(minutes=5 * index), str(close))
+        for index, close in enumerate(closes)
+    ]
+    points = supertrend_points(candles, 3, 1)
     assert points[-2].direction == "DOWN" and points[-1].direction == "UP"
-    signal = current_signal(points, ts(9, 30))
+    # The flip bar opens 10:25 and closes 10:30; evaluate as of its close.
+    return current_signal(points, candles[-1].at + timedelta(minutes=5))
+
+
+def test_supertrend_flip_to_call_matches_rust_fixture():
+    signal = _five_minute_flip_signal()
     assert signal is not None and signal.side is OptionSide.CALL
+    assert signal.signal_at == ts(10, 25)
 
 
 def test_supertrend_entry_cutoff_and_eod_are_ist_and_timezone_independent():
