@@ -30,10 +30,10 @@
     "scenario_id": "supertrend-target",
     "strategy_key": "supertrend_index_options_v1",
     "instrument": "NIFTY23350CE",
-    "side": "BUY", "quantity": 50,
+    "side": "BUY", "quantity": 65,
     "entry": "100", "target": "125", "sl1": "85", "sl2": "85",
     "exit_kind": "TARGET",
-    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 50, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "TARGET", "exit_price": "125", "pnl": "1250.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 65, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "TARGET", "exit_price": "125", "pnl": "1625.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
   },
   {
     "scenario_id": "supertrend-stop",
@@ -48,10 +48,10 @@
     "scenario_id": "supertrend-1510-eod",
     "strategy_key": "supertrend_index_options_v1",
     "instrument": "NIFTY23350PE",
-    "side": "BUY", "quantity": 50,
+    "side": "BUY", "quantity": 65,
     "entry": "100", "target": "125", "sl1": "85", "sl2": "85",
     "exit_kind": "EOD", "exit_price": "102",
-    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 50, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "EOD", "exit_price": "102", "pnl": "100.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
+    "oracle": {"allowed": true, "reason": "allowed", "signal_count": 1, "intent_count": 2, "order_count": 3, "trade_count": 1, "side": "BUY", "quantity": 65, "entry": "100", "target": "125", "sl1": "85", "sl2": "85", "exit_reason": "EOD", "exit_price": "102", "pnl": "130.00", "reversal_side": null, "reversal_entry": null, "reversal_exit": null, "reversal_pnl": "0.00"}
   },
   {
     "scenario_id": "futures-manual-demo-close",

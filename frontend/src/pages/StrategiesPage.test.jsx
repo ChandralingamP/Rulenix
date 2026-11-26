@@ -230,4 +230,54 @@ describe("StrategiesPage", () => {
     expect(screen.queryByLabelText("GOLD trade lots")).not.toBeInTheDocument();
   });
 
+  it("displays SuperTrend line price in place of expiry for supertrend_index_options_v1", async () => {
+    setAuthUsername("TRADER01");
+    apiClient.get.mockResolvedValue({
+      data: {
+        strategies: [
+          {
+            key: "supertrend_index_options_v1",
+            name: "SuperTrend Index Options v1",
+            description: "Intraday 5-minute SuperTrend flips.",
+            active: true,
+            instruments: [
+              {
+                instrument: "NIFTY",
+                label: "NIFTY ATM Options",
+                enabled: true,
+                lots: 1,
+                target_points: 25,
+                stop_loss_points: 15,
+                snapshot: {
+                  strategy_key: "supertrend_index_options_v1",
+                  instrument: "NIFTY",
+                  status: "ready",
+                  execution_key: "catalog-preview",
+                  contract_expiry: null,
+                  lot_size: 65,
+                  supertrend_price: 24185.45,
+                  supertrend_direction: "UP",
+                  supertrend_candle_at: "2026-11-26T10:10:00+05:30",
+                  index_close: 24240.1,
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const store = configureStore({ reducer: { strategies: strategiesReducer } });
+
+    render(
+      <Provider store={store}>
+        <StrategiesPage />
+      </Provider>
+    );
+
+    expect(await screen.findByText("SuperTrend line")).toBeInTheDocument();
+    expect(screen.queryByText("Expiry")).not.toBeInTheDocument();
+    expect(screen.getByText("24,185.45")).toBeInTheDocument();
+    expect(screen.getByText("UP")).toBeInTheDocument();
+    expect(screen.getByText("65")).toBeInTheDocument();
+  });
 });

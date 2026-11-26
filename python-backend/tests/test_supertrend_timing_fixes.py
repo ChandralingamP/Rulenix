@@ -283,7 +283,7 @@ async def test_supertrend_market_provider_reuses_client_and_batches_quotes() -> 
             "name": "NIFTY",
             "expiry": "20AUG2026",
             "strike": str(strike * 100),
-            "lotsize": "50",
+            "lotsize": "65",
             "instrumenttype": "OPTIDX",
             "exch_seg": "NFO",
         }

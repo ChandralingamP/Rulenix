@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, time, timedelta
 from datetime import date as Date
-from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..dependencies import Principal, admin_only, current_user, get_db
 from ..errors import DomainError
+from ..strategy.common import IST, NIFTY_LOT_SIZE, Candle, latest_completed_five_minute
+from ..strategy.supertrend import CONFIGS, supertrend_points
 
 router = APIRouter(tags=["strategy"])
 _STRATEGIES = {
@@ -20,12 +23,73 @@ _STRATEGIES = {
 }
 _FUTURES_LABELS = {"GOLDTEN": "Gold Ten", "GOLDM": "Gold Mini", "SILVERM": "Silver Mini", "SILVERMIC": "Silver Micro", "NATGASMINI": "Natural Gas Mini"}
 _INDEX_OPTIONS = {
-    "SENSEX": {"label": "SENSEX ATM Options", "exchange": "BFO", "token": "99919000", "target": 40.0, "stop": 25.0},
-    "NIFTY": {"label": "NIFTY ATM Options", "exchange": "NFO", "token": "99926000", "target": 25.0, "stop": 15.0},
+    "SENSEX": {"label": "SENSEX ATM Options", "exchange": "BFO", "token": "99919000", "target": 40.0, "stop": 25.0, "lot_size": None},
+    "NIFTY": {"label": "NIFTY ATM Options", "exchange": "NFO", "token": "99926000", "target": 25.0, "stop": 15.0, "lot_size": NIFTY_LOT_SIZE},
 }
 _OPPONENT_OPTIONS = {
-    "NIFTY": {"label": "Nifty 50 Opponent Parity", "exchange": "NFO", "token": "99926000", "default_partial_close_pct": 50.0},
+    "NIFTY": {"label": "Nifty 50 Opponent Parity", "exchange": "NFO", "token": "99926000", "default_partial_close_pct": 50.0, "lot_size": NIFTY_LOT_SIZE},
 }
+
+
+async def fetch_supertrend_statuses(
+    db: AsyncSession,
+    now: datetime | None = None,
+) -> dict[str, dict]:
+    """Compute the latest completed 5m SuperTrend line price & direction per index."""
+    local_now = (now or datetime.now(UTC)).astimezone(IST)
+    latest_completed = latest_completed_five_minute(local_now)
+    tokens = [cfg.index_token for cfg in CONFIGS.values()]
+    rows = (
+        await db.execute(
+            text("""
+            SELECT exchange, symbol_token, candle_time, open_price, high_price, low_price, close_price
+              FROM backtest_market_candles
+             WHERE interval_key = 'FIVE_MINUTE'
+               AND symbol_token = ANY(:tokens)
+               AND candle_time >= :start
+               AND candle_time <= :end
+             ORDER BY candle_time
+            """),
+            {
+                "tokens": tokens,
+                "start": local_now - timedelta(days=14),
+                "end": latest_completed,
+            },
+        )
+    ).mappings().all()
+
+    by_key: dict[tuple[str, str], list[Candle]] = {}
+    for item in rows:
+        candle_ist = item["candle_time"].astimezone(IST)
+        if not (time(9, 15) <= candle_ist.time() < time(15, 30)):
+            continue
+        key = (str(item["exchange"]), str(item["symbol_token"]))
+        by_key.setdefault(key, []).append(
+            Candle(
+                candle_ist,
+                Decimal(str(item["open_price"])),
+                Decimal(str(item["high_price"])),
+                Decimal(str(item["low_price"])),
+                Decimal(str(item["close_price"])),
+            )
+        )
+
+    statuses: dict[str, dict] = {}
+    for instrument, cfg in CONFIGS.items():
+        points = supertrend_points(by_key.get((cfg.index_exchange, cfg.index_token), []))
+        if not points:
+            continue
+        latest = points[-1]
+        previous = points[-2] if len(points) >= 2 else None
+        statuses[instrument] = {
+            "supertrend_price": round(float(latest.value), 2),
+            "supertrend_direction": latest.direction,
+            "supertrend_candle_at": latest.candle.ist.isoformat(),
+            "index_close": round(float(latest.candle.close), 2),
+            "previous_supertrend_price": round(float(previous.value), 2) if previous else None,
+            "previous_direction": previous.direction if previous else None,
+        }
+    return statuses
 
 
 async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
@@ -49,11 +113,13 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
         row = configs.get(("futures_breakout_v3", instrument))
         breakout_instruments.append({"instrument": instrument, "label": _FUTURES_LABELS[instrument], "enabled": bool(row["enabled"]) if row else False, "lots": int(row["lots"]) if row else 1, "run_day_session": bool(row["run_day_session"]) if row else True, "run_evening_session": bool(row["run_evening_session"]) if row else True, "snapshot": snapshots.get(instrument)})
     supertrend_alerts = list((await db.execute(text("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key='supertrend_index_options_v1' AND event_type='operational_alert' AND (user_id=:user OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1"), {"user": user_id})).scalars().all())
+    supertrend_levels = await fetch_supertrend_statuses(db)
     supertrend_instruments = []
     for instrument, defaults in _INDEX_OPTIONS.items():
         row = configs.get(("supertrend_index_options_v1", instrument))
         target = float(row["target_points"]) if row and row["target_points"] and row["target_points"] > 0 else defaults["target"]
         stop = float(row["stop_loss_points"]) if row and row["stop_loss_points"] and row["stop_loss_points"] > 0 else defaults["stop"]
+        level = supertrend_levels.get(instrument, {})
         supertrend_instruments.append({
             "instrument": instrument,
             "label": defaults["label"],
@@ -64,7 +130,22 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
             "target_points": target,
             "stop_loss_points": stop,
             "parameters": {"target_points": target, "stop_loss_points": stop, "atr_period": 7, "factor": 2.0, "interval": "FIVE_MINUTE", "contract_selection": "ATM"},
-            "snapshot": {"strategy_key": "supertrend_index_options_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_expiry": None, "lot_size": None, "market_data": market_data},
+            "snapshot": {
+                "strategy_key": "supertrend_index_options_v1",
+                "instrument": instrument,
+                "status": "ready",
+                "execution_key": "catalog-preview",
+                "exchange_segment": defaults["exchange"],
+                "product_type": "INTRADAY",
+                "underlying_token": defaults["token"],
+                "contract_expiry": None,
+                "lot_size": defaults.get("lot_size"),
+                "supertrend_price": level.get("supertrend_price"),
+                "supertrend_direction": level.get("supertrend_direction"),
+                "supertrend_candle_at": level.get("supertrend_candle_at"),
+                "index_close": level.get("index_close"),
+                "market_data": market_data,
+            },
         })
     opponent_alerts = list((await db.execute(text("SELECT jsonb_build_object('id',id,'instrument',instrument,'severity',payload->>'severity','code',payload->>'code','message',payload->>'message','created_at',created_at) FROM strategy_events WHERE strategy_key='nifty_opponent_v1' AND event_type='operational_alert' AND (user_id=:user OR user_id IS NULL) AND created_at>NOW()-INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1"), {"user": user_id})).scalars().all())
     opponent_instruments = []
@@ -82,7 +163,7 @@ async def _catalog(db: AsyncSession, user_id: str) -> list[dict]:
             "target_points": partial_pct,
             "stop_loss_points": 0.0,
             "parameters": {"partial_close_pct": partial_pct, "timeframe": 3, "interval": "THREE_MINUTE", "spot_abort_points": 150.0, "retracement_band": 5.0},
-            "snapshot": {"strategy_key": "nifty_opponent_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_symbol": "NIFTY CE/PE paired at 09:33", "contract_expiry": None, "lot_size": 65, "market_data": market_data},
+            "snapshot": {"strategy_key": "nifty_opponent_v1", "instrument": instrument, "status": "ready", "execution_key": "catalog-preview", "exchange_segment": defaults["exchange"], "product_type": "INTRADAY", "underlying_token": defaults["token"], "contract_symbol": "NIFTY CE/PE paired at 09:33", "contract_expiry": None, "lot_size": defaults["lot_size"], "market_data": market_data},
         })
     return [
         {"key": "futures_breakout_v3", "name": "Futures Breakout v3", "description": _STRATEGIES["futures_breakout_v3"][1], "active": activations.get("futures_breakout_v3", False), "operational_alerts": breakout_alerts, "scheduler_runs": runs, "instruments": breakout_instruments},

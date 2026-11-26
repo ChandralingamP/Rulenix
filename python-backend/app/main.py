@@ -1,3 +1,5 @@
+import logging
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -86,8 +88,23 @@ async def bootstrap_initial_admin(session_factory, settings):
         await session.commit()
 
 
+def _configure_app_logging() -> None:
+    """Ensure ``app.*`` INFO diagnostics (e.g. SkipReporter) emit to container stdout."""
+    app_logger = logging.getLogger("app")
+    if not app_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        app_logger.addHandler(handler)
+    if app_logger.level == logging.NOTSET or app_logger.level > logging.INFO:
+        app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _configure_app_logging()
     app.state.settings = get_settings()
     app.state.engine = make_engine(app.state.settings.async_database_url)
     app.state.session_factory = make_session_factory(app.state.engine)

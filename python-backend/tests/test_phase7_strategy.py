@@ -143,9 +143,9 @@ def test_supertrend_continuity_requires_previous_session_and_current_candles():
 
 def test_supertrend_contract_selection_is_nearest_atm_with_expiry_tie_break():
     contracts = [
-        OptionContract("far", "NIFTY27AUG", date(2026, 8, 27), 75, Decimal(25000), OptionSide.CALL),
-        OptionContract("low", "NIFTY20AUG", date(2026, 8, 20), 75, Decimal(24950), OptionSide.CALL),
-        OptionContract("atm", "NIFTY20AUG", date(2026, 8, 20), 75, Decimal(25050), OptionSide.CALL),
+        OptionContract("far", "NIFTY27AUG", date(2026, 8, 27), 65, Decimal(25000), OptionSide.CALL),
+        OptionContract("low", "NIFTY20AUG", date(2026, 8, 20), 65, Decimal(24950), OptionSide.CALL),
+        OptionContract("atm", "NIFTY20AUG", date(2026, 8, 20), 65, Decimal(25050), OptionSide.CALL),
     ]
     assert choose_atm_contract(contracts, "25060").token == "atm"
 

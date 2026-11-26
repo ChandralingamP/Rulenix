@@ -301,21 +301,21 @@ async def test_clear_trade_logs_kill_switch_guard(engine):
             await conn.execute(
                 text("""
                 INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, status, safety_status, entry_datetime, strategy_snapshot_id)
-                VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'demo', 50, 22000, 'open', 'DEMO', NOW(), :s_id)
+                VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'demo', 65, 22000, 'open', 'DEMO', NOW(), :s_id)
             """),
                 {"t_id": trade_id, "u_id": user_id, "s_id": snap_id},
             )
             await conn.execute(
                 text("""
                 INSERT INTO strategy_orders(id, user_id, trade_id, snapshot_id, side, execution_mode, quantity, price, status, role, session_key, lots, idempotency_key)
-                VALUES(:o_id, :u_id, :t_id, :s_id, 'BUY', 'demo', 50, 22000, 'open', 'BUY_ENTRY', 'regular', 1, 'idem-1')
+                VALUES(:o_id, :u_id, :t_id, :s_id, 'BUY', 'demo', 65, 22000, 'open', 'BUY_ENTRY', 'regular', 1, 'idem-1')
             """),
                 {"o_id": order_id, "u_id": user_id, "t_id": trade_id, "s_id": snap_id},
             )
             await conn.execute(
                 text("""
                 INSERT INTO backtest_runs(id, user_id, strategy_key, instrument, trading_symbol, symbol_token, interval_key, lookback_months, from_time, to_time, lots, lot_size, status)
-                VALUES(:r_id, :u_id, 'supertrend', 'NIFTY', 'NIFTYFUT', '12345', 'ONE_MINUTE', 1, NOW(), NOW(), 1, 50, 'completed')
+                VALUES(:r_id, :u_id, 'supertrend', 'NIFTY', 'NIFTYFUT', '12345', 'ONE_MINUTE', 1, NOW(), NOW(), 1, 65, 'completed')
             """),
                 {"r_id": run_id, "u_id": user_id},
             )
@@ -433,7 +433,7 @@ async def test_clear_trade_logs_live_blockers(engine):
             await conn.execute(
                 text("""
                 INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, status, safety_status, entry_datetime)
-                VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'live', 50, 22000, 'open', 'PROTECTED', NOW())
+                VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'live', 65, 22000, 'open', 'PROTECTED', NOW())
             """),
                 {"t_id": live_trade_id, "u_id": user_id},
             )
@@ -453,7 +453,7 @@ async def test_clear_trade_logs_live_blockers(engine):
         async with engine.begin() as conn:
             await conn.execute(
                 text("""
-                UPDATE trades SET status='closed', safety_status='CLOSED', exit_datetime=NOW(), exit_price=22100, pnl=5000
+                UPDATE trades SET status='closed', safety_status='CLOSED', exit_datetime=NOW(), exit_price=22100, pnl=6500
                 WHERE id=:id
             """),
                 {"id": live_trade_id},
@@ -544,7 +544,7 @@ async def test_external_manual_close_and_stale_order_reconciliation(engine):
         await conn.execute(
             text("""
             INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, last_price, status, safety_status, entry_datetime, strategy_snapshot_id)
-            VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'live', 50, 22000, 22050, 'open', 'PROTECTED', NOW() - INTERVAL '2 days', :s_id)
+            VALUES(:t_id, :u_id, 'supertrend', 'NIFTY', 'BUY', 'live', 65, 22000, 22050, 'open', 'PROTECTED', NOW() - INTERVAL '2 days', :s_id)
         """),
             {"t_id": trade_id, "u_id": user_id, "s_id": snap_id},
         )
@@ -552,7 +552,7 @@ async def test_external_manual_close_and_stale_order_reconciliation(engine):
         await conn.execute(
             text("""
             INSERT INTO strategy_orders(id, user_id, trade_id, snapshot_id, side, execution_mode, quantity, price, status, role, session_key, lots, idempotency_key, created_at)
-            VALUES(:o_id, :u_id, :t_id, :s_id, 'SELL', 'live', 50, 21900, 'submitted', 'SL1', :sess, 1, 'idem-recon-1', NOW() - INTERVAL '2 days')
+            VALUES(:o_id, :u_id, :t_id, :s_id, 'SELL', 'live', 65, 21900, 'submitted', 'SL1', :sess, 1, 'idem-recon-1', NOW() - INTERVAL '2 days')
         """),
             {
                 "o_id": order_id,
@@ -565,7 +565,7 @@ async def test_external_manual_close_and_stale_order_reconciliation(engine):
         await conn.execute(
             text("""
             INSERT INTO strategy_execution_intents(id, signal_id, user_id, trade_id, strategy_order_id, snapshot_id, strategy_key, instrument, session_key, action, role, side, order_type, lots, quantity, price, status, created_at)
-            VALUES(:i_id, :sig_id, :u_id, :t_id, :o_id, :s_id, 'supertrend', 'NIFTY', :sess, 'ENTRY', 'SL1', 'SELL', 'LIMIT', 1, 50, 21900, 'submitted', NOW() - INTERVAL '2 days')
+            VALUES(:i_id, :sig_id, :u_id, :t_id, :o_id, :s_id, 'supertrend', 'NIFTY', :sess, 'ENTRY', 'SL1', 'SELL', 'LIMIT', 1, 65, 21900, 'submitted', NOW() - INTERVAL '2 days')
         """),
             {
                 "i_id": intent_id,

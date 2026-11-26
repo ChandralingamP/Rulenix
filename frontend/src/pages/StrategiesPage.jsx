@@ -19,6 +19,30 @@ const formatDate = (value) => {
       });
 };
 
+const formatPrice = (value) => {
+  if (value === null || value === undefined || value === "") return "—";
+  const num = Number(value);
+  return Number.isFinite(num)
+    ? num.toLocaleString("en-IN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
+    : "—";
+};
+
+const formatBarTimeIst = (value) => {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? ""
+    : date.toLocaleTimeString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+};
+
 const TRADING_PAUSED_MESSAGE =
   "Trading paused: Market data is temporarily unavailable. No trades will be placed until it recovers";
 
@@ -305,7 +329,11 @@ export default function StrategiesPage() {
                         <tr>
                           <th className="px-4 py-3 font-semibold">Instrument</th>
                           <th className="px-4 py-3 font-semibold">Selected symbol</th>
-                          <th className="px-4 py-3 font-semibold">Expiry</th>
+                          <th className="px-4 py-3 font-semibold">
+                            {strategy.key === "supertrend_index_options_v1"
+                              ? "SuperTrend line"
+                              : "Expiry"}
+                          </th>
                           <th className="px-4 py-3 font-semibold">Contract lot</th>
                           <th className="px-4 py-3 font-semibold">Trade lots</th>
                           <th className="px-4 py-3 font-semibold">
@@ -394,7 +422,40 @@ export default function StrategiesPage() {
                                 ) : null}
                               </td>
                               <td className="px-4 py-4 text-slate-300">
-                                {formatDate(snapshot?.contract_expiry)}
+                                {strategy.key === "supertrend_index_options_v1" ? (
+                                  snapshot?.supertrend_price != null ? (
+                                    <div>
+                                      <div className="flex items-center gap-2">
+                                        <span className="font-semibold text-white">
+                                          {formatPrice(snapshot.supertrend_price)}
+                                        </span>
+                                        {snapshot.supertrend_direction ? (
+                                          <span
+                                            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                                              snapshot.supertrend_direction === "UP"
+                                                ? "bg-emerald-500/15 text-emerald-300"
+                                                : "bg-rose-500/15 text-rose-300"
+                                            }`}
+                                          >
+                                            {snapshot.supertrend_direction}
+                                          </span>
+                                        ) : null}
+                                      </div>
+                                      <p className="mt-1 text-xs text-slate-400">
+                                        Close {formatPrice(snapshot.index_close)}
+                                        {snapshot.supertrend_candle_at
+                                          ? ` · ${formatBarTimeIst(snapshot.supertrend_candle_at)} IST`
+                                          : ""}
+                                      </p>
+                                    </div>
+                                  ) : (
+                                    <span className="text-xs text-slate-500">
+                                      Waiting for 5m bar
+                                    </span>
+                                  )
+                                ) : (
+                                  formatDate(snapshot?.contract_expiry)
+                                )}
                               </td>
                               <td className="px-4 py-4 text-slate-300">
                                 {snapshot?.lot_size ?? "—"}

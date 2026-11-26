@@ -8,6 +8,7 @@ from itertools import pairwise
 
 from .common import (
     IST,
+    NIFTY_LOT_SIZE,
     Candle,
     as_ist,
     latest_completed_five_minute,
@@ -56,6 +57,7 @@ class IndexOptionConfig:
     option_name: str
     default_target_points: Decimal
     default_stop_loss_points: Decimal
+    default_lot_size: int | None = None
 
 
 CONFIGS = {
@@ -63,7 +65,7 @@ CONFIGS = {
         "SENSEX", "BSE", "99919000", "BFO", "SENSEX", Decimal(40), Decimal(25)
     ),
     "NIFTY": IndexOptionConfig(
-        "NIFTY", "NSE", "99926000", "NFO", "NIFTY", Decimal(25), Decimal(15)
+        "NIFTY", "NSE", "99926000", "NFO", "NIFTY", Decimal(25), Decimal(15), NIFTY_LOT_SIZE
     ),
 }
 

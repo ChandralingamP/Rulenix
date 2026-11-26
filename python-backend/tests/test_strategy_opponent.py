@@ -50,16 +50,16 @@ def test_ranked_coincidence_queue_walkthrough() -> None:
     # 3 CE strikes
     ce_contracts = {
         Decimal(24450): (
-            OptionContract("CE1", "NIFTY24450CE", expiry, 25, Decimal(24450), OptionSide.CALL),
+            OptionContract("CE1", "NIFTY24450CE", expiry, 65, Decimal(24450), OptionSide.CALL),
             _candle(t0, 160, 165, 145, 155),
         ),
         Decimal(24500): (
-            OptionContract("CE2", "NIFTY24500CE", expiry, 25, Decimal(24500), OptionSide.CALL),
+            OptionContract("CE2", "NIFTY24500CE", expiry, 65, Decimal(24500), OptionSide.CALL),
             # PDF Walkthrough: 24500 CE High=125, Low=110, Close=123.2
             _candle(t0, 115, 125, 110, "123.2"),
         ),
         Decimal(24550): (
-            OptionContract("CE3", "NIFTY24550CE", expiry, 25, Decimal(24550), OptionSide.CALL),
+            OptionContract("CE3", "NIFTY24550CE", expiry, 65, Decimal(24550), OptionSide.CALL),
             _candle(t0, 95, 100, 85, 90),
         ),
     }
@@ -67,15 +67,15 @@ def test_ranked_coincidence_queue_walkthrough() -> None:
     # 3 PE strikes
     pe_contracts = {
         Decimal(24450): (
-            OptionContract("PE1", "NIFTY24450PE", expiry, 25, Decimal(24450), OptionSide.PUT),
+            OptionContract("PE1", "NIFTY24450PE", expiry, 65, Decimal(24450), OptionSide.PUT),
             _candle(t0, 90, 95, 80, 85),
         ),
         Decimal(24500): (
-            OptionContract("PE2", "NIFTY24500PE", expiry, 25, Decimal(24500), OptionSide.PUT),
+            OptionContract("PE2", "NIFTY24500PE", expiry, 65, Decimal(24500), OptionSide.PUT),
             _candle(t0, 110, 118, 100, 105),
         ),
         Decimal(24550): (
-            OptionContract("PE3", "NIFTY24550PE", expiry, 25, Decimal(24550), OptionSide.PUT),
+            OptionContract("PE3", "NIFTY24550PE", expiry, 65, Decimal(24550), OptionSide.PUT),
             # PDF Walkthrough: 24550 PE High=123, Low=108, Close=123.0
             _candle(t0, 112, 123, 108, "123.0"),
         ),
@@ -159,8 +159,8 @@ def test_confirmation_and_entry_signal() -> None:
     expiry = date(2026, 11, 12)
 
     pair = CoincidencePair(
-        ce_contract=OptionContract("CE", "NIFTY24500CE", expiry, 25, Decimal(24500), OptionSide.CALL),
-        pe_contract=OptionContract("PE", "NIFTY24550PE", expiry, 25, Decimal(24550), OptionSide.PUT),
+        ce_contract=OptionContract("CE", "NIFTY24500CE", expiry, 65, Decimal(24500), OptionSide.CALL),
+        pe_contract=OptionContract("PE", "NIFTY24550PE", expiry, 65, Decimal(24550), OptionSide.PUT),
         ce_candle=_candle(t0, 115, 125, 110, 123),  # CE High 125, Low 110 -> projected to PE
         pe_candle=_candle(t0, 112, 123, 108, 123),  # PE High 123, Low 108 -> projected to CE
         premium_diff=Decimal("0.0"),
@@ -247,15 +247,15 @@ def test_next_best_coincidence_fallback() -> None:
     # 3 CE strikes
     ce_contracts = {
         Decimal(24450): (
-            OptionContract("CE1", "NIFTY24450CE", expiry, 25, Decimal(24450), OptionSide.CALL),
+            OptionContract("CE1", "NIFTY24450CE", expiry, 65, Decimal(24450), OptionSide.CALL),
             _candle(t0, 160, 165, 145, 155),
         ),
         Decimal(24500): (
-            OptionContract("CE2", "NIFTY24500CE", expiry, 25, Decimal(24500), OptionSide.CALL),
+            OptionContract("CE2", "NIFTY24500CE", expiry, 65, Decimal(24500), OptionSide.CALL),
             _candle(t0, 115, 125, 110, "123.2"),
         ),
         Decimal(24550): (
-            OptionContract("CE3", "NIFTY24550CE", expiry, 25, Decimal(24550), OptionSide.CALL),
+            OptionContract("CE3", "NIFTY24550CE", expiry, 65, Decimal(24550), OptionSide.CALL),
             _candle(t0, 95, 100, 85, 90),
         ),
     }
@@ -263,15 +263,15 @@ def test_next_best_coincidence_fallback() -> None:
     # 3 PE strikes (strictly identical strikes 24450, 24500, 24550)
     pe_contracts = {
         Decimal(24450): (
-            OptionContract("PE1", "NIFTY24450PE", expiry, 25, Decimal(24450), OptionSide.PUT),
+            OptionContract("PE1", "NIFTY24450PE", expiry, 65, Decimal(24450), OptionSide.PUT),
             _candle(t0, 148, 152, 142, 150),  # Delta with CE1 is |155 - 150| = 5.0 (Rank 3)
         ),
         Decimal(24500): (
-            OptionContract("PE2", "NIFTY24500PE", expiry, 25, Decimal(24500), OptionSide.PUT),
+            OptionContract("PE2", "NIFTY24500PE", expiry, 65, Decimal(24500), OptionSide.PUT),
             _candle(t0, 110, 125, 100, "123.0"),  # Delta with CE2 is |123.2 - 123.0| = 0.2 (Rank 1)
         ),
         Decimal(24550): (
-            OptionContract("PE3", "NIFTY24550PE", expiry, 25, Decimal(24550), OptionSide.PUT),
+            OptionContract("PE3", "NIFTY24550PE", expiry, 65, Decimal(24550), OptionSide.PUT),
             _candle(t0, 92, 98, 88, "89.5"),  # Delta with CE3 is |90 - 89.5| = 0.5 (Rank 2)
         ),
     }

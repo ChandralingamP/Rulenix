@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
+NIFTY_LOT_SIZE = 65
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ def latest_completed_five_minute(value: datetime) -> datetime:
 
 __all__ = [
     "IST",
+    "NIFTY_LOT_SIZE",
     "Candle",
     "as_ist",
     "futures_session_open",

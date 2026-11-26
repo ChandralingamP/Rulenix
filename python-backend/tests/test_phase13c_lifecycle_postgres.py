@@ -635,7 +635,7 @@ async def test_supertrend_demo_market_entry_protection_and_target_are_broker_fre
         await session.execute(
             text("""
             UPDATE strategy_market_snapshots SET strategy_key='supertrend_index_options_v1',
-              instrument='NIFTY_CALL',contract_symbol='NIFTY-DEMO-CE',lot_size=10,
+              instrument='NIFTY_CALL',contract_symbol='NIFTY-DEMO-CE',lot_size=65,
               exchange_segment='NFO',product_type='INTRADAY',
               buy_target=25,buy_sl1=15,buy_sl2=NULL WHERE id=:snapshot
             """),
@@ -662,7 +662,7 @@ async def test_supertrend_demo_market_entry_protection_and_target_are_broker_fre
                     "BUY",
                     "MARKET",
                     1,
-                    10,
+                    65,
                     Decimal(100),
                 )
             ],
@@ -706,7 +706,7 @@ async def test_supertrend_demo_market_entry_protection_and_target_are_broker_fre
             .all()
         )
     assert tuple(trade[:3]) == ("closed", "CLOSED", "TP")
-    assert Decimal(str(trade.pnl)) == Decimal(250)
+    assert Decimal(str(trade.pnl)) == Decimal(1625)
     assert broker_ids and all(value.startswith("DEMO-") for value in broker_ids)
 
 

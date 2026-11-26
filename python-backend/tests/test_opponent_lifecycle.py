@@ -38,30 +38,30 @@ def test_coincidence_queue_perimeter_ranking() -> None:
 
     ce_contracts = {
         Decimal(24450): (
-            OptionContract("CE1", "NIFTY24450CE", expiry, 25, Decimal(24450), OptionSide.CALL),
+            OptionContract("CE1", "NIFTY24450CE", expiry, 65, Decimal(24450), OptionSide.CALL),
             _candle(t0, 160, 165, 145, 155),
         ),
         Decimal(24500): (
-            OptionContract("CE2", "NIFTY24500CE", expiry, 25, Decimal(24500), OptionSide.CALL),
+            OptionContract("CE2", "NIFTY24500CE", expiry, 65, Decimal(24500), OptionSide.CALL),
             _candle(t0, 115, 125, 110, "123.2"),
         ),
         Decimal(24550): (
-            OptionContract("CE3", "NIFTY24550CE", expiry, 25, Decimal(24550), OptionSide.CALL),
+            OptionContract("CE3", "NIFTY24550CE", expiry, 65, Decimal(24550), OptionSide.CALL),
             _candle(t0, 95, 100, 85, 90),
         ),
     }
 
     pe_contracts = {
         Decimal(24450): (
-            OptionContract("PE1", "NIFTY24450PE", expiry, 25, Decimal(24450), OptionSide.PUT),
+            OptionContract("PE1", "NIFTY24450PE", expiry, 65, Decimal(24450), OptionSide.PUT),
             _candle(t0, 148, 152, 140, 145),
         ),
         Decimal(24500): (
-            OptionContract("PE2", "NIFTY24500PE", expiry, 25, Decimal(24500), OptionSide.PUT),
+            OptionContract("PE2", "NIFTY24500PE", expiry, 65, Decimal(24500), OptionSide.PUT),
             _candle(t0, 110, 125, 100, "123.0"),
         ),
         Decimal(24550): (
-            OptionContract("PE3", "NIFTY24550PE", expiry, 25, Decimal(24550), OptionSide.PUT),
+            OptionContract("PE3", "NIFTY24550PE", expiry, 65, Decimal(24550), OptionSide.PUT),
             _candle(t0, 92, 98, 88, 95),
         ),
     }
@@ -161,14 +161,14 @@ async def test_select_opponent_basket_matches_identical_strikes() -> None:
     provider = AngelSuperTrendMarketProvider(client_factory=MagicMock())
     test_rows = [
         # Nearest weekly expiry 12-Nov-2026
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24450CE", "token": "T1", "expiry": "12NOV2026", "strike": "2445000", "lotsize": "25"},
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24450PE", "token": "T2", "expiry": "12NOV2026", "strike": "2445000", "lotsize": "25"},
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24500CE", "token": "T3", "expiry": "12NOV2026", "strike": "2450000", "lotsize": "25"},
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24500PE", "token": "T4", "expiry": "12NOV2026", "strike": "2450000", "lotsize": "25"},
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24550CE", "token": "T5", "expiry": "12NOV2026", "strike": "2455000", "lotsize": "25"},
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24550PE", "token": "T6", "expiry": "12NOV2026", "strike": "2455000", "lotsize": "25"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24450CE", "token": "T1", "expiry": "12NOV2026", "strike": "2445000", "lotsize": "65"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24450PE", "token": "T2", "expiry": "12NOV2026", "strike": "2445000", "lotsize": "65"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24500CE", "token": "T3", "expiry": "12NOV2026", "strike": "2450000", "lotsize": "65"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24500PE", "token": "T4", "expiry": "12NOV2026", "strike": "2450000", "lotsize": "65"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24550CE", "token": "T5", "expiry": "12NOV2026", "strike": "2455000", "lotsize": "65"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY12NOV24550PE", "token": "T6", "expiry": "12NOV2026", "strike": "2455000", "lotsize": "65"},
         # Later monthly expiry
-        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY26NOV24500CE", "token": "T7", "expiry": "26NOV2026", "strike": "2450000", "lotsize": "25"},
+        {"exch_seg": "NFO", "name": "NIFTY", "instrumenttype": "OPTIDX", "symbol": "NIFTY26NOV24500CE", "token": "T7", "expiry": "26NOV2026", "strike": "2450000", "lotsize": "65"},
     ]
     provider._master = AsyncMock(return_value=tuple(test_rows))
 
@@ -226,7 +226,7 @@ async def test_lifecycle_forbids_trade_without_sufficient_candles() -> None:
     ]
 
     mock_provider = MagicMock()
-    mock_provider.select = AsyncMock(return_value=MagicMock(contract=MagicMock(token="T1", premium=Decimal(120), lot_size=25, symbol="CE1")))
+    mock_provider.select = AsyncMock(return_value=MagicMock(contract=MagicMock(token="T1", premium=Decimal(120), lot_size=65, symbol="CE1")))
     worker.market_provider = mock_provider
 
     t_0936 = datetime(2026, 11, 10, 9, 36, 0, tzinfo=IST)
@@ -246,7 +246,7 @@ async def test_opponent_candle_close_sl_triggers_exit() -> None:
         "user_id": str(uuid4()),
         "execution_mode": "demo",
         "direction": "BUY",
-        "quantity": 50,
+        "quantity": 130,
         "entry_price": 126.0,
         "last_price": 115.0,
         "total_lots": 2,
@@ -258,7 +258,7 @@ async def test_opponent_candle_close_sl_triggers_exit() -> None:
         "instrument_label": "NIFTY",
         "contract_token": "T_CE",
         "contract_symbol": "NIFTY24500CE",
-        "lot_size": 25,
+        "lot_size": 65,
         "pnl": 0.0,
         "buy_target": 153.75,
         "buy_sl1": 108.0,
@@ -306,7 +306,7 @@ async def test_opponent_trailing_ladder_progression() -> None:
         "user_id": str(uuid4()),
         "execution_mode": "demo",
         "direction": "BUY",
-        "quantity": 25,
+        "quantity": 65,
         "entry_price": 126.0,
         "last_price": 186.0,
         "total_lots": 2,
@@ -318,7 +318,7 @@ async def test_opponent_trailing_ladder_progression() -> None:
         "instrument_label": "NIFTY",
         "contract_token": "T_CE",
         "contract_symbol": "NIFTY24500CE",
-        "lot_size": 25,
+        "lot_size": 65,
         "pnl": 0.0,
         "buy_target": 153.75,  # H = 123
         "buy_sl1": 108.0,

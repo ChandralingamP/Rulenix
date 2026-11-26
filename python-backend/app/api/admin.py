@@ -574,3 +574,98 @@ async def daily_trades(date: Date | None = Query(None), _: Principal = Depends(a
         "live_trades": sum(row["live_trades"] for row in users),
         "users": users,
     }
+
+
+@router.get("/diagnostics/")
+async def diagnostics(
+    request: Request,
+    date: Date | None = Query(None),
+    strategy_key: str | None = Query(None),
+    severity: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    _: Principal = Depends(admin_only),
+    db: AsyncSession = Depends(get_db),
+):
+    from .strategy import fetch_supertrend_statuses
+
+    if date is None:
+        date = await db.scalar(text("SELECT (NOW() AT TIME ZONE 'Asia/Kolkata')::date"))
+
+    strategy_filter = (strategy_key or "").strip() or None
+    severity_filter = (severity or "").strip().upper() or None
+
+    rows = (
+        await db.execute(
+            text("""
+            SELECT e.id, e.strategy_key, e.instrument, e.event_type, e.payload, e.created_at,
+                   u.username
+              FROM strategy_events e
+              LEFT JOIN users u ON u.id = e.user_id
+             WHERE (e.created_at AT TIME ZONE 'Asia/Kolkata')::date = CAST(:date AS date)
+               AND e.event_type IN ('strategy_skip', 'operational_alert')
+               AND (CAST(:strategy AS varchar) IS NULL OR e.strategy_key = :strategy)
+               AND (
+                   CAST(:severity AS varchar) IS NULL
+                   OR UPPER(COALESCE(e.payload->>'severity', 'INFO')) = :severity
+               )
+             ORDER BY e.created_at DESC, e.id DESC
+             LIMIT :limit
+            """),
+            {
+                "date": date,
+                "strategy": strategy_filter,
+                "severity": severity_filter,
+                "limit": limit,
+            },
+        )
+    ).mappings().all()
+
+    events: list[dict] = []
+    by_reason: dict[str, int] = {}
+    warnings = 0
+    errors = 0
+    infos = 0
+    for row in rows:
+        payload = row["payload"] if isinstance(row["payload"], dict) else {}
+        sev = str(payload.get("severity") or "INFO").upper()
+        reason = str(payload.get("reason") or payload.get("code") or row["event_type"])
+        if sev == "WARNING":
+            warnings += 1
+        elif sev == "ERROR":
+            errors += 1
+        else:
+            infos += 1
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        events.append(
+            {
+                "id": row["id"],
+                "strategy_key": row["strategy_key"],
+                "instrument": row["instrument"],
+                "event_type": row["event_type"],
+                "severity": sev,
+                "reason": reason,
+                "message": str(payload.get("message") or reason),
+                "context": payload.get("context") if isinstance(payload.get("context"), dict) else {},
+                "username": row["username"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    supertrend_levels = await fetch_supertrend_statuses(db)
+    runtime = getattr(request.app.state, "production_runtime", None)
+    runtime_status = runtime.status() if runtime is not None else None
+
+    return {
+        "date": date.isoformat() if date is not None else None,
+        "timezone": "Asia/Kolkata",
+        "summary": {
+            "total": len(events),
+            "warnings": warnings,
+            "errors": errors,
+            "info": infos,
+            "by_reason": by_reason,
+        },
+        "supertrend_levels": supertrend_levels,
+        "runtime": runtime_status,
+        "events": events,
+    }

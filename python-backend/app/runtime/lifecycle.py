@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -54,6 +55,8 @@ class SkipReporter:
     def __init__(self, repeat_seconds: float = 300.0) -> None:
         self.repeat_seconds = repeat_seconds
         self._last: dict[tuple[str, str], tuple[str, float]] = {}
+        self.recent: deque[dict[str, object]] = deque(maxlen=200)
+        self._pending: deque[dict[str, object]] = deque(maxlen=200)
 
     def report(
         self,
@@ -79,7 +82,47 @@ class SkipReporter:
             reason,
             detail,
         )
+        if level >= logging.INFO:
+            entry: dict[str, object] = {
+                "strategy_key": strategy,
+                "instrument": instrument,
+                "severity": logging.getLevelName(level),
+                "reason": reason,
+                "message": f"{reason} ({detail})" if detail else reason,
+                "context": {name: str(value) for name, value in context.items()},
+                "created_at": datetime.now(UTC),
+            }
+            self.recent.appendleft(entry)
+            self._pending.append(entry)
         return True
+
+    async def flush(self, session: AsyncSession) -> int:
+        if not self._pending:
+            return 0
+        batch = list(self._pending)
+        self._pending.clear()
+        for item in batch:
+            await session.execute(
+                text("""
+                INSERT INTO strategy_events(user_id, strategy_key, instrument, event_type, payload, created_at)
+                VALUES(NULL, :strategy, :instrument, 'strategy_skip', CAST(:payload AS jsonb), :created_at)
+                """),
+                {
+                    "strategy": item["strategy_key"],
+                    "instrument": item["instrument"],
+                    "payload": json.dumps(
+                        {
+                            "severity": item["severity"],
+                            "code": item["reason"],
+                            "reason": item["reason"],
+                            "message": item["message"],
+                            "context": item["context"],
+                        }
+                    ),
+                    "created_at": item["created_at"],
+                },
+            )
+        return len(batch)
 
 
 skips = SkipReporter()
@@ -233,6 +276,10 @@ class AuthoritativeExecutionWorker:
     async def run_once(self) -> dict[str, object]:
         async with self.session_factory() as session:
             generated = await self._evaluate(session, datetime.now(UTC))
+            try:
+                await skips.flush(session)
+            except Exception as exc:
+                logger.warning("Failed persisting strategy skip diagnostics: %s", exc)
             await session.commit()
             recovered = (
                 await __import__("app.trading.repository", fromlist=["TradingRepository"])

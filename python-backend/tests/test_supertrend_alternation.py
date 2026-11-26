@@ -46,7 +46,7 @@ class FakeMarketProvider:
                 token="99999",
                 symbol=f"{config.instrument}{trade_date:%d%b%y}{side.value}",
                 expiry=trade_date + timedelta(days=2),
-                lot_size=25,
+                lot_size=65,
                 strike=Decimal(24000),
                 option_type=side,
                 premium=self.premium,
@@ -139,7 +139,7 @@ async def test_supertrend_alternation_and_reversal(engine):
             await conn.execute(
                 text("""
                 INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, last_price, status, safety_status, entry_datetime, created_at, strategy_snapshot_id)
-                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 25, 100, 125, 'closed', 'CLOSED', :t, :t, :s_id)
+                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 65, 100, 125, 'closed', 'CLOSED', :t, :t, :s_id)
             """),
                 {
                     "t_id": trade_id,
@@ -194,7 +194,7 @@ async def test_supertrend_alternation_and_reversal(engine):
             await conn.execute(
                 text("""
                 INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, last_price, status, safety_status, entry_datetime, created_at, strategy_snapshot_id)
-                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 25, 100, 90, 'open', 'PROTECTED', :t, :t, :s_id)
+                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 65, 100, 90, 'open', 'PROTECTED', :t, :t, :s_id)
             """),
                 {
                     "t_id": open_trade_id,
@@ -284,7 +284,7 @@ async def test_supertrend_alternation_and_reversal(engine):
             await conn.execute(
                 text("""
                 INSERT INTO trades(id, user_id, strategy_key, instrument_label, direction, execution_mode, quantity, entry_price, last_price, status, safety_status, entry_datetime, created_at, strategy_snapshot_id)
-                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 25, 100, 125, 'closed', 'CLOSED', :t, :t, :s_id)
+                VALUES(:t_id, :u_id, :strat, 'NIFTY_CE', 'BUY', 'demo', 65, 100, 125, 'closed', 'CLOSED', :t, :t, :s_id)
             """),
                 {
                     "t_id": yesterday_trade_id,
